@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM 交互日志可视化系统</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/github.min.css">
+    <script src="/static/highlight.min.js"></script>
+    <script src="/static/json.min.js"></script>
+    <script src="/static/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="logo">
+                <h1>LLM Logger</h1>
+                <span class="version">v1.0</span>
+            </div>
+            
+            <nav class="nav">
+                <a href="#" class="nav-item active" data-view="dashboard">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7"></rect>
+                        <rect x="14" y="3" width="7" height="7"></rect>
+                        <rect x="14" y="14" width="7" height="7"></rect>
+                        <rect x="3" y="14" width="7" height="7"></rect>
+                    </svg>
+                    仪表盘
+                </a>
+                <a href="#" class="nav-item" data-view="logs">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                        <polyline points="10 9 9 9 8 9"></polyline>
+                    </svg>
+                    日志列表
+                </a>
+                <a href="#" class="nav-item" data-view="sessions">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="9" cy="7" r="4"></circle>
+                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    </svg>
+                    会话管理
+                </a>
+                <a href="#" class="nav-item" data-view="agents">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                        <path d="M2 17l10 5 10-5"></path>
+                        <path d="M2 12l10 5 10-5"></path>
+                    </svg>
+                    Agent 时间轴
+                </a>
+                <a href="#" class="nav-item" data-view="analytics">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="20" x2="18" y2="10"></line>
+                        <line x1="12" y1="20" x2="12" y2="4"></line>
+                        <line x1="6" y1="20" x2="6" y2="14"></line>
+                    </svg>
+                    统计分析
+                </a>
+                <a href="#" class="nav-item" data-view="toolcalls">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                        <path d="M2 17l10 5 10-5"></path>
+                        <path d="M2 12l10 5 10-5"></path>
+                    </svg>
+                    Tool Call 日志
+                </a>
+                <a href="/vulnerabilities" class="nav-item">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                    漏洞管理
+                </a>
+                <a href="/redis" class="nav-item">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+                        <path d="M3 5V19A9 3 0 0 0 21 19V5"></path>
+                        <path d="M3 12A9 3 0 0 0 21 12"></path>
+                    </svg>
+                    Redis 缓存
+                </a>
+            </nav>
+            
+            <div class="connection-status">
+                <span class="status-indicator" id="ws-status"></span>
+                <span class="status-text" id="ws-text">离线</span>
+            </div>
+        </aside>
+        
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- 顶部栏 -->
+            <header class="header">
+                <div class="search-box">
+                    <input type="text" id="global-search" placeholder="搜索日志...">
+                    <button class="btn-icon" id="search-btn">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <path d="m21 21-4.35-4.35"></path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-secondary" id="refresh-btn">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                        </svg>
+                        刷新
+                    </button>
+                    <button class="btn btn-primary" id="export-btn">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="7 10 12 15 17 10"></polyline>
+                            <line x1="12" y1="15" x2="12" y2="3"></line>
+                        </svg>
+                        导出
+                    </button>
+                </div>
+            </header>
+            
+            <!-- 视图容器 -->
+            <div class="content">
+                <!-- 仪表盘视图 -->
+                <div class="view active" id="view-dashboard">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon success">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="20 6 9 17 4 12"></polyline>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="stat-success">-</span>
+                                <span class="stat-label">成功调用</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon error">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="15" y1="9" x2="9" y2="15"></line>
+                                    <line x1="9" y1="9" x2="15" y2="15"></line>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="stat-failed">-</span>
+                                <span class="stat-label">失败调用</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon warning">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 2v20M2 12h20"></path>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="stat-total">-</span>
+                                <span class="stat-label">总调用数</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon info">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="12" y1="16" x2="12" y2="12"></line>
+                                    <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="stat-rate">-</span>
+                                <span class="stat-label">成功率</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+
+                    
+                    <div class="recent-logs">
+                        <h3>最近日志</h3>
+                        <div class="table-container">
+                            <table class="data-table" id="recent-logs-table">
+                                <thead>
+                                    <tr>
+                                        <th>时间</th>
+                                        <th>任务类型</th>
+                                        <th>目标函数</th>
+                                        <th>延迟</th>
+                                        <th>状态</th>
+                                        <th>标注</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 日志列表视图 -->
+                <div class="view" id="view-logs">
+                    <div class="filter-bar">
+                        <div class="filter-group search-group">
+                            <label>搜索内容</label>
+                            <input type="text" id="filter-search" placeholder="搜索日志内容（messages、response、error等）...">
+                        </div>
+                        <div class="filter-group">
+                            <label>会话</label>
+                            <select id="filter-session">
+                                <option value="">全部会话</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>模型</label>
+                            <select id="filter-model">
+                                <option value="">全部模型</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>类型</label>
+                            <select id="filter-type">
+                                <option value="">全部类型</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>状态</label>
+                            <select id="filter-status">
+                                <option value="">全部</option>
+                                <option value="true">成功</option>
+                                <option value="false">失败</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>时间范围</label>
+                            <input type="datetime-local" id="filter-start">
+                            <span>至</span>
+                            <input type="datetime-local" id="filter-end">
+                        </div>
+                        <button class="btn btn-secondary" id="apply-filters">应用筛选</button>
+                        <button class="btn btn-text" id="clear-filters">清除</button>
+                    </div>
+                    
+                    <div class="table-container">
+                        <table class="data-table" id="logs-table">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>任务类型</th>
+                                    <th>目标函数</th>
+                                    <th>延迟</th>
+                                    <th>重试</th>
+                                    <th>状态</th>
+                                    <th>标注</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="pagination">
+                        <span class="pagination-info" id="pagination-info">共 0 条</span>
+                        <div class="pagination-buttons">
+                            <button class="btn btn-sm" id="prev-page" disabled>上一页</button>
+                            <span class="page-number" id="current-page">1</span>
+                            <button class="btn btn-sm" id="next-page" disabled>下一页</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 会话管理视图 -->
+                <div class="view" id="view-sessions">
+                    <div class="sessions-grid" id="sessions-grid">
+                        <!-- 动态生成会话卡片 -->
+                    </div>
+                </div>
+                
+                <!-- Agent 时间轴视图 -->
+                <div class="view" id="view-agents">
+                    <div class="filter-bar">
+                        <div class="filter-group">
+                            <label>Agent 类型</label>
+                            <select id="filter-agent-type">
+                                <option value="">全部类型</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label>状态</label>
+                            <select id="filter-agent-status">
+                                <option value="">全部</option>
+                                <option value="running">运行中</option>
+                                <option value="completed">已完成</option>
+                                <option value="failed">失败</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-secondary" id="apply-agent-filters">应用筛选</button>
+                        <button class="btn btn-text" id="clear-agent-filters">清除</button>
+                    </div>
+                    <div class="agents-timeline-container" id="agents-timeline">
+                        <!-- 动态生成 Agent 时间轴 -->
+                    </div>
+                </div>
+                
+                <!-- 统计分析视图 -->
+                <div class="view" id="view-analytics">
+                    <div class="analytics-grid">
+                        <div class="chart-card full-width">
+                            <h3>调用类型分布</h3>
+                            <canvas id="calltype-chart"></canvas>
+                        </div>
+                        <div class="chart-card full-width">
+                            <h3>延迟分析</h3>
+                            <canvas id="latency-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Tool Call 日志视图 -->
+                <div class="view" id="view-toolcalls">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon primary">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="tc-stat-total">-</span>
+                                <span class="stat-label">Tool Call 总数</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon success">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="20 6 9 17 4 12"></polyline>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="tc-stat-success">-</span>
+                                <span class="stat-label">成功调用</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon warning">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                                </svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-value" id="tc-stat-tools">-</span>
+                                <span class="stat-label">平均工具数</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="filter-bar">
+                        <div class="filter-group search-group">
+                            <label>Agent ID</label>
+                            <input type="text" id="tc-filter-agent" placeholder="过滤特定 Agent...">
+                        </div>
+                        <div class="filter-group">
+                            <label>状态</label>
+                            <select id="tc-filter-status">
+                                <option value="">全部</option>
+                                <option value="true">成功</option>
+                                <option value="false">失败</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-secondary" id="tc-apply-filters">应用筛选</button>
+                        <button class="btn btn-text" id="tc-clear-filters">清除</button>
+                    </div>
+                    
+                    <div class="table-container">
+                        <table class="data-table" id="toolcalls-table">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>Agent</th>
+                                    <th>目标函数</th>
+                                    <th>调用工具</th>
+                                    <th>工具数量</th>
+                                    <th>延迟</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="pagination">
+                        <span class="pagination-info" id="tc-pagination-info">共 0 条</span>
+                        <div class="pagination-buttons">
+                            <button class="btn btn-sm" id="tc-prev-page" disabled>上一页</button>
+                            <span class="page-number" id="tc-current-page">1</span>
+                            <button class="btn btn-sm" id="tc-next-page" disabled>下一页</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Tool Usage Distribution -->
+                    <div class="chart-card" style="margin-top: 20px;">
+                        <h3>工具使用分布</h3>
+                        <canvas id="tool-usage-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- 日志详情弹窗 -->
+    <div class="modal" id="log-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>日志详情</h2>
+                <button class="btn-icon close-btn" id="close-modal">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- 动态内容 -->
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>
