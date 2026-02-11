@@ -162,8 +162,8 @@ IVAgent → AbcDecompilerClient → MCP Server → Jadx AI MCP Plugin → ABC �
    - `--port`: MCP Server 监听端口（默认 8651）
    - `--jadx-port`: Jadx AI MCP Plugin 端口（默认 8650）
 
-3. **在 Jadx 中加载 ABC 文件**
-   - 打开 Jadx GUI
+3. **在 ABC-Decompiler 中加载 ABC 文件**
+   - 打开 ABC-Decompiler
    - 加载要分析的 `.abc` 文件
    - 确保 AI MCP Plugin 已启用并连接到端口 8650
 
