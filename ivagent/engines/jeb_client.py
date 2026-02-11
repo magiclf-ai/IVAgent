@@ -234,6 +234,30 @@ class JEBClient:
         """
         return self._call("get_interfaces", [filepath, class_signature])
 
+    def get_all_classes(self, filepath: str) -> List[str]:
+        """
+        获取 APK 中的所有类
+
+        Args:
+            filepath: APK 文件的绝对路径
+
+        Returns:
+            类签名列表
+        """
+        return self._call("get_all_classes", [filepath])
+
+    def get_all_methods(self, filepath: str) -> List[str]:
+        """
+        获取 APK 中的所有方法
+
+        Args:
+            filepath: APK 文件的绝对路径
+
+        Returns:
+            方法签名列表
+        """
+        return self._call("get_all_methods", [filepath])
+
     def get_class_methods(self, filepath: str, class_signature: str) -> List[str]:
         """
         获取指定类的所有方法

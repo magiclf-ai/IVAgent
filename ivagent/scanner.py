@@ -65,14 +65,14 @@ class IVAgentScanner:
 
     async def scan_function(
             self,
-            function_signature: str,
+            function_identifier: str,
             precondition: Optional[Precondition] = None
     ) -> Dict[str, Any]:
         """
         Scan a single function for vulnerabilities.
         
         Args:
-            function_signature: Function address (IDA) or signature (JEB/ABC)
+            function_identifier: Function address (IDA) or identifier (JEB/ABC)
             precondition: Optional analysis constraints/preconditions
             
         Returns:
@@ -102,8 +102,8 @@ class IVAgentScanner:
                 verbose=self.config.verbose
             )
 
-            print(f"[*] Scanning function: {function_signature}")
-            result = await agent.run(function_signature)
+            print(f"[*] Scanning function: {function_identifier}")
+            result = await agent.run(function_identifier)
             return result
 
         finally:
@@ -113,14 +113,14 @@ class IVAgentScanner:
 
     async def scan_functions(
             self,
-            function_signatures: List[str],
+            function_identifiers: List[str],
             precondition: Optional[Precondition] = None
     ) -> List[Dict[str, Any]]:
         """
         Scan multiple functions concurrently.
         
         Args:
-            function_signatures: List of function addresses/signatures
+            function_identifiers: List of function addresses/identifiers
             precondition: Optional analysis constraints/preconditions
             
         Returns:
@@ -135,7 +135,7 @@ class IVAgentScanner:
 
         async with self.engine:
             semaphore = asyncio.Semaphore(self.config.max_concurrency)
-            total = len(function_signatures)
+            total = len(function_identifiers)
 
             async def _scan_single(idx, sig):
                 async with semaphore:
@@ -152,7 +152,7 @@ class IVAgentScanner:
                         print(f"[X] Error scanning {sig}: {e}")
                         return {"error": str(e), "address": sig, "vulnerabilities": []}
 
-            tasks = [_scan_single(i, sig) for i, sig in enumerate(function_signatures)]
+            tasks = [_scan_single(i, sig) for i, sig in enumerate(function_identifiers)]
             results = await asyncio.gather(*tasks)
             return results
 

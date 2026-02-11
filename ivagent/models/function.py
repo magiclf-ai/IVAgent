@@ -17,7 +17,7 @@ class SimpleFunctionSummary:
     只包含必要信息，使用纯文本格式降低对 LLM 的要求，
     提升响应速度和解析稳定性。
     """
-    function_signature: str             # 函数签名
+    function_identifier: str            # 函数/方法唯一标识符（全局唯一，跨语言通用）
     
     # 函数行为描述（50字以内）
     # 例如: "验证输入参数并执行内存拷贝操作"
@@ -38,7 +38,7 @@ class SimpleFunctionSummary:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
-            "function_signature": self.function_signature,
+            "function_identifier": self.function_identifier,
             "behavior_summary": self.behavior_summary,
             "param_constraints": self.param_constraints,
             "return_value_meaning": self.return_value_meaning,
@@ -47,16 +47,16 @@ class SimpleFunctionSummary:
     
     @classmethod
     def from_text(
-        cls,
-        function_signature: str,
-        behavior_summary: str = "",
-        param_constraints: Optional[List[str]] = None,
-        return_value_meaning: str = "",
-        global_var_operations: str = "",
+            cls,
+            function_identifier: str,
+            behavior_summary: str = "",
+            param_constraints: Optional[List[str]] = None,
+            return_value_meaning: str = "",
+            global_var_operations: str = "",
     ) -> "SimpleFunctionSummary":
         """从文本快速创建摘要"""
         return cls(
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             behavior_summary=behavior_summary,
             param_constraints=param_constraints or [],
             return_value_meaning=return_value_meaning,

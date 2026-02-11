@@ -322,7 +322,7 @@ def _identify_data_type(value: Any, key: Optional[str] = None) -> Optional[str]:
     
     # 识别字典类型的 SimpleFunctionSummary
     if isinstance(value, dict):
-        if 'function_signature' in value and 'behavior_summary' in value:
+        if 'function_identifier' in value and 'behavior_summary' in value:
             return 'function_summary_dict'
         if 'vuln_type' in value and 'description' in value:
             return 'vulnerability_dict'

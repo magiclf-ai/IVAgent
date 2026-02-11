@@ -19,6 +19,7 @@ from .base_static_analysis_engine import (
     CrossReference,
     VariableConstraint,
     BaseStaticAnalysisEngine,
+    SearchResult,
 )
 from ..models.callsite import CallsiteInfo
 
@@ -100,16 +101,13 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
     # ==========================================================================
 
     def search_code(self, query: str, path_filter: Optional[str] = None) -> str:
-        """
-        Search for text in source files using ripgrep (rg).
+        """Search for text in source files using ripgrep (rg).
 
-        Args:
+        Parameters:
             query: The text string to search for (treated as literal string, not regex).
             path_filter: Optional glob pattern to filter files (e.g., "*.c", "src/*.java").
-
-        Returns:
-            Formatted search results with file paths, line numbers, and matching content.
         """
+        # Returns: Formatted search results with file paths, line numbers, and matching content.
         try:
             cmd = [
                 "rg", "-n", "--no-heading", "--fixed-strings",
@@ -160,17 +158,14 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             return f"Error searching code: {str(e)}"
 
     def read_file(self, file_path: str, start_line: int, end_line: int) -> str:
-        """
-        Read a specific range of lines from a file.
+        """Read a specific range of lines from a file.
 
-        Args:
+        Parameters:
             file_path: Path to the file (relative to source_root or absolute).
             start_line: Start line number (1-based, inclusive).
             end_line: End line number (1-based, inclusive).
-
-        Returns:
-            File content with line numbers and context header.
         """
+        # Returns: File content with line numbers and context header.
         try:
             # Resolve path
             if os.path.isabs(file_path):
@@ -214,15 +209,12 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             return f"Error reading file: {str(e)}"
 
     def list_directory(self, dir_path: str = ".") -> str:
-        """
-        List contents of a directory (files and subdirectories).
+        """List contents of a directory (files and subdirectories).
 
-        Args:
+        Parameters:
             dir_path: Directory path (relative to source_root or absolute). Defaults to current directory.
-
-        Returns:
-            List of subdirectories and files with sizes.
         """
+        # Returns: List of subdirectories and files with sizes.
         try:
             if os.path.isabs(dir_path):
                 full_path = Path(dir_path)
@@ -376,9 +368,10 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
                             "tool_calls": all_tool_calls
                         }
 
-                error_msg = f"Max iterations ({self.max_iterations}) reached"
-                self._log_execution_end(False, error_msg, llm_calls)
-                return {"error": error_msg}
+                # 达到最大迭代次数，让 LLM 总结现有信息
+                return await self._finalize_on_max_iterations(
+                    messages, system_prompt, finish_tool, llm_calls, tools
+                )
 
             else:
                 # 直接使用 LLM bind_tools 模式
@@ -426,9 +419,10 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
                             "content": response.content
                         }
 
-                error_msg = f"Max iterations ({self.max_iterations}) reached"
-                self._log_execution_end(False, error_msg, llm_calls)
-                return {"error": error_msg}
+                # 达到最大迭代次数，让 LLM 总结现有信息
+                return await self._finalize_on_max_iterations(
+                    messages, system_prompt, finish_tool, llm_calls, tools
+                )
                 
         except Exception as e:
             error_msg = str(e)
@@ -446,6 +440,137 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
                 summary=summary,
                 error_message=None if success else summary
             )
+
+    async def _finalize_on_max_iterations(
+        self,
+        messages: List[BaseMessage],
+        system_prompt: str,
+        finish_tool: Optional[Any],
+        llm_calls: int,
+        tools: List[Any]
+    ) -> dict:
+        """
+        当达到最大迭代次数时，让 LLM 基于现有信息总结并返回结果
+        
+        Args:
+            messages: 当前的对话历史
+            system_prompt: 系统提示词
+            finish_tool: 完成分析的工具函数
+            llm_calls: 已进行的 LLM 调用次数
+            tools: 可用工具列表
+            
+        Returns:
+            包含总结结果的字典
+        """
+        finalize_prompt = """\n\n[系统通知] 已达到最大迭代次数限制。请基于已收集的所有信息，立即总结分析结果。
+
+要求：
+1. 根据已有信息给出最佳答案
+2. 如果有 finish_analysis 工具，请调用它提交结果
+3. 如果没有 finish 工具或无法调用，请在回复中直接总结发现
+4. 说明分析因迭代限制而终止"""
+
+        # 添加总结提示到消息中
+        if messages and len(messages) > 0:
+            last_message = messages[-1]
+            if isinstance(last_message, HumanMessage):
+                last_message.content += finalize_prompt
+            else:
+                messages.append(HumanMessage(content=finalize_prompt))
+        else:
+            messages.append(HumanMessage(content=finalize_prompt))
+
+        try:
+            # 使用 ToolBasedLLMClient 模式
+            if hasattr(self._tool_client, 'atool_call'):
+                result = await self._tool_client.atool_call(
+                    messages=messages,
+                    tools=tools,
+                    system_prompt=system_prompt
+                )
+                llm_calls += 1
+
+                if result.success and result.tool_calls:
+                    for tc in result.tool_calls:
+                        tool_name = tc["name"]
+                        args = tc["args"]
+
+                        if finish_tool and tool_name == finish_tool.__name__:
+                            self._log_execution_end(
+                                True,
+                                f"Analysis completed after max iterations (forced finalize)",
+                                llm_calls
+                            )
+                            return {
+                                "success": True,
+                                "result": args,
+                                "max_iterations_reached": True,
+                                "note": "Analysis terminated due to max iterations, results based on collected information"
+                            }
+
+                # 没有调用 finish 工具，返回文本总结
+                self._log_execution_end(
+                    True,
+                    f"Analysis completed with text summary after max iterations",
+                    llm_calls
+                )
+                return {
+                    "success": True,
+                    "content": result.content,
+                    "max_iterations_reached": True,
+                    "note": "Analysis terminated due to max iterations, results based on collected information"
+                }
+
+            else:
+                # 直接使用 LLM bind_tools 模式
+                llm = self._tool_client
+                llm_with_tools = llm.bind_tools(tools)
+
+                messages_with_system: List[BaseMessage] = [SystemMessage(content=system_prompt)] + messages
+                response = await llm_with_tools.ainvoke(messages_with_system)
+                llm_calls += 1
+
+                tool_calls = getattr(response, 'tool_calls', None)
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        tool_name = tc.get('name', '')
+                        args = tc.get('args', {})
+
+                        if finish_tool and tool_name == finish_tool.__name__:
+                            self._log_execution_end(
+                                True,
+                                f"Analysis completed after max iterations (forced finalize)",
+                                llm_calls
+                            )
+                            return {
+                                "success": True,
+                                "result": args,
+                                "max_iterations_reached": True,
+                                "note": "Analysis terminated due to max iterations, results based on collected information"
+                            }
+
+                # 没有调用 finish 工具，返回文本总结
+                self._log_execution_end(
+                    True,
+                    f"Analysis completed with text summary after max iterations",
+                    llm_calls
+                )
+                return {
+                    "success": True,
+                    "content": response.content,
+                    "max_iterations_reached": True,
+                    "note": "Analysis terminated due to max iterations, results based on collected information"
+                }
+
+        except Exception as e:
+            error_msg = f"Error during finalization: {str(e)}"
+            self._log_execution_end(False, error_msg, llm_calls)
+            return {
+                "error": error_msg,
+                "max_iterations_reached": True,
+                "partial_success": False
+            }
 
     # ==========================================================================
     # BaseStaticAnalysisEngine 接口实现
@@ -465,11 +590,11 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
     async def get_function_def(
             self,
             function_name: Optional[str] = None,
-            function_signature: Optional[str] = None,
+            function_identifier: Optional[str] = None,
             location: Optional[str] = None,
     ) -> Optional[FunctionDef]:
         """通过 LLM Agent 获取函数定义"""
-        query = function_signature or function_name or location
+        query = function_identifier or function_name or location
         if not query:
             return None
 
@@ -539,7 +664,7 @@ Guidelines:
 
     async def get_callee(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> List[CallSite]:
         """通过 LLM Agent 获取函数内调用的子函数"""
 
@@ -569,20 +694,20 @@ Guidelines:
 - Include the actual code line as context
 - List the arguments if they can be determined"""
 
-        user_prompt = f"Find all function calls within: {function_signature}\n\nSource root: {self.source_root}"
+        user_prompt = f"Find all function calls within: {function_identifier}\n\nSource root: {self.source_root}"
 
-        result = await self._run_analysis(system_prompt, user_prompt, finish_analysis, target=f"get_callee:{function_signature}")
+        result = await self._run_analysis(system_prompt, user_prompt, finish_analysis, target=f"get_callee:{function_identifier}")
 
         if result.get("success") and result.get("result"):
             calls = result["result"].get("calls", [])
-            caller_name = function_signature.split('(')[0].split()[-1].strip()
+            caller_name = function_identifier.split('(')[0].split()[-1].strip()
 
             return [
                 CallSite(
                     caller_name=caller_name,
-                    caller_signature=function_signature,
+                    caller_identifier=function_identifier,
                     callee_name=c.get("callee_name", ""),
-                    callee_signature=c.get("callee_name", ""),
+                    callee_identifier=c.get("callee_name", ""),
                     line_number=c.get("line_number", 0),
                     file_path="",
                     call_context=c.get("context", ""),
@@ -595,10 +720,10 @@ Guidelines:
 
     async def get_caller(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> List[CallSite]:
         """通过 LLM Agent 获取调用该函数的父函数"""
-        func_name = function_signature.split('(')[0].split()[-1].strip()
+        func_name = function_identifier.split('(')[0].split()[-1].strip()
 
         def finish_analysis(callers: list = None):
             """
@@ -607,7 +732,7 @@ Guidelines:
             Args:
                 callers: List of caller dicts, each containing:
                     - caller_name: Name of the calling function
-                    - caller_signature: Full signature of caller (optional)
+                    - caller_identifier: Full identifier of caller (optional)
                     - file_path: Path to the file
                     - line_number: Line number of the call
                     - context: The actual code line containing the call
@@ -638,9 +763,9 @@ Exclude:
             return [
                 CallSite(
                     caller_name=c.get("caller_name", ""),
-                    caller_signature=c.get("caller_signature", c.get("caller_name", "")),
+                    caller_identifier=c.get("caller_identifier", c.get("caller_name", "")),
                     callee_name=func_name,
-                    callee_signature=function_signature,
+                    callee_identifier=function_identifier,
                     line_number=c.get("line_number", 0),
                     file_path=c.get("file_path", ""),
                     call_context=c.get("context", ""),
@@ -709,7 +834,7 @@ Reference types:
 
     async def get_variable_constraints(
             self,
-            function_signature: str,
+            function_identifier: str,
             var_name: str,
             line_number: Optional[int] = None,
     ) -> List[VariableConstraint]:
@@ -742,7 +867,7 @@ Constraint types:
 - type_check: Checks variable type
 - other: Other types of constraints"""
 
-        user_prompt = f"Analyze variable '{var_name}' in function '{function_signature}'"
+        user_prompt = f"Analyze variable '{var_name}' in function '{function_identifier}'"
         if line_number:
             user_prompt += f" (focus around line {line_number})"
         user_prompt += f"\n\nSource root: {self.source_root}"
@@ -768,20 +893,20 @@ Constraint types:
     async def _resolve_static_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str] = None,
+            caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """通过 LLM Agent 解析调用点"""
-        if not callsite.function_signature:
+        if not callsite.function_identifier:
             return None
 
-        func_name = callsite.function_signature.split('(')[0].strip()
+        func_name = callsite.function_identifier.split('(')[0].strip()
 
         def finish_analysis(resolved: bool, signature: str = "", reason: str = ""):
             """
-            Report the resolved function signature.
+            Report the resolved function identifier.
             
             Args:
-                resolved: Whether the signature was successfully resolved.
+                resolved: Whether the identifier was successfully resolved.
                 signature: The resolved full signature.
                 reason: Explanation if not resolved.
             """
@@ -794,9 +919,9 @@ Your workflow:
 2. Otherwise, search for the function definition
 3. Call finish_analysis with the resolved signature"""
 
-        user_prompt = f"Resolve function call: {callsite.function_signature}\nLocation: {callsite.file_path}:{callsite.line_number}"
-        if caller_signature:
-            user_prompt += f"\nCalled from: {caller_signature}"
+        user_prompt = f"Resolve function call: {callsite.function_identifier}\nLocation: {callsite.file_path}:{callsite.line_number}"
+        if caller_identifier:
+            user_prompt += f"\nCalled from: {caller_identifier}"
         user_prompt += f"\n\nSource root: {self.source_root}"
 
         result = await self._run_analysis(system_prompt, user_prompt, finish_analysis, target=f"_resolve_static_callsite:{func_name}")
@@ -808,46 +933,83 @@ Your workflow:
 
         return None
 
-    async def search_functions(
+    async def search_symbol(
             self,
             query: str,
-            limit: int = 10,
-    ) -> List[FunctionDef]:
-        """通过 LLM Agent 搜索函数"""
+            options: Optional[Any] = None,
+    ) -> List[SearchResult]:
+        """通过 LLM Agent 搜索符号
 
-        def finish_analysis(functions: list = None):
+        Args:
+            query: 搜索关键词
+            options: 搜索选项 (SearchOptions)，可选，包含 limit/offset 等配置
+
+        Returns:
+            SearchResult 列表，包含符号类型信息
+        """
+        from .base_static_analysis_engine import SymbolType
+
+        # 从 options 中提取参数
+        limit = 10
+        offset = 0
+        if options:
+            limit = getattr(options, 'limit', 10)
+            offset = getattr(options, 'offset', 0)
+
+        def finish_analysis(symbols: list = None):
             """
-            Report matching functions.
-            
+            Report matching symbols.
+
             Args:
-                functions: List of function dicts, each containing:
-                    - name: Function name
+                symbols: List of symbol dicts, each containing:
+                    - name: Symbol name
                     - signature: Full signature
+                    - symbol_type: Type of symbol (function, class, global_var, etc.)
                     - file_path: Path to file
                     - line: Line number
             """
             pass
 
-        system_prompt = """You are an expert code analyst. Search for functions matching a query.
+        system_prompt = """You are an expert code analyst. Search for symbols matching a query.
 
 Your workflow:
 1. Use search_code to find potential matches
-2. Examine each match to confirm it's a function definition
-3. Call finish_analysis with all matching functions"""
+2. Examine each match to confirm it's a symbol definition (function, class, global variable)
+3. Call finish_analysis with all matching symbols, including their types"""
 
-        user_prompt = f"Search for functions matching: {query}\nReturn up to {limit} results\n\nSource root: {self.source_root}"
+        # 请求更多结果以支持 offset
+        fetch_limit = limit + offset
+        user_prompt = f"Search for symbols matching: {query}\nReturn up to {fetch_limit} results\n\nSource root: {self.source_root}"
 
-        result = await self._run_analysis(system_prompt, user_prompt, finish_analysis, target=f"search_functions:{query}")
+        result = await self._run_analysis(system_prompt, user_prompt, finish_analysis, target=f"search_symbol:{query}")
 
         if result.get("success") and result.get("result"):
-            funcs = result["result"].get("functions", [])[:limit]
+            symbols = result["result"].get("symbols", [])
 
             results = []
-            for f in funcs:
-                func_def = await self.get_function_def(function_name=f.get("name"))
-                if func_def:
-                    results.append(func_def)
+            for s in symbols:
+                # 解析符号类型
+                type_str = s.get("symbol_type", "function").lower()
+                if type_str == "class":
+                    symbol_type = SymbolType.CLASS
+                elif type_str == "method":
+                    symbol_type = SymbolType.METHOD
+                elif type_str in ["global_var", "global_variable", "variable"]:
+                    symbol_type = SymbolType.GLOBAL_VAR
+                elif type_str == "field":
+                    symbol_type = SymbolType.FIELD
+                else:
+                    symbol_type = SymbolType.FUNCTION
 
-            return results
+                results.append(SearchResult(
+                    name=s.get("name", ""),
+                    signature=s.get("signature", ""),
+                    symbol_type=symbol_type,
+                    file_path=s.get("file_path"),
+                    line=s.get("line", 0),
+                ))
+
+            # 应用 offset 和 limit
+            return results[offset:offset + limit]
 
         return []

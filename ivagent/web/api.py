@@ -285,23 +285,57 @@ async def get_log_entry(entry_id: str):
     )
 
 
-@app.get("/api/sessions", response_model=List[SessionInfo])
-async def get_sessions():
-    """获取所有会话列表"""
+class SessionListResponse(BaseModel):
+    """会话列表响应"""
+    total: int
+    sessions: List[SessionInfo]
+
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+async def get_sessions(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    search: Optional[str] = None
+):
+    """获取会话列表（支持分页）"""
     logger = get_logger()
-    sessions = logger.get_sessions()
     
-    return [
-        SessionInfo(
-            session_id=s["session_id"],
-            start_time=s["start_time"],
-            end_time=s.get("end_time"),
-            total_calls=s["total_calls"],
-            success_calls=s["success_calls"],
-            failed_calls=s["failed_calls"]
-        )
-        for s in sessions
-    ]
+    # 如果有搜索，目前只能先全量获取再过滤（SQLite 不支持复杂的 JSON/Like 搜索优化，或者需要改写 SQL）
+    # 但如果仅仅是按 session_id 搜索，可以在 storage 层实现，但目前 get_sessions 不支持 filter
+    # 为了解决性能问题，如果无搜索，直接分页。如果有搜索，退化为旧逻辑（或者以后优化）
+    
+    if search:
+        # 搜索模式：性能较差，但用户搜索时通常结果不多
+        # 获取所有会话（注意：这里调用的是旧的不带 limit 的逻辑？不，现在 get_sessions 必传 limit/offset）
+        # 我们需要一个新的方法 get_all_sessions 或者 modify get_sessions logic
+        # 暂时用大 limit
+        all_sessions = logger.get_sessions(limit=10000, offset=0)
+        search = search.lower()
+        filtered_sessions = [
+            s for s in all_sessions 
+            if search in s["session_id"].lower()
+        ]
+        total = len(filtered_sessions)
+        paginated_sessions = filtered_sessions[offset : offset + limit]
+    else:
+        # 高性能分页模式
+        total = logger.get_session_count()
+        paginated_sessions = logger.get_sessions(limit=limit, offset=offset)
+    
+    return SessionListResponse(
+        total=total,
+        sessions=[
+            SessionInfo(
+                session_id=s["session_id"],
+                start_time=s["start_time"],
+                end_time=s.get("end_time"),
+                total_calls=s["total_calls"],
+                success_calls=s["success_calls"],
+                failed_calls=s["failed_calls"]
+            )
+            for s in paginated_sessions
+        ]
+    )
 
 
 @app.get("/api/sessions/{session_id}/logs", response_model=List[LogEntryResponse])
@@ -552,6 +586,20 @@ async def delete_old_logs(days: int = Query(default=7, ge=1)):
     logger = get_logger()
     deleted = logger.storage.delete_old_entries(days)
     return {"deleted": deleted}
+
+
+@app.delete("/api/logs/{entry_id}")
+async def delete_log_entry(entry_id: str):
+    """删除单个日志条目"""
+    logger = get_logger()
+    if not hasattr(logger.storage, 'delete_entry'):
+        raise HTTPException(status_code=501, detail="Storage backend does not support deletion")
+        
+    success = logger.storage.delete_entry(entry_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Log entry not found")
+    
+    return {"deleted": True, "id": entry_id}
 
 
 @app.post("/api/export")
@@ -897,7 +945,7 @@ class VulnerabilityResponse(BaseModel):
     description: str
     severity: str
     confidence: float
-    function_signature: str
+    function_identifier: str
     location: str
     file_path: Optional[str]
     line_number: Optional[int]
@@ -943,7 +991,7 @@ async def list_vulnerabilities(
     severity: Optional[str] = Query(None, description="严重程度过滤 (critical/high/medium/low/info)"),
     status: Optional[str] = Query(None, description="状态过滤 (new/confirmed/false_positive/fixed/ignored)"),
     vuln_type: Optional[str] = Query(None, description="漏洞类型过滤"),
-    function_signature: Optional[str] = Query(None, description="函数签名搜索"),
+    function_identifier: Optional[str] = Query(None, description="函数标识符搜索"),
     search: Optional[str] = Query(None, description="关键词搜索"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -960,7 +1008,7 @@ async def list_vulnerabilities(
         severity=severity_list,
         status=status_list,
         vuln_type=vuln_type,
-        function_signature=function_signature,
+        function_identifier=function_identifier,
         search_keyword=search,
         limit=limit,
         offset=offset,

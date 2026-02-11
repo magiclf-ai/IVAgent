@@ -171,17 +171,17 @@ class FunctionSummaryCache:
         if self.verbose:
             print(f"[{level}] FunctionSummaryCache: {message}")
     
-    def _generate_cache_key(self, function_signature: str, context_hash: Optional[str] = None) -> str:
+    def _generate_cache_key(self, function_identifier: str, context_hash: Optional[str] = None) -> str:
         """
         生成缓存键
         
-        使用可读的函数签名作为键，便于调试和维护。
+        使用可读的函数标识符作为键，便于调试和维护。
         对特殊字符进行清理，确保键的合法性。
         """
-        # 清理函数签名中的特殊字符，使其适合作为 Redis 键
+        # 清理函数标识符中的特殊字符，使其适合作为 Redis 键
         # 替换空格、换行、制表符等空白字符为下划线
         import re
-        clean_sig = re.sub(r'\s+', '_', function_signature.strip())
+        clean_sig = re.sub(r'\s+', '_', function_identifier.strip())
         
         # 如果签名太长，使用前缀+哈希的方式
         max_len = 200
@@ -261,29 +261,29 @@ class FunctionSummaryCache:
             print(f"[FunctionSummaryCache] Lock release error: {e}")
             return False
     
-    def get(self, function_signature: str, context_hash: Optional[str] = None) -> Optional[Any]:
+    def get(self, function_identifier: str, context_hash: Optional[str] = None) -> Optional[Any]:
         """获取函数摘要缓存"""
-        cache_key = self._generate_cache_key(function_signature, context_hash)
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
         return self.cache.get(cache_key)
     
-    def set(self, function_signature: str, value: Any, context_hash: Optional[str] = None, ttl: Optional[int] = None) -> bool:
+    def set(self, function_identifier: str, value: Any, context_hash: Optional[str] = None, ttl: Optional[int] = None) -> bool:
         """设置函数摘要缓存"""
-        cache_key = self._generate_cache_key(function_signature, context_hash)
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
         return self.cache.set(cache_key, value, ttl or self.default_ttl)
     
-    def refresh_ttl(self, function_signature: str, context_hash: Optional[str] = None, ttl: Optional[int] = None) -> bool:
+    def refresh_ttl(self, function_identifier: str, context_hash: Optional[str] = None, ttl: Optional[int] = None) -> bool:
         """
         刷新函数摘要缓存的 TTL
         
         在缓存命中时调用，延长缓存的存活时间。
         使用默认 TTL 或指定的 TTL。
         """
-        cache_key = self._generate_cache_key(function_signature, context_hash)
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
         return self.cache.expire(cache_key, ttl or self.default_ttl)
     
     async def get_or_compute(
         self,
-        function_signature: str,
+        function_identifier: str,
         compute_func,
         context_hash: Optional[str] = None,
         ttl: Optional[int] = None,
@@ -295,16 +295,16 @@ class FunctionSummaryCache:
         使用 Redis 分布式锁实现跨客户端的并发控制。
         添加 compute_func 超时控制，防止因 RPC 卡住导致锁长期持有。
         """
-        cache_key = self._generate_cache_key(function_signature, context_hash)
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
         status_key = self._make_status_key(cache_key)
         lock_key = self._make_lock_key(cache_key)
         
         # 步骤1: 检查缓存
-        cached = self.get(function_signature, context_hash)
+        cached = self.get(function_identifier, context_hash)
         if cached is not None:
-            self.log(f"Cache hit for {function_signature}")
+            self.log(f"Cache hit for {function_identifier}")
             # 刷新缓存 TTL，延长存活时间
-            self.refresh_ttl(function_signature, context_hash, ttl)
+            self.refresh_ttl(function_identifier, context_hash, ttl)
             return cached
         
         # 步骤2: 检查状态并等待或执行
@@ -313,32 +313,32 @@ class FunctionSummaryCache:
             status = self._get_status(status_key)
             
             if status == AnalysisState.ANALYZING:
-                self.log(f"Waiting for ongoing analysis: {function_signature}")
+                self.log(f"Waiting for ongoing analysis: {function_identifier}")
                 await asyncio.sleep(self.wait_interval)
                 wait_time += self.wait_interval
                 
                 # 再次检查缓存
-                cached = self.get(function_signature, context_hash)
+                cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit after waiting: {function_signature}")
+                    self.log(f"Cache hit after waiting: {function_identifier}")
                     # 刷新缓存 TTL
-                    self.refresh_ttl(function_signature, context_hash, ttl)
+                    self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
                 continue
             
             elif status == AnalysisState.COMPLETED:
-                cached = self.get(function_signature, context_hash)
+                cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit (status=completed): {function_signature}")
+                    self.log(f"Cache hit (status=completed): {function_identifier}")
                     # 刷新缓存 TTL
-                    self.refresh_ttl(function_signature, context_hash, ttl)
+                    self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
                 # 缓存丢失，重新分析
-                self.log(f"Cache lost (status=completed but no data), retrying: {function_signature}")
+                self.log(f"Cache lost (status=completed but no data), retrying: {function_identifier}")
                 self._delete_status(status_key)
             
             elif status == AnalysisState.FAILED:
-                self.log(f"Previous analysis failed, retrying: {function_signature}", "WARNING")
+                self.log(f"Previous analysis failed, retrying: {function_identifier}", "WARNING")
                 self._delete_status(status_key)
             
             # 尝试获取分布式锁执行分析
@@ -353,11 +353,11 @@ class FunctionSummaryCache:
             # 获取锁成功，执行分析
             try:
                 # 双重检查缓存
-                cached = self.get(function_signature, context_hash)
+                cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit (double-check): {function_signature}")
+                    self.log(f"Cache hit (double-check): {function_identifier}")
                     # 刷新缓存 TTL
-                    self.refresh_ttl(function_signature, context_hash, ttl)
+                    self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
                 
                 # 设置状态为分析中（只有不存在时才设置，避免覆盖其他进程）
@@ -371,7 +371,7 @@ class FunctionSummaryCache:
                     wait_time += self.wait_interval
                     continue
                 
-                self.log(f"Starting analysis: {function_signature}")
+                self.log(f"Starting analysis: {function_identifier}")
                 
                 # 执行分析（compute_func 是异步函数），添加超时控制
                 try:
@@ -381,23 +381,23 @@ class FunctionSummaryCache:
                     )
                 except asyncio.TimeoutError:
                     self._set_status(status_key, AnalysisState.FAILED, ttl=300)
-                    self.log(f"Analysis timeout after {compute_timeout}s: {function_signature}", "ERROR")
-                    raise RuntimeError(f"Analysis timeout for {function_signature} after {compute_timeout}s")
+                    self.log(f"Analysis timeout after {compute_timeout}s: {function_identifier}", "ERROR")
+                    raise RuntimeError(f"Analysis timeout for {function_identifier} after {compute_timeout}s")
                 
                 # 缓存结果
-                self.set(function_signature, result, context_hash, ttl)
+                self.set(function_identifier, result, context_hash, ttl)
                 
                 # 更新状态为完成（延长 TTL，避免过早过期）
                 self._set_status(status_key, AnalysisState.COMPLETED, ttl=3600)
                 
-                self.log(f"Analysis completed: {function_signature}")
+                self.log(f"Analysis completed: {function_identifier}")
                 return result
                 
             except Exception as e:
                 # 只在不是超时错误时设置失败状态（超时错误已设置）
                 if not isinstance(e, RuntimeError) or "timeout" not in str(e).lower():
                     self._set_status(status_key, AnalysisState.FAILED, ttl=300)
-                self.log(f"Analysis failed: {function_signature} - {e}", "ERROR")
+                self.log(f"Analysis failed: {function_identifier} - {e}", "ERROR")
                 raise
                 
             finally:
@@ -409,7 +409,7 @@ class FunctionSummaryCache:
                     pass
         
         # 超时，最后尝试直接计算
-        self.log(f"Wait timeout, computing directly: {function_signature}", "WARNING")
+        self.log(f"Wait timeout, computing directly: {function_identifier}", "WARNING")
         return await asyncio.wait_for(compute_func(), timeout=compute_timeout)
 
 

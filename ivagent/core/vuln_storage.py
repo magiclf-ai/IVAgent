@@ -52,7 +52,7 @@ class VulnerabilityRecord:
     confidence: float                           # 置信度 (0-1)
     
     # 位置信息
-    function_signature: str                     # 函数签名
+    function_identifier: str                     # 函数标识符
     location: str                               # 具体位置
     file_path: Optional[str] = None             # 文件路径
     line_number: Optional[int] = None           # 行号
@@ -107,7 +107,7 @@ class VulnerabilityRecord:
             "description": self.description,
             "severity": self.severity,
             "confidence": self.confidence,
-            "function_signature": self.function_signature,
+            "function_identifier": self.function_identifier,
             "location": self.location,
             "file_path": self.file_path,
             "line_number": self.line_number,
@@ -193,7 +193,7 @@ class VulnerabilityStorage:
                 description TEXT NOT NULL,
                 severity TEXT NOT NULL,
                 confidence REAL NOT NULL,
-                function_signature TEXT NOT NULL,
+                function_identifier TEXT NOT NULL,
                 location TEXT NOT NULL,
                 file_path TEXT,
                 line_number INTEGER,
@@ -236,7 +236,7 @@ class VulnerabilityStorage:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_severity ON vulnerabilities(severity)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_status ON vulnerabilities(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_type ON vulnerabilities(type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_function ON vulnerabilities(function_signature)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_function ON vulnerabilities(function_identifier)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_agent ON vulnerabilities(agent_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vuln_created ON vulnerabilities(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_session_status ON scan_sessions(status)")
@@ -248,14 +248,14 @@ class VulnerabilityStorage:
         conn = self._get_conn()
         conn.execute("""
             INSERT OR REPLACE INTO vulnerabilities 
-            (id, name, type, description, severity, confidence, function_signature, location,
+            (id, name, type, description, severity, confidence, function_identifier, location,
              file_path, line_number, data_flow_source, data_flow_intermediate, data_flow_sink, data_flow_path,
              evidence, remediation, code_snippet, agent_id, parent_agent_id, call_stack,
              status, created_at, updated_at, verified_by, verification_note, tags, metadata)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             vuln.vuln_id, vuln.name, vuln.type, vuln.description, vuln.severity, vuln.confidence,
-            vuln.function_signature, vuln.location, vuln.file_path, vuln.line_number,
+            vuln.function_identifier, vuln.location, vuln.file_path, vuln.line_number,
             vuln.data_flow_source, vuln.data_flow_intermediate, vuln.data_flow_sink, vuln.data_flow_path,
             vuln.evidence, vuln.remediation, vuln.code_snippet, vuln.agent_id, vuln.parent_agent_id, vuln.call_stack,
             vuln.status, vuln.created_at, vuln.updated_at, vuln.verified_by, vuln.verification_note, vuln.tags, vuln.metadata
@@ -302,7 +302,7 @@ class VulnerabilityStorage:
         severity: Optional[Union[str, List[str]]] = None,
         status: Optional[Union[str, List[str]]] = None,
         vuln_type: Optional[Union[str, List[str]]] = None,
-        function_signature: Optional[str] = None,
+        function_identifier: Optional[str] = None,
         agent_id: Optional[str] = None,
         search_keyword: Optional[str] = None,
         order_by: str = "created_at",
@@ -340,9 +340,9 @@ class VulnerabilityStorage:
                 conditions.append(f"type IN ({','.join('?' * len(vuln_type))})")
                 params.extend(vuln_type)
         
-        if function_signature:
-            conditions.append("function_signature LIKE ?")
-            params.append(f"%{function_signature}%")
+        if function_identifier:
+            conditions.append("function_identifier LIKE ?")
+            params.append(f"%{function_identifier}%")
         
         if agent_id:
             conditions.append("agent_id = ?")
@@ -436,9 +436,9 @@ class VulnerabilityStorage:
         
         # 按函数统计
         function_stats = conn.execute("""
-            SELECT function_signature, COUNT(*) as count 
+            SELECT function_identifier, COUNT(*) as count 
             FROM vulnerabilities 
-            GROUP BY function_signature
+            GROUP BY function_identifier
             ORDER BY count DESC
             LIMIT 10
         """).fetchall()
@@ -547,7 +547,7 @@ class VulnerabilityStorage:
             description=row['description'],
             severity=row['severity'],
             confidence=row['confidence'],
-            function_signature=row['function_signature'],
+            function_identifier=row['function_identifier'],
             location=row['location'],
             file_path=row['file_path'],
             line_number=row['line_number'],
@@ -618,7 +618,7 @@ class VulnerabilityManager:
         description: str,
         severity: str,
         confidence: float,
-        function_signature: str,
+        function_identifier: str,
         location: str,
         agent_id: Optional[str] = None,
         **kwargs
@@ -632,7 +632,7 @@ class VulnerabilityManager:
             description: 漏洞描述
             severity: 危害等级 (critical/high/medium/low/info)
             confidence: 置信度 (0-1)
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符（全局唯一）
             location: 具体位置
             agent_id: Agent ID
             **kwargs: 其他可选字段
@@ -647,7 +647,7 @@ class VulnerabilityManager:
             description=description,
             severity=severity,
             confidence=confidence,
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             location=location,
             agent_id=agent_id,
             **kwargs
@@ -658,7 +658,7 @@ class VulnerabilityManager:
     def import_from_agent_result(
         self,
         vulnerabilities: List[Any],
-        function_signature: str,
+        function_identifier: str,
         agent_id: Optional[str] = None,
         parent_agent_id: Optional[str] = None,
     ) -> List[VulnerabilityRecord]:
@@ -667,7 +667,7 @@ class VulnerabilityManager:
         
         Args:
             vulnerabilities: Agent 返回的漏洞列表
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符（全局唯一）
             agent_id: Agent ID
             parent_agent_id: 父 Agent ID
         
@@ -715,7 +715,7 @@ class VulnerabilityManager:
                 description=vuln_dict.get('description', ''),
                 severity=severity,
                 confidence=vuln_dict.get('confidence', 0.5),
-                function_signature=function_signature,
+                function_identifier=function_identifier,
                 location=vuln_dict.get('location', ''),
                 file_path=vuln_dict.get('file_path'),
                 line_number=vuln_dict.get('line_number'),
@@ -728,7 +728,7 @@ class VulnerabilityManager:
                 code_snippet=vuln_dict.get('code_snippet'),
                 agent_id=agent_id,
                 parent_agent_id=parent_agent_id,
-                call_stack=json.dumps(vuln_dict.get('call_stack', [])),
+                call_stack=json.dumps(vuln_dict.get('metadata', {}).get('call_stack', [])),
                 tags=json.dumps(vuln_dict.get('tags', [])),
                 metadata=json.dumps(vuln_dict.get('metadata', {})),
             )

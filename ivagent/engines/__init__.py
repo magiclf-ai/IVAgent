@@ -13,6 +13,9 @@ from .base_static_analysis_engine import (
     CrossReference,
     VariableConstraint,
     TargetType,
+    SymbolType,
+    SearchResult,
+    SearchOptions,
 )
 
 # 引擎基类
@@ -54,6 +57,9 @@ __all__ = [
     "CrossReference",
     "VariableConstraint",
     "TargetType",
+    "SymbolType",
+    "SearchResult",
+    "SearchOptions",
     # 引擎基类
     "BaseStaticAnalysisEngine",
     "LangGraphEngine",

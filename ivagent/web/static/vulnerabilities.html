@@ -4,381 +4,330 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>漏洞管理 - IVAgent</title>
-    <link rel="stylesheet" href="/static/vuln-style.css">
-    <link rel="stylesheet" href="/static/highlight-github.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=ZCOOL+KuaiLe&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="/static/bootstrap.min.css" rel="stylesheet">
+    <link href="/static/bootstrap-icons.min.css" rel="stylesheet">
+    <link href="/static/style.css" rel="stylesheet">
+    <link href="/static/highlight-github.min.css" rel="stylesheet">
     <script src="/static/highlight.min.js"></script>
     <script src="/static/chart.umd.min.js"></script>
 </head>
 <body>
-    <div class="app">
-        <!-- 侧边栏 -->
-        <aside class="sidebar">
-            <div class="logo">
-                <h1>LLM Logger</h1>
-                <span class="version">v1.0</span>
+
+    <div class="d-flex" id="wrapper">
+        <!-- Sidebar -->
+        <div id="sidebar-wrapper">
+            <div class="sidebar-heading">
+                <i class="bi bi-robot text-primary"></i> IVAgent
+                <small class="ms-2" style="font-size: 0.8rem; opacity: 0.7;">v1.0</small>
+            </div>
+            <div class="list-group list-group-flush my-3">
+                <a href="/#dashboard" class="list-group-item list-group-item-action nav-item">
+                    <i class="bi bi-speedometer2"></i> 仪表盘
+                </a>
+                <a href="/#logs" class="list-group-item list-group-item-action nav-item">
+                    <i class="bi bi-list-ul"></i> 日志列表
+                </a>
+                <a href="/#agents" class="list-group-item list-group-item-action nav-item">
+                    <i class="bi bi-diagram-3"></i> Agent 时间轴
+                </a>
+                <a href="/#toolcalls" class="list-group-item list-group-item-action nav-item">
+                    <i class="bi bi-tools"></i> Tool Call 日志
+                </a>
+                <div class="sidebar-heading mt-4" style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(255,255,255,0.4); border-bottom: none; padding-bottom: 0;">
+                    系统管理
+                </div>
+                <a href="/vulnerabilities" class="list-group-item list-group-item-action nav-item active">
+                    <i class="bi bi-shield-exclamation"></i> 漏洞管理
+                </a>
+                <a href="/redis" class="list-group-item list-group-item-action nav-item">
+                    <i class="bi bi-database"></i> Redis 缓存
+                </a>
             </div>
             
-            <nav class="nav">
-                <a href="/" class="nav-item">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="3" width="7" height="7"></rect>
-                        <rect x="14" y="3" width="7" height="7"></rect>
-                        <rect x="14" y="14" width="7" height="7"></rect>
-                        <rect x="3" y="14" width="7" height="7"></rect>
-                    </svg>
-                    仪表盘
-                </a>
-                <a href="/" class="nav-item" onclick="window.location.href='/#logs'; return false;">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                        <polyline points="14 2 14 8 20 8"></polyline>
-                        <line x1="16" y1="13" x2="8" y2="13"></line>
-                        <line x1="16" y1="17" x2="8" y2="17"></line>
-                        <polyline points="10 9 9 9 8 9"></polyline>
-                    </svg>
-                    日志列表
-                </a>
-                <a href="/" class="nav-item" onclick="window.location.href='/#sessions'; return false;">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                        <circle cx="9" cy="7" r="4"></circle>
-                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                    </svg>
-                    会话管理
-                </a>
-                <a href="/" class="nav-item" onclick="window.location.href='/#agents'; return false;">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
-                        <path d="M2 17l10 5 10-5"></path>
-                        <path d="M2 12l10 5 10-5"></path>
-                    </svg>
-                    Agent 时间轴
-                </a>
-                <a href="/" class="nav-item" onclick="window.location.href='/#analytics'; return false;">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="20" x2="18" y2="10"></line>
-                        <line x1="12" y1="20" x2="12" y2="4"></line>
-                        <line x1="6" y1="20" x2="6" y2="14"></line>
-                    </svg>
-                    统计分析
-                </a>
-                <a href="/vulnerabilities" class="nav-item active">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-                        <line x1="12" y1="8" x2="12" y2="12"></line>
-                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
-                    </svg>
-                    漏洞管理
-                </a>
-                <a href="/redis" class="nav-item">
-                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
-                        <path d="M3 5V19A9 3 0 0 0 21 19V5"></path>
-                        <path d="M3 12A9 3 0 0 0 21 12"></path>
-                    </svg>
-                    Redis 缓存
-                </a>
+            <div class="sidebar-footer">
+                <div class="d-flex align-items-center justify-content-between">
+                    <span id="ws-text" class="small" style="opacity: 0.7">离线</span>
+                    <span id="ws-status" class="status-dot offline"></span>
+                </div>
+            </div>
+        </div>
+        <!-- /#sidebar-wrapper -->
+
+        <!-- Page Content -->
+        <div id="page-content-wrapper">
+            <nav class="navbar navbar-expand-lg border-bottom mb-4">
+                <div class="container-fluid">
+                    <button class="btn btn-light btn-sm border" id="menu-toggle"><i class="bi bi-list"></i></button>
+                    <span class="navbar-brand ms-3 text-primary fw-bold">漏洞管理中心</span>
+                </div>
             </nav>
-            
-            <div class="connection-status">
-                <span class="status-indicator" id="ws-status"></span>
-                <span class="status-text" id="ws-text">离线</span>
-            </div>
-        </aside>
-        
-        <!-- 主内容区 -->
-        <main class="main">
-            <!-- 顶部统计栏 -->
-            <div class="stats-bar">
-                <div class="stat-card severity-critical">
-                    <div class="stat-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-                            <line x1="12" y1="9" x2="12" y2="13"></line>
-                            <line x1="12" y1="17" x2="12.01" y2="17"></line>
-                        </svg>
-                    </div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="stat-critical">0</span>
-                        <span class="stat-label">严重</span>
-                    </div>
-                </div>
-                <div class="stat-card severity-high">
-                    <div class="stat-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
-                            <path d="M2 17l10 5 10-5"></path>
-                            <path d="M2 12l10 5 10-5"></path>
-                        </svg>
-                    </div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="stat-high">0</span>
-                        <span class="stat-label">高危</span>
-                    </div>
-                </div>
-                <div class="stat-card severity-medium">
-                    <div class="stat-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <line x1="12" y1="8" x2="12" y2="12"></line>
-                            <line x1="12" y1="16" x2="12.01" y2="16"></line>
-                        </svg>
-                    </div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="stat-medium">0</span>
-                        <span class="stat-label">中危</span>
-                    </div>
-                </div>
-                <div class="stat-card severity-low">
-                    <div class="stat-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                            <polyline points="14 2 14 8 20 8"></polyline>
-                            <line x1="16" y1="13" x2="8" y2="13"></line>
-                            <line x1="16" y1="17" x2="8" y2="17"></line>
-                        </svg>
-                    </div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="stat-low">0</span>
-                        <span class="stat-label">低危</span>
-                    </div>
-                </div>
-                <div class="stat-card total">
-                    <div class="stat-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-                        </svg>
-                    </div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="stat-total">0</span>
-                        <span class="stat-label">总计</span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- 图表区域 -->
-            <div class="charts-section">
-                <div class="chart-card">
-                    <h3>漏洞分布</h3>
-                    <div class="chart-container">
-                        <canvas id="severity-chart"></canvas>
-                    </div>
-                </div>
-                <div class="chart-card">
-                    <h3>趋势分析</h3>
-                    <div class="chart-container">
-                        <canvas id="trend-chart"></canvas>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- 工具栏 -->
-            <div class="toolbar">
-                <div class="filter-group">
-                    <label>严重程度</label>
-                    <select id="filter-severity" multiple>
-                        <option value="critical">严重</option>
-                        <option value="high">高危</option>
-                        <option value="medium">中危</option>
-                        <option value="low">低危</option>
-                        <option value="info">信息</option>
-                    </select>
-                </div>
-                <div class="filter-group">
-                    <label>状态</label>
-                    <select id="filter-status">
-                        <option value="">全部状态</option>
-                        <option value="new">新发现</option>
-                        <option value="confirmed">已确认</option>
-                        <option value="false_positive">误报</option>
-                        <option value="fixed">已修复</option>
-                        <option value="ignored">已忽略</option>
-                    </select>
-                </div>
-                <div class="filter-group">
-                    <label>漏洞类型</label>
-                    <select id="filter-type">
-                        <option value="">全部类型</option>
-                    </select>
-                </div>
-                <div class="filter-group search-group">
-                    <input type="text" id="search-input" placeholder="搜索漏洞...">
-                    <button class="btn-icon" id="search-btn">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="11" cy="11" r="8"></circle>
-                            <path d="m21 21-4.35-4.35"></path>
-                        </svg>
-                    </button>
-                </div>
-                <div class="toolbar-actions">
-                    <button class="btn btn-secondary" id="refresh-btn">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polyline points="23 4 23 10 17 10"></polyline>
-                            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
-                        </svg>
-                        刷新
-                    </button>
-                    <button class="btn btn-primary" id="export-btn">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                            <polyline points="7 10 12 15 17 10"></polyline>
-                            <line x1="12" y1="15" x2="12" y2="3"></line>
-                        </svg>
-                        导出
-                    </button>
-                    <button class="btn btn-danger" id="clear-all-btn">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                        </svg>
-                        清除全部
-                    </button>
-                </div>
-            </div>
-            
-            <!-- 漏洞列表 -->
-            <div class="vuln-list-container">
-                <div class="vuln-list-header">
-                    <h2>漏洞列表</h2>
-                    <span class="vuln-count" id="vuln-count">共 0 个漏洞</span>
-                </div>
-                <div class="vuln-list" id="vuln-list">
-                    <!-- 动态生成漏洞卡片 -->
-                </div>
-                <div class="pagination" id="pagination">
-                    <button class="btn btn-sm" id="prev-page" disabled>上一页</button>
-                    <span class="page-info" id="page-info">1 / 1</span>
-                    <button class="btn btn-sm" id="next-page" disabled>下一页</button>
-                </div>
-            </div>
-        </main>
-    </div>
-    
-    <!-- 漏洞详情弹窗 -->
-    <div class="modal" id="vuln-modal">
-        <div class="modal-overlay"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <div class="modal-title">
-                    <span class="severity-badge" id="modal-severity"></span>
-                    <h2 id="modal-title"></h2>
-                </div>
-                <button class="btn-icon close-btn" id="close-modal">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
-            </div>
-            <div class="modal-body">
-                <div class="vuln-detail-grid">
-                    <!-- 左侧：主要信息 -->
-                    <div class="detail-main">
-                        <section class="detail-section">
-                            <h3>漏洞描述</h3>
-                            <p id="modal-description"></p>
-                        </section>
-                        
-                        <section class="detail-section">
-                            <h3>数据流分析</h3>
-                            <div class="data-flow-diagram" id="modal-data-flow">
-                                <!-- 动态生成数据流图 -->
+
+            <div class="container-fluid px-4">
+                <!-- Stats Row -->
+                <div class="row g-4 mb-4">
+                    <div class="col-md-2 col-sm-6">
+                        <div class="card stat-card severity-critical h-100 p-3">
+                            <div class="stat-icon"><i class="bi bi-exclamation-octagon-fill"></i></div>
+                            <div class="stat-details">
+                                <h3 id="stat-critical">0</h3>
+                                <p>严重漏洞</p>
                             </div>
-                        </section>
-                        
-                        <section class="detail-section" id="code-section">
-                            <h3>代码片段</h3>
-                            <div class="code-block">
-                                <pre><code id="modal-code"></code></pre>
-                            </div>
-                        </section>
-                        
-                        <section class="detail-section">
-                            <h3>修复建议</h3>
-                            <div class="remediation-box">
-                                <p id="modal-remediation"></p>
-                            </div>
-                        </section>
+                        </div>
                     </div>
-                    
-                    <!-- 右侧：元信息 -->
-                    <div class="detail-sidebar">
-                        <div class="info-card">
-                            <h4>基本信息</h4>
-                            <div class="info-item">
-                                <span class="info-label">漏洞类型</span>
-                                <span class="info-value" id="modal-type"></span>
+                    <div class="col-md-2 col-sm-6">
+                        <div class="card stat-card severity-high h-100 p-3">
+                            <div class="stat-icon"><i class="bi bi-exclamation-triangle-fill"></i></div>
+                            <div class="stat-details">
+                                <h3 id="stat-high">0</h3>
+                                <p>高危漏洞</p>
                             </div>
-                            <div class="info-item">
-                                <span class="info-label">置信度</span>
-                                <div class="confidence-bar">
-                                    <div class="confidence-fill" id="modal-confidence"></div>
-                                    <span id="modal-confidence-text"></span>
+                        </div>
+                    </div>
+                    <div class="col-md-2 col-sm-6">
+                        <div class="card stat-card severity-medium h-100 p-3">
+                            <div class="stat-icon"><i class="bi bi-exclamation-circle-fill"></i></div>
+                            <div class="stat-details">
+                                <h3 id="stat-medium">0</h3>
+                                <p>中危漏洞</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 col-sm-6">
+                        <div class="card stat-card severity-low h-100 p-3">
+                            <div class="stat-icon"><i class="bi bi-info-circle-fill"></i></div>
+                            <div class="stat-details">
+                                <h3 id="stat-low">0</h3>
+                                <p>低危漏洞</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4 col-sm-12">
+                        <div class="card stat-card total h-100 p-3">
+                            <div class="stat-icon"><i class="bi bi-shield-check"></i></div>
+                            <div class="stat-details">
+                                <h3 id="stat-total">0</h3>
+                                <p>总漏洞数</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Charts Row -->
+                <div class="row g-4 mb-4">
+                    <div class="col-md-4">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h5 class="card-title text-primary mb-3">严重程度分布</h5>
+                                <div style="height: 200px;">
+                                    <canvas id="severity-chart"></canvas>
                                 </div>
                             </div>
-                            <div class="info-item">
-                                <span class="info-label">状态</span>
-                                <select id="modal-status-select" class="status-select">
+                        </div>
+                    </div>
+                    <div class="col-md-8">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <h5 class="card-title text-primary mb-3">发现趋势</h5>
+                                <div style="height: 200px;">
+                                    <canvas id="trend-chart"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Toolbar -->
+                <div class="card mb-4 border-0 shadow-sm">
+                    <div class="card-body p-3">
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-2">
+                                <label class="form-label text-muted small text-uppercase fw-bold">严重程度</label>
+                                <select class="form-select form-select-sm" id="filter-severity">
+                                    <option value="">全部</option>
+                                    <option value="critical">严重</option>
+                                    <option value="high">高危</option>
+                                    <option value="medium">中危</option>
+                                    <option value="low">低危</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label text-muted small text-uppercase fw-bold">状态</label>
+                                <select class="form-select form-select-sm" id="filter-status">
+                                    <option value="">全部</option>
                                     <option value="new">新发现</option>
                                     <option value="confirmed">已确认</option>
-                                    <option value="false_positive">误报</option>
                                     <option value="fixed">已修复</option>
+                                    <option value="false_positive">误报</option>
                                     <option value="ignored">已忽略</option>
                                 </select>
                             </div>
-                        </div>
-                        
-                        <div class="info-card">
-                            <h4>位置信息</h4>
-                            <div class="info-item">
-                                <span class="info-label">函数</span>
-                                <span class="info-value code-text" id="modal-function"></span>
+                            <div class="col-md-2">
+                                <label class="form-label text-muted small text-uppercase fw-bold">漏洞类型</label>
+                                <select class="form-select form-select-sm" id="filter-type">
+                                    <option value="">全部</option>
+                                </select>
                             </div>
-                            <div class="info-item">
-                                <span class="info-label">位置</span>
-                                <span class="info-value" id="modal-location"></span>
+                            <div class="col-md-4">
+                                <label class="form-label text-muted small text-uppercase fw-bold">搜索</label>
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text bg-white border-end-0 text-secondary"><i class="bi bi-search"></i></span>
+                                    <input type="text" class="form-control border-start-0" id="search-input" placeholder="搜索漏洞名称、函数或路径...">
+                                </div>
                             </div>
-                            <div class="info-item">
-                                <span class="info-label">文件</span>
-                                <span class="info-value code-text" id="modal-file"></span>
-                            </div>
-                        </div>
-                        
-                        <div class="info-card">
-                            <h4>分析信息</h4>
-                            <div class="info-item">
-                                <span class="info-label">Agent ID</span>
-                                <span class="info-value code-text" id="modal-agent"></span>
-                            </div>
-                            <div class="info-item">
-                                <span class="info-label">发现时间</span>
-                                <span class="info-value" id="modal-time"></span>
-                            </div>
-                            <div class="info-item">
-                                <span class="info-label">调用栈</span>
-                                <div class="call-stack" id="modal-call-stack"></div>
+                            <div class="col-md-2 text-end">
+                                <button class="btn btn-primary btn-sm w-100" onclick="vulnList.refresh()">
+                                    <i class="bi bi-arrow-clockwise me-1"></i> 刷新列表
+                                </button>
                             </div>
                         </div>
-                        
-                        <div class="info-card">
-                            <h4>证据</h4>
-                            <ul class="evidence-list" id="modal-evidence"></ul>
+                    </div>
+                </div>
+
+                <!-- List -->
+                <div class="card border-0 shadow-sm">
+                    <div class="card-header bg-transparent border-bottom d-flex justify-content-between align-items-center py-3">
+                        <h6 class="mb-0 text-primary fw-bold"><i class="bi bi-list-task me-2"></i>漏洞列表</h6>
+                        <span class="badge bg-light text-secondary border" id="vuln-count">共 0 个漏洞</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="vuln-list" class="list-group list-group-flush">
+                            <!-- JS will populate this -->
                         </div>
-                        
-                        <div class="detail-actions">
-                            <button class="btn btn-primary" id="save-status-btn">保存状态</button>
-                            <button class="btn btn-danger" id="delete-vuln-btn">删除</button>
+                    </div>
+                    <div class="card-footer bg-transparent border-top py-3">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <span class="text-muted small" id="page-info">1 / 1</span>
+                            <div class="btn-group btn-group-sm">
+                                <button class="btn btn-outline-secondary" id="prev-page" disabled><i class="bi bi-chevron-left"></i> 上一页</button>
+                                <button class="btn btn-outline-secondary" id="next-page" disabled>下一页 <i class="bi bi-chevron-right"></i></button>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-    
-    <!-- Toast 提示 -->
-    <div class="toast-container" id="toast-container"></div>
-    
+
+    <!-- Details Modal -->
+    <div class="modal fade" id="vuln-modal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <div class="d-flex align-items-center gap-3">
+                        <span id="modal-severity" class="severity-badge"></span>
+                        <h5 class="modal-title mb-0 fw-bold" id="modal-title">漏洞详情</h5>
+                    </div>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="vuln-detail-grid">
+                        <!-- Left Column: Details -->
+                        <div class="left-col">
+                            <div class="detail-section">
+                                <h3><i class="bi bi-card-text me-2"></i>漏洞描述</h3>
+                                <p id="modal-description" class="text-body mb-0"></p>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-signpost-split me-2"></i>调用路径</h3>
+                                <div id="modal-call-path" class="small font-monospace" style="max-height: 200px; overflow-y: auto;"></div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-diagram-3 me-2"></i>数据流分析</h3>
+                                <div id="modal-data-flow"></div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-list-nested me-2"></i>调用栈</h3>
+                                <div id="modal-call-stack" class="small text-secondary font-monospace" style="max-height: 150px; overflow-y: auto;"></div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-search me-2"></i>证据</h3>
+                                <ul id="modal-evidence" class="ps-3 mb-0 small text-secondary"></ul>
+                            </div>
+
+                            <div class="detail-section" id="code-section">
+                                <h3><i class="bi bi-code-square me-2"></i>相关代码</h3>
+                                <div class="code-block">
+                                    <pre><code class="language-python" id="modal-code"></code></pre>
+                                </div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-tools me-2"></i>修复建议</h3>
+                                <div class="remediation-box" id="modal-remediation"></div>
+                            </div>
+                        </div>
+
+                        <!-- Right Column: Meta Info -->
+                        <div class="right-col">
+                            <div class="detail-section">
+                                <h3><i class="bi bi-info-circle me-2"></i>基本信息</h3>
+                                <div class="info-item">
+                                    <span class="info-label">漏洞类型</span>
+                                    <span class="info-value" id="modal-type"></span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">置信度</span>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <div class="progress" style="width: 60px; height: 6px;">
+                                            <div class="progress-bar bg-primary" id="modal-confidence" role="progressbar"></div>
+                                        </div>
+                                        <span class="info-value" id="modal-confidence-text"></span>
+                                    </div>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">发现时间</span>
+                                    <span class="info-value" id="modal-time"></span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">Agent ID</span>
+                                    <span class="info-value font-monospace" id="modal-agent"></span>
+                                </div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-geo-alt me-2"></i>位置信息</h3>
+                                <div class="info-item">
+                                    <span class="info-label">函数</span>
+                                    <span class="info-value font-monospace text-truncate" style="max-width: 150px;" id="modal-function"></span>
+                                </div>
+                                <div class="info-item">
+                                    <span class="info-label">位置</span>
+                                    <span class="info-value font-monospace" id="modal-location"></span>
+                                </div>
+                                <div class="mb-2 mt-2">
+                                    <span class="info-label d-block mb-1">文件路径</span>
+                                    <div class="bg-light p-2 rounded small text-break font-monospace" id="modal-file"></div>
+                                </div>
+                            </div>
+
+                            <div class="detail-section">
+                                <h3><i class="bi bi-check-circle me-2"></i>状态管理</h3>
+                                <select class="form-select form-select-sm mb-2" id="modal-status-select">
+                                    <option value="new">新发现</option>
+                                    <option value="confirmed">已确认</option>
+                                    <option value="fixed">已修复</option>
+                                    <option value="false_positive">误报</option>
+                                    <option value="ignored">已忽略</option>
+                                </select>
+                                <button class="btn btn-primary btn-sm w-100" onclick="vulnDetail.saveStatus()">
+                                    更新状态
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container" style="position: fixed; top: 20px; right: 20px; z-index: 9999;"></div>
+
+    <script src="/static/bootstrap.bundle.min.js"></script>
     <script src="/static/vulnerabilities.js"></script>
 </body>
 </html>

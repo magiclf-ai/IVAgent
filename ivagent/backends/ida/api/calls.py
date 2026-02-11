@@ -34,14 +34,14 @@ class CalleeInfo:
     arg_texts: List[str] = None  # 参数字符串表示列表
 
 
-def get_callees(function_signature: str) -> List[CalleeInfo]:
+def get_callees(function_identifier: str) -> List[CalleeInfo]:
     """
     获取函数调用的子函数（从函数内部 outgoing calls）
     
     使用 DecompiledFunction 一次遍历收集所有信息，包括调用点和行号。
     
     参数:
-        function_signature: 函数签名（地址或函数名）
+        function_identifier: 函数唯一标识符（地址或函数名）
     返回:
         CalleeInfo 列表
     """
@@ -49,7 +49,7 @@ def get_callees(function_signature: str) -> List[CalleeInfo]:
     from ..decompiler import DecompiledFunction
 
     # 解析地址
-    ea = _parse_address(function_signature)
+    ea = _parse_address(function_identifier)
 
     func = idaapi.get_func(ea)
     if not func:
@@ -87,12 +87,12 @@ def get_callees(function_signature: str) -> List[CalleeInfo]:
         return []
 
 
-def get_callers(function_signature: str) -> List[CallDetail]:
+def get_callers(function_identifier: str) -> List[CallDetail]:
     """
     获取调用该函数的父函数（incoming calls）
     
     参数:
-        function_signature: 函数签名（地址或函数名）
+        function_identifier: 函数唯一标识符（地址或函数名）
     返回:
         CallDetail 列表
     """
@@ -100,7 +100,7 @@ def get_callers(function_signature: str) -> List[CallDetail]:
     import idautils
 
     # 解析地址
-    ea = _parse_address(function_signature)
+    ea = _parse_address(function_identifier)
 
     callee_name = idc.get_func_name(ea)
     callers = []

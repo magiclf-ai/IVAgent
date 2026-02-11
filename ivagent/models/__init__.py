@@ -25,6 +25,25 @@ from .callsite import (
     ResolvedCallsite,
 )
 
+from .workflow import (
+    WorkflowContext,
+    TargetInfo,
+    ScopeInfo,
+    StrategyHints,
+    VulnerabilityFocus,
+    WorkflowParser,
+)
+
+from .semantic_analysis import (
+    CodeFinding,
+)
+
+from .task import (
+    TaskStatus,
+    TaskStatusTransitionError,
+    Task,
+)
+
 __all__ = [
     # 约束模型（纯文本格式）
     "FunctionContext",
@@ -40,4 +59,17 @@ __all__ = [
     # 调用点模型
     "CallsiteInfo",
     "ResolvedCallsite",
+    # Workflow 模型
+    "WorkflowContext",
+    "TargetInfo",
+    "ScopeInfo",
+    "StrategyHints",
+    "VulnerabilityFocus",
+    "WorkflowParser",
+    # 语义分析模型
+    "CodeFinding",
+    # 任务管理模型
+    "TaskStatus",
+    "TaskStatusTransitionError",
+    "Task",
 ]

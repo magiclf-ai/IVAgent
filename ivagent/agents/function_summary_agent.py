@@ -41,7 +41,7 @@ from ..models.callsite import CallsiteInfo, ResolvedCallsite
 def get_sub_function_summary(
         line_number: int,
         column_number: int,
-        function_signature: str,
+        function_identifier: str,
         arguments: List[str],
         call_text: str,
 ) -> Dict[str, Any]:
@@ -49,7 +49,7 @@ def get_sub_function_summary(
     获取指定子函数的摘要信息。
     
     当分析当前函数需要了解某个子函数的行为和约束时，调用此工具获取子函数摘要。
-    通过提供调用点的位置信息（行号、列号、函数签名等），Agent 会自动解析出具体的函数。
+    通过提供调用点的位置信息（行号、列号、函数标识符等），Agent 会自动解析出具体的函数。
     
     通常用于：
     - 子函数涉及关键安全检查
@@ -60,7 +60,7 @@ def get_sub_function_summary(
     Args:
         line_number: 调用所在行号（从代码左侧的方括号中获取，如 [ 8] 表示第8行）
         column_number: 调用所在列号（函数名开始的列）
-        function_signature: 目标函数签名（如 "sub_13E15CC", "memcpy", "Lcom/example/App;->log(Ljava/lang/String;)V"）
+        function_identifier: 目标函数唯一标识符（如 "sub_13E15CC", "memcpy", "Lcom/example/App;->log(Ljava/lang/String;)V"）
         arguments: 参数表达式列表（如 ["ptr", "size", "data"]）
         call_text: 完整调用文本（包含参数和调用语句，如 "result = sub_13E15CC(ptr, size);")
     
@@ -76,7 +76,7 @@ def get_sub_function_summary(
         调用参数：
         - line_number: 8
         - column_number: 16
-        - function_signature: "sub_13E15CC"
+        - function_identifier: "sub_13E15CC"
         - arguments: ["**(*(result + 272) + 72LL)", "*a2", "&v3"]
         - call_text: "result = sub_13E15CC(**(*(result + 272) + 72LL), *a2, &v3);"
     """
@@ -85,7 +85,7 @@ def get_sub_function_summary(
         "callsite": {
             "line_number": line_number,
             "column_number": column_number,
-            "function_signature": function_signature,
+            "function_identifier": function_identifier,
             "arguments": arguments,
             "call_text": call_text,
         }
@@ -128,7 +128,7 @@ def submit_function_summary(
 @dataclass
 class SubFunctionSummary:
     """子函数摘要信息（精简版）"""
-    function_signature: str
+    function_identifier: str
     function_name: str
     behavior_summary: str
     param_constraints: List[str] = field(default_factory=list)
@@ -139,7 +139,7 @@ class SubFunctionSummary:
         """转换为纯文本格式"""
         lines = [
             f"函数: {self.function_name}",
-            f"签名: {self.function_signature}",
+            f"标识符: {self.function_identifier}",
             f"行为: {self.behavior_summary}",
         ]
         if self.param_constraints:
@@ -279,9 +279,7 @@ class FunctionSummaryAgent:
                 verbose=self.verbose,
             )
             FunctionSummaryAgent._cache_initialized = True
-            if self.verbose:
-                print(f"[FunctionSummaryAgent] Initialized shared cache: {self.cache_type}")
-
+     
     @property
     def cache(self) -> FunctionSummaryCache:
         """获取共享缓存实例"""
@@ -294,13 +292,13 @@ class FunctionSummaryAgent:
 
     async def analyze(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> SimpleFunctionSummary:
         """
         分析函数并生成摘要（递归分析子函数）
 
         Args:
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符（全局唯一）
 
         Returns:
             SimpleFunctionSummary 对象
@@ -309,7 +307,7 @@ class FunctionSummaryAgent:
         self._agent_logger.log_execution_start(
             agent_id=self.agent_id,
             agent_type="FunctionSummaryAgent",
-            target_function=function_signature,
+            target_function=function_identifier,
             parent_id=self.parent_id,
             call_stack=self.call_stack.copy(),
             metadata={
@@ -319,9 +317,9 @@ class FunctionSummaryAgent:
         )
 
         # 检查循环调用
-        if function_signature in self._analysis_chain:
-            self.log(f"Circular dependency detected for {function_signature}, returning empty summary", "WARNING")
-            summary = self._create_circular_summary(function_signature)
+        if function_identifier in self._analysis_chain:
+            self.log(f"Circular dependency detected for {function_identifier}, returning empty summary", "WARNING")
+            summary = self._create_circular_summary(function_identifier)
             self._agent_logger.log_execution_end(
                 agent_id=self.agent_id,
                 status=AgentStatus.COMPLETED,
@@ -331,13 +329,13 @@ class FunctionSummaryAgent:
             return summary
 
         # 将当前函数加入分析链
-        self._analysis_chain.add(function_signature)
+        self._analysis_chain.add(function_identifier)
 
         try:
             # 函数摘要不依赖于上下文，所以 context_hash 为 None
             summary = await self.cache.get_or_compute(
-                function_signature=function_signature,
-                compute_func=lambda: self._do_analyze(function_signature),
+                function_identifier=function_identifier,
+                compute_func=lambda: self._do_analyze(function_identifier),
                 context_hash=None,
             )
 
@@ -362,11 +360,11 @@ class FunctionSummaryAgent:
             raise
         finally:
             # 分析完成，从分析链中移除
-            self._analysis_chain.discard(function_signature)
+            self._analysis_chain.discard(function_identifier)
 
     async def _do_analyze(
             self,
-            function_signature: str,
+            function_identifier: str,
             current_depth: int = 0,
     ) -> SimpleFunctionSummary:
         """
@@ -376,19 +374,19 @@ class FunctionSummaryAgent:
         1. LLM 分析代码，按需调用 get_sub_function_summary 获取子函数摘要
         2. 最终调用 submit_function_summary 提交结果
         """
-        self.log(f"Starting analysis for {function_signature} (depth: {current_depth})")
+        self.log(f"Starting analysis for {function_identifier} (depth: {current_depth})")
 
         # 检查递归深度
         if current_depth >= self.max_depth:
-            self.log(f"Max depth reached for {function_signature}, using shallow analysis")
-            return await self._shallow_analysis(function_signature)
+            self.log(f"Max depth reached for {function_identifier}, using shallow analysis")
+            return await self._shallow_analysis(function_identifier)
 
         try:
             # 获取函数定义
-            func_def = await self.engine.get_function_def(function_signature)
+            func_def = await self.engine.get_function_def(function_identifier)
             if not func_def:
-                self.log(f"Failed to get function definition for {function_signature}", "WARNING")
-                return self._create_empty_summary(function_signature)
+                self.log(f"Failed to get function definition for {function_identifier}", "WARNING")
+                return self._create_empty_summary(function_identifier)
 
             # 构建提示词
             user_prompt = prompts.FUNCTION_SUMMARY_ANALYSIS_TEMPLATE.format(
@@ -407,8 +405,8 @@ class FunctionSummaryAgent:
             )
 
         except Exception as e:
-            self.log(f"Analysis failed for {function_signature}: {str(e)}", "ERROR")
-            return await self._fallback_analysis(function_signature)
+            self.log(f"Analysis failed for {function_identifier}: {str(e)}", "ERROR")
+            return await self._fallback_analysis(function_identifier)
 
     async def _tool_call_loop(
             self,
@@ -469,7 +467,7 @@ class FunctionSummaryAgent:
                 tc = submit_calls[0]
                 tool_args = tc.get('args', {})
                 return SimpleFunctionSummary(
-                    function_signature=func_def.signature,
+                    function_identifier=func_def.signature,
                     behavior_summary=tool_args.get('behavior_summary', ''),
                     param_constraints=tool_args.get('param_constraints', []),
                     return_value_meaning=tool_args.get('return_value_meaning', ''),
@@ -486,9 +484,9 @@ class FunctionSummaryAgent:
                     callsite_data = tc.get('args', {})
                     if callsite_data:
                         callsite = CallsiteInfo.from_dict(callsite_data)
-                        # 临时使用 function_signature 作为 key，后面会解析成真正的签名
-                        temp_key = f"{callsite.function_signature}:{callsite.line_number}"
-                        if temp_key not in [f"{c.function_signature}:{c.line_number}" for c in callsites_to_fetch]:
+                        # 临时使用 function_identifier 作为 key，后面会解析成真正的标识符
+                        temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
+                        if temp_key not in [f"{c.function_identifier}:{c.line_number}" for c in callsites_to_fetch]:
                             callsites_to_fetch.append(callsite)
                             callsite_to_tool[temp_key] = tc
 
@@ -514,24 +512,24 @@ class FunctionSummaryAgent:
                     for callsite, resolved in zip(callsites_to_fetch, resolved_sigs):
                         if isinstance(resolved, Exception):
                             self.log(
-                                f"Failed to resolve callsite {callsite.function_signature}:{callsite.line_number}: {resolved}",
+                                f"Failed to resolve callsite {callsite.function_identifier}:{callsite.line_number}: {resolved}",
                                 "WARNING")
-                            temp_key = f"{callsite.function_signature}:{callsite.line_number}"
+                            temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
                             sub_summaries[temp_key] = SubFunctionSummary(
-                                function_signature=callsite.function_signature,
-                                function_name=callsite.function_signature,
+                                function_identifier=callsite.function_identifier,
+                                function_name=callsite.function_identifier,
                                 behavior_summary=f"解析调用点失败: {str(resolved)}",
                             )
                         elif resolved:
                             sig_map[resolved] = callsite
                             fetch_tasks.append(self._get_sub_function_summary(resolved, current_depth))
                         else:
-                            # 解析失败，使用函数签名作为回退
-                            temp_key = f"{callsite.function_signature}:{callsite.line_number}"
+                            # 解析失败，使用函数标识符作为回退
+                            temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
                             sub_summaries[temp_key] = SubFunctionSummary(
-                                function_signature=callsite.function_signature,
-                                function_name=callsite.function_signature,
-                                behavior_summary=f"无法解析调用点，请检查函数签名 '{callsite.function_signature}' 和行号 {callsite.line_number}",
+                                function_identifier=callsite.function_identifier,
+                                function_name=callsite.function_identifier,
+                                behavior_summary=f"无法解析调用点，请检查函数标识符 '{callsite.function_identifier}' 和行号 {callsite.line_number}",
                             )
 
                     # 并发获取摘要
@@ -539,13 +537,13 @@ class FunctionSummaryAgent:
                         summary_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
                         for (sig, result) in zip(sig_map.keys(), summary_results):
                             callsite = sig_map[sig]
-                            temp_key = f"{callsite.function_signature}:{callsite.line_number}"
+                            temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
 
                             if isinstance(result, Exception):
                                 self.log(f"Failed to get summary for {sig}: {result}", "WARNING")
                                 sub_summaries[temp_key] = SubFunctionSummary(
-                                    function_signature=sig,
-                                    function_name=callsite.function_signature,
+                                    function_identifier=sig,
+                                    function_name=callsite.function_identifier,
                                     behavior_summary=f"获取摘要失败: {str(result)}",
                                 )
                             else:
@@ -560,7 +558,7 @@ class FunctionSummaryAgent:
                     callsite_data = tc.get('args', {})
 
                     if callsite_data:
-                        temp_key = f"{callsite_data.get('function_signature')}:{callsite_data.get('line_number')}"
+                        temp_key = f"{callsite_data.get('function_identifier')}:{callsite_data.get('line_number')}"
                         summary = sub_summaries.get(temp_key)
                     else:
                         summary = None
@@ -604,7 +602,7 @@ class FunctionSummaryAgent:
     async def _resolve_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str],
+            caller_identifier: Optional[str],
             caller_code: Optional[str] = None,
     ) -> Optional[str]:
         """
@@ -614,7 +612,7 @@ class FunctionSummaryAgent:
         
         参数:
             callsite: 调用点信息
-            caller_signature: 调用者函数签名
+            caller_identifier: 调用者函数标识符
             caller_code: 调用者源代码
         
         返回:
@@ -624,21 +622,21 @@ class FunctionSummaryAgent:
             # 委托给 Engine 处理
             signature = await self.engine.resolve_function_by_callsite(
                 callsite=callsite,
-                caller_signature=caller_signature,
+                caller_identifier=caller_identifier,
                 caller_code=caller_code,
             )
             
             if signature:
-                self.log(f"Resolved callsite {callsite.function_signature}:{callsite.line_number} -> {signature}")
+                self.log(f"Resolved callsite {callsite.function_identifier}:{callsite.line_number} -> {signature}")
                 return signature
             
             self.log(
-                f"Failed to resolve callsite {callsite.function_signature}:{callsite.line_number}, using function signature as fallback")
-            return callsite.function_signature
+                f"Failed to resolve callsite {callsite.function_identifier}:{callsite.line_number}, using function identifier as fallback")
+            return callsite.function_identifier
             
         except Exception as e:
             self.log(f"Error resolving callsite: {e}", "WARNING")
-            return callsite.function_signature
+            return callsite.function_identifier
 
     async def _get_sub_function_summary(
             self,
@@ -653,7 +651,7 @@ class FunctionSummaryAgent:
             if remaining_depth <= 0:
                 self.log(f"Max depth reached for sub-function {signature}")
                 return SubFunctionSummary(
-                    function_signature=signature,
+                    function_identifier=signature,
                     function_name=signature.split('(')[0] if '(' in signature else signature,
                     behavior_summary="达到最大分析深度",
                 )
@@ -661,7 +659,7 @@ class FunctionSummaryAgent:
             # 检查循环依赖
             if signature in self.call_stack:
                 return SubFunctionSummary(
-                    function_signature=signature,
+                    function_identifier=signature,
                     function_name=signature.split('(')[0] if '(' in signature else signature,
                     behavior_summary="循环依赖，跳过分析",
                 )
@@ -684,10 +682,10 @@ class FunctionSummaryAgent:
                 call_stack=new_call_stack,
             )
 
-            summary = await sub_agent.analyze(function_signature=signature)
+            summary = await sub_agent.analyze(function_identifier=signature)
 
             return SubFunctionSummary(
-                function_signature=signature,
+                function_identifier=signature,
                 function_name=signature.split('(')[0] if '(' in signature else signature,
                 behavior_summary=summary.behavior_summary,
                 param_constraints=summary.param_constraints,
@@ -698,7 +696,7 @@ class FunctionSummaryAgent:
         except Exception as e:
             self.log(f"Failed to get sub-function summary for {signature}: {e}", "WARNING")
             return SubFunctionSummary(
-                function_signature=signature,
+                function_identifier=signature,
                 function_name=signature.split('(')[0] if '(' in signature else signature,
                 behavior_summary=f"获取摘要失败: {str(e)}",
             )
@@ -749,7 +747,7 @@ class FunctionSummaryAgent:
 
         return selected[:5]
 
-    def _parse_text_summary(self, content: str, function_signature: str) -> SimpleFunctionSummary:
+    def _parse_text_summary(self, content: str, function_identifier: str) -> SimpleFunctionSummary:
         """从文本响应解析函数摘要"""
         behavior = ""
         param_constraints = []
@@ -791,7 +789,7 @@ class FunctionSummaryAgent:
                 global_ops = line
 
         return SimpleFunctionSummary(
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             behavior_summary=behavior,
             param_constraints=param_constraints,
             return_value_meaning=return_value,
@@ -800,7 +798,7 @@ class FunctionSummaryAgent:
 
     async def _shallow_analysis(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> SimpleFunctionSummary:
         """
         浅层分析（达到最大深度时使用）
@@ -808,9 +806,9 @@ class FunctionSummaryAgent:
         只分析当前函数，不递归分析子函数。
         """
         try:
-            func_def = await self.engine.get_function_def(function_signature)
+            func_def = await self.engine.get_function_def(function_identifier)
             if not func_def:
-                return self._create_empty_summary(function_signature)
+                return self._create_empty_summary(function_identifier)
 
             user_prompt = prompts.SIMPLE_TEXT_SUMMARY_PROMPT.format(
                 func_name=func_def.name,
@@ -836,7 +834,7 @@ class FunctionSummaryAgent:
             self._llm_call_count += 1
 
             return SimpleFunctionSummary(
-                function_signature=function_signature,
+                function_identifier=function_identifier,
                 behavior_summary=result.get('behavior_summary', ''),
                 param_constraints=result.get('param_constraints', []),
                 return_value_meaning=result.get('return_value_meaning', ''),
@@ -845,11 +843,11 @@ class FunctionSummaryAgent:
 
         except Exception as e:
             self.log(f"Shallow analysis failed: {e}", "WARNING")
-            return self._create_empty_summary(function_signature)
+            return self._create_empty_summary(function_identifier)
 
     async def _fallback_analysis(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> SimpleFunctionSummary:
         """
         降级分析（Tool Call 失败时使用）
@@ -857,9 +855,9 @@ class FunctionSummaryAgent:
         使用纯文本 JSON 模式进行分析。
         """
         try:
-            func_def = await self.engine.get_function_def(function_signature)
+            func_def = await self.engine.get_function_def(function_identifier)
             if not func_def:
-                return self._create_empty_summary(function_signature)
+                return self._create_empty_summary(function_identifier)
 
             user_prompt = prompts.SIMPLE_TEXT_SUMMARY_PROMPT.format(
                 func_name=func_def.name,
@@ -884,7 +882,7 @@ class FunctionSummaryAgent:
             self._llm_call_count += 1
 
             return SimpleFunctionSummary(
-                function_signature=function_signature,
+                function_identifier=function_identifier,
                 behavior_summary=result.get('behavior_summary', ''),
                 param_constraints=result.get('param_constraints', []),
                 return_value_meaning=result.get('return_value_meaning', ''),
@@ -893,22 +891,22 @@ class FunctionSummaryAgent:
 
         except Exception as e:
             self.log(f"Fallback analysis failed: {e}", "ERROR")
-            return self._create_empty_summary(function_signature)
+            return self._create_empty_summary(function_identifier)
 
-    def _create_empty_summary(self, function_signature: str) -> SimpleFunctionSummary:
+    def _create_empty_summary(self, function_identifier: str) -> SimpleFunctionSummary:
         """创建空的函数摘要"""
         return SimpleFunctionSummary(
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             behavior_summary="分析失败，无法获取函数信息",
             param_constraints=[],
             return_value_meaning="",
             global_var_operations="",
         )
 
-    def _create_circular_summary(self, function_signature: str) -> SimpleFunctionSummary:
+    def _create_circular_summary(self, function_identifier: str) -> SimpleFunctionSummary:
         """创建循环调用摘要"""
         return SimpleFunctionSummary(
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             behavior_summary="检测到循环调用，该函数在当前分析链中已被分析",
             param_constraints=[],
             return_value_meaning="",

@@ -31,6 +31,7 @@ from .base_static_analysis_engine import (
     CrossReference,
     VariableConstraint,
     BaseStaticAnalysisEngine,
+    SearchResult,
 )
 
 from ..models.callsite import CallsiteInfo
@@ -139,6 +140,14 @@ class JEBClient:
     async def get_field_callers(self, filepath: str, field_signature: str) -> List[Dict[str, Any]]:
         """获取访问字段的所有位置"""
         return await self._call_with_retry("get_field_callers", filepath, field_signature)
+
+    async def get_all_classes(self, filepath: str) -> List[str]:
+        """获取 APK 中的所有类"""
+        return await self._call_with_retry("get_all_classes", filepath)
+
+    async def get_all_methods(self, filepath: str) -> List[str]:
+        """获取 APK 中的所有方法"""
+        return await self._call_with_retry("get_all_methods", filepath)
 
     async def get_class_methods(self, filepath: str, class_signature: str) -> List[str]:
         """获取类的所有方法"""
@@ -306,18 +315,21 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         call_sites = []
         for item in data:
+            if not item:
+                continue
             try:
-                sig = item.get("method").get("signature", "")
-                name = item.get("method").get("name", "")
+                method = item.get("method") or {}
+                sig = method.get("signature", "")
+                name = method.get("name", "")
                 arguments = item.get("arguments", [])
 
                 if is_callee:
                     # 当前函数调用其他函数
                     call_sites.append(CallSite(
                         caller_name="current",
-                        caller_signature="current",
+                        caller_identifier="current",
                         callee_name=name or sig,
-                        callee_signature=sig,
+                        callee_identifier=sig,
                         line_number=item.get("line_index", -1),
                         file_path=self.target_path,
                         call_context=item.get("line", ""),
@@ -327,9 +339,9 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
                     # 其他函数调用当前函数
                     call_sites.append(CallSite(
                         caller_name=name or sig,
-                        caller_signature=sig,
+                        caller_identifier=sig,
                         callee_name="current",
-                        callee_signature="current",
+                        callee_identifier="current",
                         line_number=item.get("line_index", -1),
                         file_path=self.target_path,
                         call_context=item.get("line", ""),
@@ -346,7 +358,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
     async def get_function_def(
             self,
             function_name: Optional[str] = None,
-            function_signature: Optional[str] = None,
+            function_identifier: Optional[str] = None,
             location: Optional[str] = None,
     ) -> Optional[FunctionDef]:
         """
@@ -359,8 +371,8 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
         if not self.target_path:
             raise ValueError("APK path not set. Use set_target() first.")
 
-        # 确定查询标识（签名优先）
-        query = function_signature or location or function_name
+        # 确定查询标识（标识符优先）
+        query = function_identifier or location or function_name
         if not query:
             return None
 
@@ -395,55 +407,55 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         return None
 
-    async def get_callee(self, function_signature: str) -> List[CallSite]:
+    async def get_callee(self, function_identifier: str) -> List[CallSite]:
         """异步获取函数内调用的子函数"""
         await self._ensure_client()
 
         if not self.target_path:
             return []
 
-        result = await self._client.get_method_callees(self.target_path, function_signature)
+        result = await self._client.get_method_callees(self.target_path, function_identifier)
         return self._to_call_sites(result, is_callee=True)
 
-    async def get_caller(self, function_signature: str) -> List[CallSite]:
+    async def get_caller(self, function_identifier: str) -> List[CallSite]:
         """异步获取调用该函数的父函数"""
         await self._ensure_client()
 
         if not self.target_path:
             return []
 
-        result = await self._client.get_method_callers(self.target_path, function_signature)
+        result = await self._client.get_method_callers(self.target_path, function_identifier)
         return self._to_call_sites(result, is_callee=False)
 
     async def _resolve_static_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str] = None,
+            caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
         [实现基类方法] 静态分析：根据调用点信息解析函数签名
         
         实现策略：
-        1. 如果提供了 caller_signature，先获取调用者函数定义
+        1. 如果提供了 caller_identifier，先获取调用者函数定义
         2. 从调用者的 callee 列表中查找匹配行号和函数名的调用
         3. 返回被调用函数的签名
         """
         await self._ensure_client()
 
-        if not callsite.function_signature:
+        if not callsite.function_identifier:
             return None
 
-        # 策略1: 如果有调用者签名，从调用者上下文中解析
-        if caller_signature:
+        # 策略1: 如果有调用者标识符，从调用者上下文中解析
+        if caller_identifier:
             try:
                 # 获取调用者的 callee 列表
-                callees = await self.get_callee(caller_signature)
+                callees = await self.get_callee(caller_identifier)
 
                 # 在 callee 中查找匹配的行号和函数名
                 for callee in callees:
-                    sig_match = callee.callee_signature == callsite.function_signature
+                    sig_match = callee.callee_identifier == callsite.function_identifier
                     if sig_match:
-                        return callee.callee_signature
+                        return callee.callee_identifier
 
 
             except Exception as e:
@@ -452,10 +464,10 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
         # 策略2: 直接通过函数名搜索
         try:
             if self.target_path:
-                results = await self._client.check_java_identifier(self.target_path, callsite.function_signature)
+                results = await self._client.check_java_identifier(self.target_path, callsite.function_identifier)
                 for result in results:
                     if result.get("type") == "method":
-                        return result.get("signature", callsite.function_signature)
+                        return result.get("signature", callsite.function_identifier)
         except Exception:
             pass
 
@@ -505,7 +517,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
     async def get_variable_constraints(
             self,
-            function_signature: str,
+            function_identifier: str,
             var_name: str,
             line_number: Optional[int] = None,
     ) -> List[VariableConstraint]:
@@ -513,28 +525,73 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
         # TODO: 需要 JEB 提供更详细的变量分析能力
         return []
 
-    async def search_functions(self, query: str, limit: int = 10) -> List[FunctionDef]:
-        """异步搜索函数"""
+    async def search_symbol(
+            self,
+            query: str,
+            options: Optional[Any] = None,
+    ) -> List[SearchResult]:
+        """异步搜索符号（方法、类、字段）
+
+        Args:
+            query: 搜索关键词
+            options: 搜索选项 (SearchOptions)，可选，包含 limit/offset/case_sensitive/use_regex 等配置
+
+        Returns:
+            SearchResult 列表，包含符号类型信息
+        """
+        from .base_static_analysis_engine import SymbolType
+        import re
+
         await self._ensure_client()
 
         if not self.target_path:
             return []
 
+        # 从 options 中提取参数
+        limit = 10
+        offset = 0
+        case_sensitive = False
+        use_regex = False
+        if options:
+            limit = getattr(options, 'limit', 10)
+            offset = getattr(options, 'offset', 0)
+            case_sensitive = getattr(options, 'case_sensitive', False)
+            use_regex = getattr(options, 'use_regex', False)
+
         try:
-            results = await self._client.check_java_identifier(self.target_path, query)
-            function_defs = []
+            search_results = []
 
-            for result in results:
-                if result.get("type") == "method":
-                    sig = result.get("signature", "")
-                    # 获取函数定义
-                    func_def = await self.get_function_def(function_signature=sig)
-                    if func_def:
-                        function_defs.append(func_def)
-                    if len(function_defs) >= limit:
-                        break
+            # 准备匹配函数
+            def match(name: str) -> bool:
+                if use_regex:
+                    flags = 0 if case_sensitive else re.IGNORECASE
+                    try:
+                        pattern = re.compile(query, flags)
+                        return bool(pattern.search(name))
+                    except re.error:
+                        return False
+                else:
+                    if case_sensitive:
+                        return query in name
+                    else:
+                        return query.lower() in name.lower()
 
-            return function_defs
+            methods = await self._client.get_all_methods(self.target_path)
+            for item in methods:
+                name = item["name"]
+                signature = item["signature"]
+                if match(name):
+                    search_results.append(SearchResult(name=name, signature=signature, symbol_type=SymbolType.METHOD))
+
+            classes = await self._client.get_all_classes(self.target_path)
+            for item in classes:
+                name = item["name"]
+                signature = item["signature"]
+                if match(name):
+                    search_results.append(SearchResult(name=name, signature=signature, symbol_type=SymbolType.CLASS))
+
+            # 应用 offset 和 limit
+            return search_results[offset:offset + limit]
         except Exception:
             return []
 

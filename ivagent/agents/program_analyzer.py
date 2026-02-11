@@ -65,7 +65,7 @@ class AnalysisState(TypedDict):
     result: Optional[Any]
 
     # 程序分析特有字段
-    function_signature: str
+    function_identifier: str
     function_context: Optional[FunctionContext]
     phase: str
 
@@ -129,7 +129,7 @@ class ProgramAnalyzer:
 
     async def get_function_summary(
             self,
-            function_signature: str,
+            function_identifier: str,
             cache_type: str = "redis",
             cache_config: Optional[Dict[str, Any]] = None,
     ) -> SimpleFunctionSummary:
@@ -140,5 +140,5 @@ class ProgramAnalyzer:
             cache_type=cache_type,
             cache_config=cache_config,
         )
-        summary = await agent.analyze(function_signature)
+        summary = await agent.analyze(function_identifier)
         return summary

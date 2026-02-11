@@ -212,7 +212,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
     async def get_function_def(
             self,
             function_name: Optional[str] = None,
-            function_signature: Optional[str] = None,
+            function_identifier: Optional[str] = None,
             location: Optional[str] = None,
     ) -> Optional[FunctionDef]:
         """Get function definition (source code)."""
@@ -221,8 +221,8 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
         target_class = ""
         target_method = ""
 
-        if function_signature:
-            target_class, target_method = self._parse_signature(function_signature)
+        if function_identifier:
+            target_class, target_method = self._parse_signature(function_identifier)
         elif function_name:
             # This is risky without class name
             # We might need to search?
@@ -270,7 +270,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             if source_engine:
                 try:
                     func_def = await source_engine.get_function_def(
-                        function_signature=f"{target_class}.{target_method}"
+                        function_identifier=f"{target_class}.{target_method}"
                     )
                     if func_def:
                         logger.info(f"SourceCodeEngine fallback succeeded for {target_class}.{target_method}")
@@ -283,23 +283,23 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
     async def get_callee(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> List[CallSite]:
         """Get callees (calls made by this function)."""
-        func_def = await self.get_function_def(function_signature=function_signature)
+        func_def = await self.get_function_def(function_identifier=function_identifier)
         if not func_def or not func_def.code:
             return []
 
         # Parse code using DecompiledMethod
-        decompiled = DecompiledMethod(function_signature, func_def.code)
+        decompiled = DecompiledMethod(function_identifier, func_def.code)
 
         call_sites = []
         for call in decompiled.calls:
             call_sites.append(CallSite(
                 caller_name=func_def.name,
-                caller_signature=function_signature,
+                caller_identifier=function_identifier,
                 callee_name=call.target_name,
-                callee_signature=call.target_signature,
+                callee_identifier=call.target_signature,
                 line_number=call.line_index + 1,  # 1-based
                 call_context=call.call_text,
                 arguments=call.arguments
@@ -309,7 +309,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
     async def get_caller(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> List[CallSite]:
         """Get callers (functions calling this function)."""
         # Current MCP server does not expose get_xrefs_to_method.
@@ -329,7 +329,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
     async def get_variable_constraints(
             self,
-            function_signature: str,
+            function_identifier: str,
             var_name: str,
             line_number: Optional[int] = None,
     ) -> List[VariableConstraint]:
@@ -342,7 +342,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
     async def _resolve_static_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str] = None,
+            caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
         [Implement BaseStaticAnalysisEngine] Static analysis: resolve function signature from callsite info.
@@ -350,17 +350,19 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
         # Abc-Decompiler backend currently does not support advanced callsite resolution
         return None
 
-    async def search_functions(
+    async def search_symbol(
             self,
             query: str,
             options: Optional[SearchOptions] = None,
     ) -> List[SearchResult]:
         """
-        异步搜索函数/方法
+        异步搜索符号（类、方法、字段）
 
-        通过 Abc-Decompiler 后端搜索匹配的类/方法。
+        通过 Abc-Decompiler 后端搜索匹配的类/方法/字段。
         支持子串匹配和正则表达式匹配。
         """
+        from .base_static_analysis_engine import SymbolType
+
         await self._ensure_connected()
 
         if options is None:
@@ -386,19 +388,32 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
             query_cmp = query if options.case_sensitive else query.lower()
 
+            # 首先搜索匹配的类
             for class_info in classes:
                 class_name = class_info.get("class_name", "") if isinstance(class_info, dict) else str(class_info)
                 if not class_name:
                     continue
 
-                # 如果搜索类名，检查类名匹配
+                # 检查类名匹配
                 class_matched = False
-                if options.include_class_name:
-                    if options.use_regex and pattern:
-                        class_matched = bool(pattern.search(class_name))
-                    else:
-                        class_name_cmp = class_name if options.case_sensitive else class_name.lower()
-                        class_matched = query_cmp in class_name_cmp
+                if options.use_regex and pattern:
+                    class_matched = bool(pattern.search(class_name))
+                else:
+                    class_name_cmp = class_name if options.case_sensitive else class_name.lower()
+                    class_matched = query_cmp in class_name_cmp
+
+                if class_matched:
+                    # 添加类作为搜索结果
+                    match_score = 1.0 if class_name_cmp.startswith(query_cmp) else 0.8
+                    results.append(SearchResult(
+                        name=class_name,
+                        signature=class_name,
+                        symbol_type=SymbolType.CLASS,
+                        file_path=f"{class_name.replace('.', '/')}.ts",
+                        line=0,
+                        match_score=match_score,
+                        match_reason=f"Class name matches '{query}'"
+                    ))
 
                 # 获取类的方法
                 try:
@@ -451,46 +466,43 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                         match_reason = f"Class name contains '{query}'"
 
                     if matched:
-                        # 尝试获取方法代码
-                        try:
-                            method_result = await self.client.get_method_by_name(class_name, method_name)
-                            code = ""
-                            if isinstance(method_result, dict):
-                                code = method_result.get("code", "") or method_result.get("source", "")
-                            elif isinstance(method_result, str):
-                                code = method_result
-                        except Exception:
-                            code = ""
-
-                        # 如果在代码中搜索
-                        if options.search_in_code and code:
-                            code_matches = False
-                            if options.use_regex and pattern:
-                                code_matches = bool(pattern.search(code))
-                            else:
-                                code_cmp = code if options.case_sensitive else code.lower()
-                                code_matches = query_cmp in code_cmp
-                            
-                            if not code_matches and not matched:
-                                continue
-                            if code_matches:
-                                match_score = min(1.0, match_score + 0.1)
-                                match_reason += f" (found in code)"
-
-                        func_def = FunctionDef(
-                            signature=signature,
-                            name=method_name,
-                            code=code or "// Code not available",
-                            file_path=f"{class_name.replace('.', '/')}.ts",
-                            start_line=0,
-                            end_line=0,
-                        )
-
                         results.append(SearchResult(
-                            function=func_def,
+                            name=method_name,
+                            signature=signature,
+                            symbol_type=SymbolType.METHOD,
+                            file_path=f"{class_name.replace('.', '/')}.ts",
+                            line=0,
                             match_score=match_score,
                             match_reason=match_reason or f"Matches '{query}'"
                         ))
+
+                # 获取类的字段
+                try:
+                    fields = await self.client.get_class_fields(class_name)
+                    if isinstance(fields, list):
+                        for field in fields:
+                            field_name = field.get("field_name", "") if isinstance(field, dict) else str(field)
+                            field_sig = f"{class_name}.{field_name}"
+
+                            field_matched = False
+                            if options.use_regex and pattern:
+                                field_matched = bool(pattern.search(field_name))
+                            else:
+                                field_cmp = field_name if options.case_sensitive else field_name.lower()
+                                field_matched = query_cmp in field_cmp
+
+                            if field_matched:
+                                results.append(SearchResult(
+                                    name=field_name,
+                                    signature=field_sig,
+                                    symbol_type=SymbolType.FIELD,
+                                    file_path=f"{class_name.replace('.', '/')}.ts",
+                                    line=0,
+                                    match_score=0.85 if field_cmp.startswith(query_cmp) else 0.65,
+                                    match_reason=f"Field name matches '{query}'"
+                                ))
+                except Exception:
+                    pass
 
             # 按匹配分数排序并分页
             results.sort(key=lambda x: x.match_score, reverse=True)

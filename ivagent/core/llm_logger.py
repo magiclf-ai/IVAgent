@@ -128,6 +128,10 @@ class BaseLogStorage:
         """删除指定天数前的日志，返回删除数量"""
         raise NotImplementedError
 
+    def delete_entry(self, entry_id: str) -> bool:
+        """删除指定日志条目"""
+        raise NotImplementedError
+
 
 class SQLiteLogStorage(BaseLogStorage):
     """SQLite 日志存储"""
@@ -355,9 +359,10 @@ class SQLiteLogStorage(BaseLogStorage):
         
         return [self._row_to_entry(row) for row in rows]
     
-    def get_sessions(self) -> List[Dict[str, Any]]:
+    def get_sessions(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """获取会话列表"""
         conn = self._get_conn()
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT 
                 session_id,
                 MIN(timestamp) as start_time,
@@ -368,9 +373,18 @@ class SQLiteLogStorage(BaseLogStorage):
             FROM llm_logs
             GROUP BY session_id
             ORDER BY start_time DESC
-        """).fetchall()
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
         
         return [dict(row) for row in rows]
+
+    def get_session_count(self) -> int:
+        """获取会话总数"""
+        conn = self._get_conn()
+        # count distinct session_ids
+        # Since we group by session_id in get_sessions, we need count of distinct session_ids
+        row = conn.execute("SELECT COUNT(DISTINCT session_id) FROM llm_logs").fetchone()
+        return row[0] if row else 0
     
     def get_stats(self) -> Dict[str, Any]:
         conn = self._get_conn()
@@ -409,6 +423,12 @@ class SQLiteLogStorage(BaseLogStorage):
         cursor = conn.execute("DELETE FROM llm_logs WHERE timestamp < ?", (cutoff,))
         conn.commit()
         return cursor.rowcount
+
+    def delete_entry(self, entry_id: str) -> bool:
+        conn = self._get_conn()
+        cursor = conn.execute("DELETE FROM llm_logs WHERE id = ?", (entry_id,))
+        conn.commit()
+        return cursor.rowcount > 0
     
     def _row_to_entry(self, row: sqlite3.Row) -> LLMLogEntry:
         """将数据库行转换为日志条目"""
@@ -967,9 +987,15 @@ class LLMLogManager:
             offset=offset
         )
     
-    def get_sessions(self) -> List[Dict[str, Any]]:
+    def get_sessions(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """获取会话列表"""
-        return self.storage.get_sessions()
+        return self.storage.get_sessions(limit=limit, offset=offset)
+
+    def get_session_count(self) -> int:
+        """获取会话总数"""
+        if hasattr(self.storage, 'get_session_count'):
+            return self.storage.get_session_count()
+        return 0
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

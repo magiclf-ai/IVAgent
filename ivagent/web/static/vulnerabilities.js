@@ -23,6 +23,9 @@ const state = {
     charts: {}
 };
 
+// Bootstrap Modal 实例
+let bsVulnModal = null;
+
 // ============================================
 // API 封装
 // ============================================
@@ -209,7 +212,7 @@ const charts = {
         const labels = ['严重', '高危', '中危', '低危', '信息'];
         const keys = ['critical', 'high', 'medium', 'low', 'info'];
         const values = keys.map(k => data[k] || 0);
-        const colors = ['#dc2626', '#ea580c', '#d97706', '#16a34a', '#6b7280'];
+        const colors = ['#ef4444', '#f97316', '#f59e0b', '#10b981', '#94a3b8'];
         
         state.charts.severity = new Chart(ctx, {
             type: 'doughnut',
@@ -229,7 +232,7 @@ const charts = {
                     legend: {
                         position: 'right',
                         labels: {
-                            color: '#94a3b8',
+                            color: '#64748b',
                             padding: 16,
                             usePointStyle: true,
                             pointStyle: 'circle'
@@ -254,6 +257,11 @@ const charts = {
         const labels = dailyData.map(d => d.date.slice(5)); // 只显示月-日
         const values = dailyData.map(d => d.count);
         
+        const context = ctx.getContext('2d');
+        const gradient = context.createLinearGradient(0, 0, 0, 300);
+        gradient.addColorStop(0, 'rgba(99, 102, 241, 0.25)');
+        gradient.addColorStop(1, 'rgba(99, 102, 241, 0)');
+
         state.charts.trend = new Chart(ctx, {
             type: 'line',
             data: {
@@ -261,13 +269,15 @@ const charts = {
                 datasets: [{
                     label: '漏洞数量',
                     data: values,
-                    borderColor: '#3b82f6',
-                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    borderColor: '#6366f1',
+                    backgroundColor: gradient,
                     borderWidth: 2,
                     fill: true,
                     tension: 0.4,
-                    pointRadius: 3,
-                    pointBackgroundColor: '#3b82f6'
+                    pointRadius: 4,
+                    pointBackgroundColor: '#ffffff',
+                    pointBorderColor: '#6366f1',
+                    pointBorderWidth: 2
                 }]
             },
             options: {
@@ -281,7 +291,8 @@ const charts = {
                 scales: {
                     x: {
                         grid: {
-                            color: 'rgba(51, 65, 85, 0.5)'
+                            color: '#e2e8f0',
+                            display: false
                         },
                         ticks: {
                             color: '#64748b'
@@ -289,7 +300,7 @@ const charts = {
                     },
                     y: {
                         grid: {
-                            color: 'rgba(51, 65, 85, 0.5)'
+                            color: '#e2e8f0'
                         },
                         ticks: {
                             color: '#64748b'
@@ -305,14 +316,19 @@ const charts = {
 // 漏洞列表渲染
 // ============================================
 const vulnList = {
+    // 已查看的漏洞ID集合
+    viewedVulns: new Set(),
+    
     // 渲染漏洞卡片
     renderCard(vuln) {
         const severityText = ui.getSeverityText(vuln.severity);
         const statusText = ui.getStatusText(vuln.status);
         const createdTime = ui.formatTime(vuln.created_at);
+        const isViewed = this.viewedVulns.has(vuln.vuln_id);
+        const viewedClass = isViewed ? 'viewed' : '';
         
         return `
-            <div class="vuln-card" data-id="${vuln.vuln_id}">
+            <div class="vuln-card ${viewedClass}" data-id="${vuln.vuln_id}">
                 <div class="vuln-severity">
                     <div class="severity-indicator ${vuln.severity}"></div>
                     <span class="severity-text ${vuln.severity}">${severityText}</span>
@@ -320,14 +336,14 @@ const vulnList = {
                 <div class="vuln-content">
                     <div class="vuln-title">${this.escapeHtml(vuln.name)}</div>
                     <div class="vuln-meta">
-                        <span>
+                        <span class="vuln-function" title="${this.escapeHtml(vuln.function_identifier)}">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
                                 <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
                             </svg>
-                            ${this.escapeHtml(vuln.function_signature)}
+                            ${this.escapeHtml(vuln.function_identifier)}
                         </span>
-                        <span>
+                        <span class="vuln-location" title="${this.escapeHtml(vuln.location)}">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
                                 <circle cx="12" cy="10" r="3"></circle>
@@ -388,10 +404,13 @@ const vulnList = {
             
             container.innerHTML = state.vulnerabilities.map(v => this.renderCard(v)).join('');
             
-            // 绑定点击事件
+            // 绑定双击事件
             container.querySelectorAll('.vuln-card').forEach(card => {
-                card.addEventListener('click', () => {
+                card.addEventListener('dblclick', () => {
                     const vulnId = card.dataset.id;
+                    // 标记为已查看
+                    vulnList.viewedVulns.add(vulnId);
+                    card.classList.add('viewed');
                     vulnDetail.show(vulnId);
                 });
             });
@@ -423,15 +442,28 @@ const vulnList = {
 // 漏洞详情弹窗
 // ============================================
 const vulnDetail = {
+    // 初始化 Bootstrap Modal
+    init() {
+        const modalEl = document.getElementById('vuln-modal');
+        if (modalEl && typeof bootstrap !== 'undefined' && bootstrap.Modal) {
+            bsVulnModal = new bootstrap.Modal(modalEl);
+        }
+    },
+    
     // 显示漏洞详情
     async show(vulnId) {
         state.currentVulnId = vulnId;
-        const modal = document.getElementById('vuln-modal');
         
         try {
             const vuln = await api.getVulnerabilityDetail(vulnId);
             this.render(vuln);
-            modal.classList.add('active');
+            if (bsVulnModal) {
+                bsVulnModal.show();
+            } else {
+                // Fallback: 手动显示
+                const modal = document.getElementById('vuln-modal');
+                if (modal) modal.classList.add('show');
+            }
         } catch (error) {
             ui.toast('加载漏洞详情失败: ' + error.message, 'error');
         }
@@ -447,7 +479,16 @@ const vulnDetail = {
         // 标题和描述
         document.getElementById('modal-title').textContent = vuln.name;
         document.getElementById('modal-description').textContent = vuln.description;
-        
+
+        // 调用路径
+        const callPathEl = document.getElementById('modal-call-path');
+        const callPath = vuln.metadata && vuln.metadata.call_path ? vuln.metadata.call_path : null;
+        if (callPath) {
+            callPathEl.innerHTML = callPath.replace(/\n/g, '<br>');
+        } else {
+            callPathEl.innerHTML = '<span style="color: var(--text-secondary);">暂无调用路径信息</span>';
+        }
+
         // 数据流
         this.renderDataFlow(vuln.data_flow);
         
@@ -473,7 +514,7 @@ const vulnDetail = {
         document.getElementById('modal-status-select').value = vuln.status;
         
         // 位置信息
-        document.getElementById('modal-function').textContent = vuln.function_signature;
+        document.getElementById('modal-function').textContent = vuln.function_identifier;
         document.getElementById('modal-location').textContent = vuln.location;
         document.getElementById('modal-file').textContent = vuln.file_path || '-';
         
@@ -579,7 +620,13 @@ const vulnDetail = {
     
     // 关闭弹窗
     close() {
-        document.getElementById('vuln-modal').classList.remove('active');
+        if (bsVulnModal) {
+            bsVulnModal.hide();
+        } else {
+            // Fallback: 手动隐藏
+            const modal = document.getElementById('vuln-modal');
+            if (modal) modal.classList.remove('show');
+        }
         state.currentVulnId = null;
     }
 };
@@ -647,131 +694,89 @@ const vulnTypes = {
 // 事件绑定
 // ============================================
 function bindEvents() {
-    // 严重程度筛选（多选）
-    document.getElementById('filter-severity').addEventListener('change', (e) => {
-        const options = Array.from(e.target.selectedOptions).map(o => o.value);
-        state.filters.severity = options;
-        vulnList.refresh();
-    });
+    // 严重程度筛选
+    const filterSeverity = document.getElementById('filter-severity');
+    if (filterSeverity) {
+        filterSeverity.addEventListener('change', (e) => {
+            state.filters.severity = e.target.value ? [e.target.value] : [];
+            vulnList.refresh();
+        });
+    }
     
     // 状态筛选
-    document.getElementById('filter-status').addEventListener('change', (e) => {
-        state.filters.status = e.target.value;
-        vulnList.refresh();
-    });
+    const filterStatus = document.getElementById('filter-status');
+    if (filterStatus) {
+        filterStatus.addEventListener('change', (e) => {
+            state.filters.status = e.target.value;
+            vulnList.refresh();
+        });
+    }
     
     // 类型筛选
-    document.getElementById('filter-type').addEventListener('change', (e) => {
-        state.filters.type = e.target.value;
-        vulnList.refresh();
-    });
+    const filterType = document.getElementById('filter-type');
+    if (filterType) {
+        filterType.addEventListener('change', (e) => {
+            state.filters.type = e.target.value;
+            vulnList.refresh();
+        });
+    }
     
     // 搜索
-    document.getElementById('search-btn').addEventListener('click', () => {
-        state.filters.search = document.getElementById('search-input').value;
-        vulnList.refresh();
-    });
-    
-    document.getElementById('search-input').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            state.filters.search = e.target.value;
-            vulnList.refresh();
-        }
-    });
-    
-    // 刷新按钮
-    document.getElementById('refresh-btn').addEventListener('click', () => {
-        vulnList.refresh();
-        stats.load();
-        ui.toast('数据已刷新', 'success');
-    });
-    
-    // 导出按钮
-    document.getElementById('export-btn').addEventListener('click', () => {
-        exportData();
-    });
-    
-    // 清除全部按钮
-    document.getElementById('clear-all-btn').addEventListener('click', async () => {
-        // 获取当前漏洞数量
-        const currentCount = state.total;
-        
-        if (currentCount === 0) {
-            ui.toast('当前没有漏洞记录', 'info');
-            return;
-        }
-        
-        // 确认对话框
-        const confirmed = confirm(
-            `⚠️ 警告：此操作不可恢复！\n\n` +
-            `即将删除所有 ${currentCount} 个漏洞记录。\n\n` +
-            `是否确认继续？`
-        );
-        
-        if (!confirmed) {
-            return;
-        }
-        
-        // 二次确认
-        const doubleConfirmed = confirm(
-            `再次确认：您确定要永久删除所有漏洞记录吗？`
-        );
-        
-        if (!doubleConfirmed) {
-            return;
-        }
-        
-        try {
-            ui.toast('正在清除漏洞记录...', 'info');
-            const result = await api.clearAllVulnerabilities();
-            
-            ui.toast(
-                `成功清除 ${result.deleted_count} 个漏洞记录`,
-                'success',
-                '清除完成'
-            );
-            
-            // 刷新数据
-            vulnList.refresh();
-            stats.load();
-        } catch (error) {
-            ui.toast('清除漏洞失败: ' + error.message, 'error');
-        }
-    });
+    const searchInput = document.getElementById('search-input');
+    if (searchInput) {
+        searchInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                state.filters.search = e.target.value;
+                vulnList.refresh();
+            }
+        });
+        // 实时搜索（防抖）
+        let searchTimeout;
+        searchInput.addEventListener('input', (e) => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                state.filters.search = e.target.value;
+                vulnList.refresh();
+            }, 500);
+        });
+    }
     
     // 分页
-    document.getElementById('prev-page').addEventListener('click', () => {
-        if (state.currentPage > 1) {
-            state.currentPage--;
-            vulnList.render();
-        }
-    });
+    const prevPage = document.getElementById('prev-page');
+    const nextPage = document.getElementById('next-page');
     
-    document.getElementById('next-page').addEventListener('click', () => {
-        if (state.currentPage < state.totalPages) {
-            state.currentPage++;
-            vulnList.render();
-        }
-    });
+    if (prevPage) {
+        prevPage.addEventListener('click', () => {
+            if (state.currentPage > 1) {
+                state.currentPage--;
+                vulnList.render();
+            }
+        });
+    }
     
-    // 弹窗关闭
-    document.getElementById('close-modal').addEventListener('click', () => {
-        vulnDetail.close();
-    });
+    if (nextPage) {
+        nextPage.addEventListener('click', () => {
+            if (state.currentPage < state.totalPages) {
+                state.currentPage++;
+                vulnList.render();
+            }
+        });
+    }
     
-    document.querySelector('.modal-overlay').addEventListener('click', () => {
-        vulnDetail.close();
-    });
-    
-    // 保存状态
-    document.getElementById('save-status-btn').addEventListener('click', () => {
-        vulnDetail.saveStatus();
-    });
-    
-    // 删除漏洞
-    document.getElementById('delete-vuln-btn').addEventListener('click', () => {
-        vulnDetail.delete();
-    });
+    // 弹窗关闭 - 使用事件委托
+    const modal = document.getElementById('vuln-modal');
+    if (modal) {
+        modal.addEventListener('click', (e) => {
+            // 点击弹窗背景关闭
+            if (e.target === modal) {
+                vulnDetail.close();
+            }
+            // 点击关闭按钮
+            if (e.target.classList.contains('btn-close') || e.target.closest('.btn-close')) {
+                vulnDetail.close();
+            }
+        });
+    }
     
     // ESC 关闭弹窗
     document.addEventListener('keydown', (e) => {
@@ -779,6 +784,15 @@ function bindEvents() {
             vulnDetail.close();
         }
     });
+    
+    // Sidebar Toggle
+    const menuToggle = document.getElementById('menu-toggle');
+    if (menuToggle) {
+        menuToggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            document.getElementById('wrapper').classList.toggle('toggled');
+        });
+    }
 }
 
 // ============================================
@@ -818,6 +832,9 @@ async function exportData() {
 // 初始化
 // ============================================
 async function init() {
+    // 初始化 Bootstrap Modal
+    vulnDetail.init();
+    
     bindEvents();
     
     // 并行加载数据

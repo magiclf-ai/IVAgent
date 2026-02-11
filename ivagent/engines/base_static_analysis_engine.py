@@ -55,9 +55,9 @@ class FunctionDef:
 class CallSite:
     """调用点信息"""
     caller_name: str                        # 调用者函数名
-    caller_signature: str                   # 调用者签名
+    caller_identifier: str                  # 调用者标识符
     callee_name: str                        # 被调用者函数名
-    callee_signature: str                   # 被调用者签名
+    callee_identifier: str                  # 被调用者标识符
     line_number: int                        # 调用所在行号
     file_path: Optional[str] = None         # 文件路径
     call_context: Optional[str] = None      # 调用上下文（代码片段）
@@ -67,9 +67,9 @@ class CallSite:
         """转换为字典"""
         return {
             "caller_name": self.caller_name,
-            "caller_signature": self.caller_signature,
+            "caller_identifier": self.caller_identifier,
             "callee_name": self.callee_name,
-            "callee_signature": self.callee_signature,
+            "callee_identifier": self.callee_identifier,
             "line_number": self.line_number,
             "file_path": self.file_path,
             "call_context": self.call_context,
@@ -137,17 +137,36 @@ class SearchOptions:
         }
 
 
+class SymbolType(Enum):
+    """符号类型"""
+    FUNCTION = "function"
+    CLASS = "class"
+    METHOD = "method"
+    GLOBAL_VAR = "global_var"
+    FIELD = "field"
+    VARIABLE = "variable"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class SearchResult:
-    """函数搜索结果"""
-    function: FunctionDef                   # 函数定义
+    """符号搜索结果"""
+    name: str                               # 符号名
+    signature: str                          # 符号签名
+    symbol_type: SymbolType                 # 符号类型
+    file_path: Optional[str] = None         # 文件路径
+    line: int = 0                           # 行号
     match_score: float = 0.0                # 匹配分数（0-1，越高越匹配）
     match_reason: Optional[str] = None      # 匹配原因/说明
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
-            "function": self.function.to_dict(),
+            "name": self.name,
+            "signature": self.signature,
+            "symbol_type": self.symbol_type.value,
+            "file_path": self.file_path,
+            "line": self.line,
             "match_score": self.match_score,
             "match_reason": self.match_reason,
         }
@@ -186,17 +205,17 @@ class BaseStaticAnalysisEngine(ABC):
 
     @abstractmethod
     async def get_function_def(
-        self,
-        function_name: Optional[str] = None,
-        function_signature: Optional[str] = None,
-        location: Optional[str] = None,
+            self,
+            function_name: Optional[str] = None,
+            function_identifier: Optional[str] = None,
+            location: Optional[str] = None,
     ) -> Optional[FunctionDef]:
         """
         异步获取函数定义
         
         参数:
             function_name: 函数名
-            function_signature: 函数签名（优先使用）
+            function_identifier: 函数唯一标识符（优先使用）
             location: 位置信息（如地址 0x140001000）
         
         返回:
@@ -206,14 +225,14 @@ class BaseStaticAnalysisEngine(ABC):
     
     @abstractmethod
     async def get_callee(
-        self,
-        function_signature: str,
+            self,
+            function_identifier: str,
     ) -> List[CallSite]:
         """
         异步获取函数内调用的子函数（被调用者）
         
         参数:
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符
         
         返回:
             CallSite 列表
@@ -222,14 +241,14 @@ class BaseStaticAnalysisEngine(ABC):
     
     @abstractmethod
     async def get_caller(
-        self,
-        function_signature: str,
+            self,
+            function_identifier: str,
     ) -> List[CallSite]:
         """
         异步获取调用该函数的父函数（调用者）
         
         参数:
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符
         
         返回:
             CallSite 列表
@@ -256,16 +275,16 @@ class BaseStaticAnalysisEngine(ABC):
     
     @abstractmethod
     async def get_variable_constraints(
-        self,
-        function_signature: str,
-        var_name: str,
-        line_number: Optional[int] = None,
+            self,
+            function_identifier: str,
+            var_name: str,
+            line_number: Optional[int] = None,
     ) -> List[VariableConstraint]:
         """
         异步获取变量在指定位置的约束条件
         
         参数:
-            function_signature: 函数签名
+            function_identifier: 函数唯一标识符
             var_name: 变量名
             line_number: 行号（可选，默认获取所有约束）
         
@@ -274,72 +293,72 @@ class BaseStaticAnalysisEngine(ABC):
         """
         pass
     
-    async def search_functions(
+    async def search_symbol(
         self,
         query: str,
         options: Optional[SearchOptions] = None,
     ) -> List[SearchResult]:
         """
-        异步搜索函数/方法
+        异步搜索符号（函数、类、全局变量等）
         
-        根据关键字搜索匹配的函数或方法。支持多种匹配模式：
+        根据关键字搜索匹配的符号。支持多种匹配模式：
         - 简单子串匹配（默认）
         - 正则表达式匹配
         - 大小写敏感/不敏感匹配
-        - 在函数代码中搜索（如果后端支持）
+        - 在代码中搜索（如果后端支持）
         
         参数:
             query: 搜索关键词
             options: 搜索选项，None 则使用默认选项
         
         返回:
-            SearchResult 列表，按 match_score 降序排列
+            SearchResult 列表，按 match_score 降序排列，包含符号类型信息
         
         示例:
             # 简单搜索
-            results = await engine.search_functions("memcpy")
+            results = await engine.search_symbol("memcpy")
             
             # 正则搜索，不区分大小写
             options = SearchOptions(use_regex=True, case_sensitive=False, limit=20)
-            results = await engine.search_functions(r"str.*cpy", options)
+            results = await engine.search_symbol(r"str.*cpy", options)
             
             # 在代码中搜索
             options = SearchOptions(search_in_code=True, limit=100)
-            results = await engine.search_functions("password", options)
+            results = await engine.search_symbol("password", options)
         """
         # 默认实现：返回空列表
         return []
     
     async def batch_get_function_defs(
-        self,
-        signatures: List[str],
-        max_concurrency: Optional[int] = None,
+            self,
+            identifiers: List[str],
+            max_concurrency: Optional[int] = None,
     ) -> Dict[str, Optional[FunctionDef]]:
         """
         批量异步获取函数定义
         
         参数:
-            signatures: 函数签名列表
+            identifiers: 函数唯一标识符列表
             max_concurrency: 最大并发数（覆盖默认设置）
         
         返回:
-            函数签名 -> FunctionDef 的字典
+            函数标识符 -> FunctionDef 的字典
         """
         semaphore = asyncio.Semaphore(
             max_concurrency or self._max_concurrency
         )
         
-        async def _fetch_one(sig: str) -> tuple:
+        async def _fetch_one(ident: str) -> tuple:
             async with semaphore:
-                result = await self.get_function_def(function_signature=sig)
-                return sig, result
+                result = await self.get_function_def(function_identifier=ident)
+                return ident, result
         
-        tasks = [_fetch_one(sig) for sig in signatures]
+        tasks = [_fetch_one(ident) for ident in identifiers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         return {
-            sig: result if not isinstance(result, Exception) else None
-            for sig, result in results
+            ident: result if not isinstance(result, Exception) else None
+            for ident, result in results
         }
 
     async def ping(self) -> bool:
@@ -378,7 +397,7 @@ class BaseStaticAnalysisEngine(ABC):
     async def resolve_function_by_callsite(
         self,
         callsite: CallsiteInfo,
-        caller_signature: Optional[str] = None,
+        caller_identifier: Optional[str] = None,
         caller_code: Optional[str] = None,
     ) -> Optional[str]:
         """
@@ -393,14 +412,14 @@ class BaseStaticAnalysisEngine(ABC):
         
         参数:
             callsite: 调用点信息（包含行号、列号、函数名、参数等）
-            caller_signature: 调用者函数签名（可选，用于上下文定位）
+            caller_identifier: 调用者函数标识符（可选，用于上下文定位）
             caller_code: 调用者源代码（可选，用于 CallsiteAgent）
         
         返回:
             被调用函数的完整签名，解析失败返回 None
         """
         # 1. 优先尝试静态分析
-        signature = await self._resolve_static_callsite(callsite, caller_signature)
+        signature = await self._resolve_static_callsite(callsite, caller_identifier)
         if signature:
             return signature
 
@@ -419,9 +438,9 @@ class BaseStaticAnalysisEngine(ABC):
                 
                 # 提取 class 和 method 名（如果可能）
                 caller_class = None
-                caller_method = caller_signature
-                if caller_signature and '.' in caller_signature:
-                    parts = caller_signature.split('.')
+                caller_method = caller_identifier
+                if caller_identifier and '.' in caller_identifier:
+                    parts = caller_identifier.split('.')
                     caller_method = parts[-1]
                     if len(parts) > 1:
                         caller_class = parts[-2]
@@ -433,8 +452,8 @@ class BaseStaticAnalysisEngine(ABC):
                     caller_method=caller_method
                 )
                 
-                if resolved_result.resolved_successfully and resolved_result.function_signature:
-                    return resolved_result.function_signature
+                if resolved_result.resolved_successfully and resolved_result.function_identifier:
+                    return resolved_result.function_identifier
                     
             except Exception as e:
                 # 记录错误但不抛出，保持静默失败
@@ -444,16 +463,16 @@ class BaseStaticAnalysisEngine(ABC):
 
     @abstractmethod
     async def _resolve_static_callsite(
-        self,
-        callsite: CallsiteInfo,
-        caller_signature: Optional[str] = None,
+            self,
+            callsite: CallsiteInfo,
+            caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
         [子类实现] 静态分析：根据调用点信息解析函数签名
         
         参数:
             callsite: 调用点信息
-            caller_signature: 调用者函数签名
+            caller_identifier: 调用者函数标识符
             
         返回:
             解析后的函数签名，失败返回 None

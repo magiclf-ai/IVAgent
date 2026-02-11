@@ -216,7 +216,7 @@ class CallsiteAgent(BaseAgent):
             caller_method: Name of the caller function.
         """
         # 记录执行开始
-        target = callsite_info.function_signature or "unknown"
+        target = callsite_info.function_identifier or "unknown"
         self._agent_logger.log_execution_start(
             agent_id=self.agent_id,
             agent_type="CallsiteAgent",
@@ -338,7 +338,7 @@ class CallsiteAgent(BaseAgent):
         
         return ResolvedCallsite(
             callsite=callsite_info,
-            function_signature=best_candidate,
+            function_identifier=best_candidate,
             resolved_successfully=resolved_successfully,
             error_message=reasoning if not candidates else ""
         )
@@ -466,7 +466,7 @@ Please analyze the following callsite and identify the target function being cal
 | Field | Value |
 |-------|-------|
 | **Line Number** | {callsite.line_number} |
-| **Target Function Signature** | `{callsite.function_signature or "N/A"}` |
+| **Target Function Identifier** | `{callsite.function_identifier or "N/A"}` |
 | **Arguments** | `{callsite.arguments or "N/A"}` |
 | **Call Text** | `{callsite.call_text or "N/A"}` |{caller_info}{source_context}
 

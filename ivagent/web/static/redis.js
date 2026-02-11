@@ -271,6 +271,7 @@ function bindEvents() {
             elements.connectModal.classList.remove('active');
             elements.valueModal.classList.remove('active');
             elements.ttlModal.classList.remove('active');
+            elements.clearAllModal.classList.remove('active');
         }
         if (e.key === 'r' && e.ctrlKey) {
             e.preventDefault();
@@ -278,6 +279,21 @@ function bindEvents() {
             searchKeys();
         }
     });
+    
+    // Sidebar Toggle
+    const menuToggle = document.getElementById('menu-toggle');
+    if (menuToggle) {
+        menuToggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            document.getElementById('wrapper').classList.toggle('toggled');
+        });
+    }
+    
+    // Clear All Modal Cancel Button
+    const cancelClearAllBtn = document.getElementById('cancel-clear-all-btn');
+    if (cancelClearAllBtn) {
+        cancelClearAllBtn.addEventListener('click', closeClearAllModal);
+    }
 }
 
 // ==================== API 调用 ====================
@@ -426,8 +442,13 @@ function setSearchingState(searching) {
 // ==================== UI 更新 ====================
 
 function updateConnectionStatus(connected) {
-    elements.redisStatus.classList.toggle('connected', connected);
-    elements.redisStatusText.textContent = connected ? '已连接' : '未连接';
+    if (elements.redisStatus) {
+        elements.redisStatus.classList.remove('online', 'offline');
+        elements.redisStatus.classList.add(connected ? 'online' : 'offline');
+    }
+    if (elements.redisStatusText) {
+        elements.redisStatusText.textContent = connected ? '已连接' : '未连接';
+    }
 }
 
 function updateKeysTable(keys) {
@@ -469,6 +490,20 @@ function updateKeysTable(keys) {
                 state.selectedKeys.delete(key);
             }
             updateBatchDeleteButton();
+        });
+    });
+    
+    // 绑定行双击事件 - 点击查看 key 值
+    elements.keysTableBody.querySelectorAll('tr').forEach(row => {
+        row.addEventListener('dblclick', (e) => {
+            // 避免在复选框和按钮上触发
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.closest('button')) {
+                return;
+            }
+            const key = row.dataset.key;
+            if (key) {
+                viewKey(key);
+            }
         });
     });
 }
@@ -546,13 +581,13 @@ function showKeyValue(data) {
     let valueHtml = renderValueByType(data.type, data.value);
     
     elements.valueModalBody.innerHTML = `
-        <div class="key-detail">
+        <div class="log-detail">
             <div class="detail-section">
                 <h4>基本信息</h4>
                 <div class="detail-grid">
                     <div class="detail-item">
                         <span class="detail-label">键名</span>
-                        <span class="detail-value"><code>${escapeHtml(data.key)}</code></span>
+                        <span class="detail-value id"><code>${escapeHtml(data.key)}</code></span>
                     </div>
                     <div class="detail-item">
                         <span class="detail-label">类型</span>
@@ -577,9 +612,7 @@ function showKeyValue(data) {
             
             <div class="detail-section">
                 <h4>值内容</h4>
-                <div class="value-container">
-                    ${valueHtml}
-                </div>
+                ${valueHtml}
             </div>
         </div>
     `;
@@ -599,17 +632,13 @@ function renderValueByType(type, value) {
     } else if (type === 'zset') {
         return renderZSetValue(value);
     }
-    return `<pre class="value-content">${escapeHtml(String(value))}</pre>`;
+    return renderRawValue(value);
 }
 
 function renderDecodedValue(value) {
     // 处理解码后的值对象
     if (value && typeof value === 'object' && value.type) {
         const { type, format, value: actualValue, preview, truncated, class_name, data_type, is_dataclass } = value;
-        
-        let formatBadge = format ? `<span class="format-badge">${format}</span>` : '';
-        let typeBadge = `<span class="value-type-badge">${class_name || type}</span>`;
-        let dataTypeBadge = data_type ? `<span class="data-type-badge" data-type="${data_type}">${data_type}</span>` : '';
         
         // 特殊处理 FunctionSummary 类型
         if (data_type === 'function_summary' || data_type === 'function_summary_dict') {
@@ -624,110 +653,147 @@ function renderDecodedValue(value) {
         if (type === 'structured') {
             // 结构化数据（对象、数组等）
             const jsonStr = JSON.stringify(actualValue, null, 2);
-            return `
-                <div class="value-header">
-                    ${typeBadge}
-                    ${dataTypeBadge}
-                    ${formatBadge}
-                    <span class="value-size">${value.size || 0} bytes</span>
-                </div>
-                <pre class="value-content json-value"><code>${escapeHtml(jsonStr)}</code></pre>
-            `;
+            return renderValueCard('JSON', 'bi-braces', jsonStr, 'json');
         } else if (type === 'text') {
             // 文本数据
             const displayValue = truncated ? preview : actualValue;
-            return `
-                <div class="value-header">
-                    ${typeBadge}
-                    ${dataTypeBadge}
-                    ${formatBadge}
-                    <span class="value-size">${value.size || 0} chars</span>
-                </div>
-                <pre class="value-content text-value">${escapeHtml(displayValue)}</pre>
-                ${truncated ? '<div class="value-truncated">内容已截断，完整数据更大</div>' : ''}
-            `;
+            return renderValueCard('Text', 'bi-file-text', displayValue, 'text', truncated);
         } else if (type === 'number' || type === 'boolean' || type === 'null') {
             // 简单类型
-            return `
-                <div class="value-header">
-                    ${typeBadge}
-                    ${dataTypeBadge}
-                    ${formatBadge}
-                </div>
-                <div class="value-content simple-value ${type}-value">${escapeHtml(String(actualValue))}</div>
-            `;
+            return renderSimpleValueCard(class_name || type, actualValue, type);
         } else if (type === 'object') {
             // 自定义对象
-            return `
-                <div class="value-header">
-                    ${typeBadge}
-                    ${dataTypeBadge}
-                    ${formatBadge}
-                </div>
-                <pre class="value-content object-value">${escapeHtml(preview || String(actualValue))}</pre>
-                ${truncated ? '<div class="value-truncated">内容已截断</div>' : ''}
-            `;
+            return renderValueCard(class_name || 'Object', 'bi-box', preview || String(actualValue), 'object', truncated);
         }
     }
     
     // 原始值（未解码格式）
+    return renderRawValue(value);
+}
+
+// 渲染值卡片（参照日志详情的 message-card 样式）
+function renderValueCard(title, icon, content, contentType, truncated = false) {
+    let contentHtml = '';
+    
+    if (contentType === 'json') {
+        contentHtml = `<pre class="value-content json-value"><code>${escapeHtml(content)}</code></pre>`;
+    } else if (contentType === 'text') {
+        contentHtml = `<pre class="value-content text-value">${escapeHtml(content)}</pre>`;
+    } else if (contentType === 'object') {
+        contentHtml = `<pre class="value-content object-value">${escapeHtml(content)}</pre>`;
+    } else {
+        contentHtml = `<div class="value-content">${escapeHtml(String(content))}</div>`;
+    }
+    
+    return `
+        <div class="message-list">
+            <div class="message-card">
+                <div class="message-card-header" onclick="toggleMessageCard(this)">
+                    <div class="message-meta">
+                        <span class="msg-type-badge badge-system">
+                            <i class="bi ${icon}"></i> ${title}
+                        </span>
+                        ${truncated ? '<span class="value-size-warning">已截断</span>' : ''}
+                    </div>
+                    <i class="bi bi-chevron-down message-toggle-icon"></i>
+                </div>
+                <div class="message-card-body">
+                    ${contentHtml}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// 渲染简单值卡片
+function renderSimpleValueCard(typeName, value, type) {
+    const typeColors = {
+        'number': '#059669',
+        'boolean': '#7c3aed',
+        'null': '#94a3b8',
+        'string': '#1e40af'
+    };
+    const color = typeColors[type] || 'var(--text-main)';
+    
+    return `
+        <div class="message-list">
+            <div class="message-card">
+                <div class="message-card-header" onclick="toggleMessageCard(this)">
+                    <div class="message-meta">
+                        <span class="msg-type-badge badge-ai">
+                            <i class="bi bi-hash"></i> ${typeName}
+                        </span>
+                    </div>
+                    <i class="bi bi-chevron-down message-toggle-icon"></i>
+                </div>
+                <div class="message-card-body">
+                    <div class="value-content simple-value ${type}-value" style="color: ${color}; font-size: 24px; font-weight: 600; text-align: center; padding: 40px;">
+                        ${escapeHtml(String(value))}
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// 渲染原始值
+function renderRawValue(value) {
     const displayValue = typeof value === 'object' 
         ? JSON.stringify(value, null, 2) 
         : String(value);
-    return `<pre class="value-content raw-value">${escapeHtml(displayValue)}</pre>`;
+    
+    return `
+        <div class="message-list">
+            <div class="message-card">
+                <div class="message-card-header" onclick="toggleMessageCard(this)">
+                    <div class="message-meta">
+                        <span class="msg-type-badge badge-default">
+                            <i class="bi bi-file-binary"></i> Raw Value
+                        </span>
+                    </div>
+                    <i class="bi bi-chevron-down message-toggle-icon"></i>
+                </div>
+                <div class="message-card-body">
+                    <pre class="value-content raw-value">${escapeHtml(displayValue)}</pre>
+                </div>
+            </div>
+        </div>
+    `;
 }
 
 // 渲染函数摘要（FunctionSummary）
 function renderFunctionSummary(data, dataType) {
-    console.log('renderFunctionSummary called with:', data);
-    
     // 提取实际的摘要对象
     let summary = data;
     if (data && data.value) {
         summary = data.value;
     }
     if (!summary || typeof summary !== 'object') {
-        console.log('Invalid summary data:', summary);
-        return `<pre class="value-content raw-value">${escapeHtml(String(data))}</pre>`;
+        return renderRawValue(data);
     }
     
-    // 调试：输出实际的数据内容
-    console.log('FunctionSummary summary:', summary);
-    console.log('param_constraints:', summary.param_constraints);
-    console.log('Array.isArray(param_constraints):', Array.isArray(summary.param_constraints));
-    
     // 提取 SimpleFunctionSummary 的关键信息
-    const functionName = summary.function_signature || summary.function_name || 'Unknown';
+    const functionName = summary.function_identifier || summary.function_name || 'Unknown';
     const behaviorSummary = summary.behavior_summary || '';
     const returnValue = summary.return_value_meaning || '';
     const globalVarOps = summary.global_var_operations || '';
     const paramConstraints = Array.isArray(summary.param_constraints) ? summary.param_constraints : [];
-    console.log('paramConstraints extracted:', paramConstraints);
     
-    return `
-        <div class="value-header">
-            <span class="value-type-badge function-summary">SimpleFunctionSummary</span>
-            <span class="data-type-badge" data-type="function_summary">函数摘要</span>
-        </div>
-        <div class="function-summary-container">
+    // 构建内容 HTML
+    let contentHtml = `
+        <div class="fs-content">
             <!-- 函数基本信息 -->
             <div class="fs-section">
-                <h4 class="fs-title">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
-                        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
-                    </svg>
-                    函数信息
-                </h4>
-                <div class="fs-info-grid">
-                    <div class="fs-info-item">
-                        <span class="fs-label">函数签名</span>
-                        <code class="fs-value">${escapeHtml(functionName)}</code>
+                <h5 class="fs-section-title"><i class="bi bi-link"></i> 函数信息</h5>
+                <div class="detail-grid" style="grid-template-columns: 1fr;">
+                    <div class="detail-item">
+                        <span class="detail-label">函数签名</span>
+                        <code class="detail-value" style="font-size: 13px;">${escapeHtml(functionName)}</code>
                     </div>
                     ${returnValue ? `
-                    <div class="fs-info-item">
-                        <span class="fs-label">返回值</span>
-                        <span class="fs-value">${escapeHtml(returnValue)}</span>
+                    <div class="detail-item">
+                        <span class="detail-label">返回值</span>
+                        <span class="detail-value">${escapeHtml(returnValue)}</span>
                     </div>` : ''}
                 </div>
             </div>
@@ -735,28 +801,13 @@ function renderFunctionSummary(data, dataType) {
             <!-- 行为总结 -->
             ${behaviorSummary ? `
             <div class="fs-section">
-                <h4 class="fs-title">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <line x1="12" y1="16" x2="12" y2="12"></line>
-                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                    </svg>
-                    行为总结
-                </h4>
-                <p class="fs-behavior">${escapeHtml(behaviorSummary)}</p>
+                <h5 class="fs-section-title"><i class="bi bi-info-circle"></i> 行为总结</h5>
+                <div class="fs-text-content">${escapeHtml(behaviorSummary)}</div>
             </div>` : ''}
             
             <!-- 参数约束 -->
             <div class="fs-section">
-                <h4 class="fs-title">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="4" y1="9" x2="20" y2="9"></line>
-                        <line x1="4" y1="15" x2="20" y2="15"></line>
-                        <line x1="10" y1="3" x2="8" y2="21"></line>
-                        <line x1="16" y1="3" x2="14" y2="21"></line>
-                    </svg>
-                    参数约束 (${paramConstraints.length})
-                </h4>
+                <h5 class="fs-section-title"><i class="bi bi-list-check"></i> 参数约束 (${paramConstraints.length})</h5>
                 ${paramConstraints.length > 0 ? `
                 <div class="fs-constraints-list">
                     ${paramConstraints.map((constraint, idx) => `
@@ -771,43 +822,28 @@ function renderFunctionSummary(data, dataType) {
             <!-- 全局变量操作 -->
             ${globalVarOps ? `
             <div class="fs-section">
-                <h4 class="fs-title">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-                        <polyline points="2 17 12 22 22 17"></polyline>
-                        <polyline points="2 12 12 17 22 12"></polyline>
-                    </svg>
-                    全局变量操作
-                </h4>
-                <p class="fs-global-ops">${escapeHtml(globalVarOps)}</p>
+                <h5 class="fs-section-title"><i class="bi bi-globe"></i> 全局变量操作</h5>
+                <div class="fs-text-content">${escapeHtml(globalVarOps)}</div>
             </div>` : ''}
             
             <!-- JSON 原始数据 -->
             <div class="fs-section">
-                <h4 class="fs-title">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="16 18 22 12 16 6"></polyline>
-                        <polyline points="8 6 2 12 8 18"></polyline>
-                    </svg>
-                    JSON 数据
-                </h4>
-                <pre class="fs-json-content"><code>${escapeHtml(JSON.stringify(summary, null, 2))}</code></pre>
+                <h5 class="fs-section-title"><i class="bi bi-braces"></i> JSON 数据</h5>
+                <pre class="value-content json-value"><code>${escapeHtml(JSON.stringify(summary, null, 2))}</code></pre>
             </div>
         </div>
     `;
+    
+    return renderCollectionCard('FunctionSummary', 'bi-code-square', '函数摘要', contentHtml);
 }
 
 function renderHashValue(value) {
     if (!value || Object.keys(value).length === 0) {
-        return '<div class="empty-value">空 Hash</div>';
+        return renderEmptyValueCard('Hash', '空 Hash');
     }
     
     const entries = Object.entries(value);
-    return `
-        <div class="value-header">
-            <span class="value-type-badge">Hash</span>
-            <span class="value-size">${entries.length} 字段</span>
-        </div>
+    const tableHtml = `
         <table class="value-table hash-table">
             <thead><tr><th>字段</th><th>值</th></tr></thead>
             <tbody>
@@ -820,18 +856,16 @@ function renderHashValue(value) {
             </tbody>
         </table>
     `;
+    
+    return renderCollectionCard('Hash', 'bi-diagram-2', `${entries.length} 字段`, tableHtml);
 }
 
 function renderListValue(value) {
     if (!value || value.length === 0) {
-        return '<div class="empty-value">空 List</div>';
+        return renderEmptyValueCard('List', '空 List');
     }
     
-    return `
-        <div class="value-header">
-            <span class="value-type-badge">List</span>
-            <span class="value-size">${value.length} 项</span>
-        </div>
+    const listHtml = `
         <ol class="value-list structured-list">
             ${value.map((v, i) => `
                 <li>
@@ -841,34 +875,30 @@ function renderListValue(value) {
             `).join('')}
         </ol>
     `;
+    
+    return renderCollectionCard('List', 'bi-list-ol', `${value.length} 项`, listHtml);
 }
 
 function renderSetValue(value) {
     if (!value || value.length === 0) {
-        return '<div class="empty-value">空 Set</div>';
+        return renderEmptyValueCard('Set', '空 Set');
     }
     
-    return `
-        <div class="value-header">
-            <span class="value-type-badge">Set</span>
-            <span class="value-size">${value.length} 项</span>
-        </div>
+    const listHtml = `
         <ul class="value-list structured-list set-list">
             ${value.map(v => `<li>${renderInlineValue(v)}</li>`).join('')}
         </ul>
     `;
+    
+    return renderCollectionCard('Set', 'bi-collection', `${value.length} 项`, listHtml);
 }
 
 function renderZSetValue(value) {
     if (!value || value.length === 0) {
-        return '<div class="empty-value">空 ZSet</div>';
+        return renderEmptyValueCard('ZSet', '空 ZSet');
     }
     
-    return `
-        <div class="value-header">
-            <span class="value-type-badge">ZSet</span>
-            <span class="value-size">${value.length} 项</span>
-        </div>
+    const tableHtml = `
         <table class="value-table zset-table">
             <thead><tr><th>成员</th><th>分数</th></tr></thead>
             <tbody>
@@ -881,6 +911,8 @@ function renderZSetValue(value) {
             </tbody>
         </table>
     `;
+    
+    return renderCollectionCard('ZSet', 'bi-sort-numeric-down', `${value.length} 项`, tableHtml);
 }
 
 function renderInlineValue(value) {
@@ -905,6 +937,65 @@ function renderInlineValue(value) {
     const str = typeof value === 'object' ? JSON.stringify(value) : String(value);
     const display = str.length > 100 ? str.substring(0, 100) + '...' : str;
     return `<code class="inline-code">${escapeHtml(display)}</code>`;
+}
+
+// 渲染集合卡片
+function renderCollectionCard(title, icon, sizeInfo, contentHtml) {
+    return `
+        <div class="message-list">
+            <div class="message-card">
+                <div class="message-card-header" onclick="toggleMessageCard(this)">
+                    <div class="message-meta">
+                        <span class="msg-type-badge badge-tool">
+                            <i class="bi ${icon}"></i> ${title}
+                        </span>
+                        <span class="value-size-info">${sizeInfo}</span>
+                    </div>
+                    <i class="bi bi-chevron-down message-toggle-icon"></i>
+                </div>
+                <div class="message-card-body">
+                    ${contentHtml}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// 渲染空值卡片
+function renderEmptyValueCard(type, message) {
+    return `
+        <div class="message-list">
+            <div class="message-card">
+                <div class="message-card-header" onclick="toggleMessageCard(this)">
+                    <div class="message-meta">
+                        <span class="msg-type-badge badge-default">
+                            <i class="bi bi-inbox"></i> ${type}
+                        </span>
+                    </div>
+                    <i class="bi bi-chevron-down message-toggle-icon"></i>
+                </div>
+                <div class="message-card-body">
+                    <div class="empty-value" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                        <i class="bi bi-inbox" style="font-size: 32px; display: block; margin-bottom: 12px; opacity: 0.5;"></i>
+                        ${message}
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// 切换消息卡片折叠状态（参照 app.js）
+function toggleMessageCard(header) {
+    const card = header.closest('.message-card');
+    const body = card.querySelector('.message-card-body');
+    const icon = header.querySelector('.message-toggle-icon');
+    
+    if (body) {
+        const isCollapsed = body.style.display === 'none';
+        body.style.display = isCollapsed ? 'block' : 'none';
+        icon.style.transform = isCollapsed ? 'rotate(0deg)' : 'rotate(-90deg)';
+    }
 }
 
 function editTTL(key, currentTTL) {
@@ -1100,50 +1191,47 @@ function showError(message) {
 }
 
 // 渲染分析状态
-function renderAnalysisState(state) {
+function renderAnalysisState(stateValue) {
     const stateColors = {
-        'pending': { bg: '#fef3c7', text: '#92400e', border: '#fbbf24', label: '等待中' },
-        'analyzing': { bg: '#dbeafe', text: '#1e40af', border: '#60a5fa', label: '分析中' },
-        'completed': { bg: '#d1fae5', text: '#065f46', border: '#34d399', label: '已完成' },
-        'failed': { bg: '#fee2e2', text: '#991b1b', border: '#f87171', label: '失败' }
+        'pending': { bg: '#fef3c7', text: '#92400e', border: '#fbbf24', label: '等待中', icon: 'bi-hourglass' },
+        'analyzing': { bg: '#dbeafe', text: '#1e40af', border: '#60a5fa', label: '分析中', icon: 'bi-arrow-repeat' },
+        'completed': { bg: '#d1fae5', text: '#065f46', border: '#34d399', label: '已完成', icon: 'bi-check-circle' },
+        'failed': { bg: '#fee2e2', text: '#991b1b', border: '#f87171', label: '失败', icon: 'bi-x-circle' }
     };
     
-    const stateInfo = stateColors[state] || { bg: '#f3f4f6', text: '#4b5563', border: '#d1d5db', label: state };
+    const stateInfo = stateColors[stateValue] || { bg: '#f3f4f6', text: '#4b5563', border: '#d1d5db', label: stateValue, icon: 'bi-question-circle' };
     
-    return `
-        <div class="value-header">
-            <span class="value-type-badge" style="background: ${stateInfo.bg}; color: ${stateInfo.text}; border-color: ${stateInfo.border};">
-                AnalysisState
-            </span>
-            <span class="data-type-badge" data-type="analysis_state">分析状态</span>
-        </div>
-        <div class="analysis-state-container">
+    const contentHtml = `
+        <div class="analysis-state-content" style="padding: 24px; text-align: center;">
             <div class="state-badge" style="
                 display: inline-flex;
                 align-items: center;
-                gap: 8px;
-                padding: 12px 24px;
+                gap: 12px;
+                padding: 16px 32px;
                 background: ${stateInfo.bg};
                 color: ${stateInfo.text};
                 border: 1px solid ${stateInfo.border};
-                border-radius: 8px;
-                font-size: 16px;
+                border-radius: 12px;
+                font-size: 18px;
                 font-weight: 600;
             ">
+                <i class="bi ${stateInfo.icon}" style="font-size: 20px;"></i>
                 <span class="state-indicator" style="
-                    width: 10px;
-                    height: 10px;
+                    width: 12px;
+                    height: 12px;
                     background: ${stateInfo.border};
                     border-radius: 50%;
-                    ${state === 'analyzing' ? 'animation: pulse 1.5s infinite;' : ''}
+                    ${stateValue === 'analyzing' ? 'animation: pulse 1.5s infinite;' : ''}
                 "></span>
                 ${escapeHtml(stateInfo.label)}
             </div>
-            <div class="state-raw" style="margin-top: 16px; font-size: 12px; color: #6b7280;">
-                原始值: <code>${escapeHtml(state)}</code>
+            <div class="state-raw" style="margin-top: 20px; font-size: 13px; color: var(--text-secondary);">
+                原始值: <code>${escapeHtml(stateValue)}</code>
             </div>
         </div>
     `;
+    
+    return renderCollectionCard('AnalysisState', 'bi-activity', '分析状态', contentHtml);
 }
 
 // 启动应用

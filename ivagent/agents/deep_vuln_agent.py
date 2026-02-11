@@ -64,25 +64,21 @@ from ..models.callsite import CallsiteInfo, ResolvedCallsite
 def get_function_summary_tool(
         line_number: int,
         column_number: int,
-        function_signature: str,
+        function_identifier: str,
         arguments: List[str],
         call_text: str,
 ) -> Dict[str, Any]:
-    """
-    获取子函数摘要
+    """获取子函数摘要。
     
     当需要了解子函数的行为和参数约束时调用此工具。
     通过提供调用点的位置信息（行号、列号、函数名等），Agent 会自动解析出具体的函数。
     
-    Args:
+    Parameters:
         line_number: 调用所在行号（从代码左侧的方括号中获取，如 [ 8] 表示第8行）
         column_number: 调用所在列号（函数名开始的列）
-        function_signature: 目标函数签名（如 "sub_13E15CC", "Lpackage/Class;->method(Args)Ret"）
+        function_identifier: 目标函数唯一标识符（如 "sub_13E15CC"）
         arguments: 参数表达式列表（如 ["ptr", "size", "data"]）
         call_text: 完整调用文本（包含参数和调用语句，如 "result = func(ptr, size);")
-    
-    Returns:
-        函数摘要信息，包含 behavior_summary, param_constraints 等
     
     Example:
         对于代码：
@@ -93,15 +89,16 @@ def get_function_summary_tool(
         调用参数：
         - line_number: 8
         - column_number: 16
-        - function_signature: "sub_13E15CC"
+        - function_identifier: "sub_13E15CC"
         - arguments: ["**(*(result + 272) + 72LL)", "*a2", "&v3"]
         - call_text: "result = sub_13E15CC(**(*(result + 272) + 72LL), *a2, &v3);"
     """
+    # Returns: 函数摘要信息，包含 behavior_summary, param_constraints 等
     return {
         "callsite": {
             "line_number": line_number,
             "column_number": column_number,
-            "function_signature": function_signature,
+            "function_identifier": function_identifier,
             "arguments": arguments,
             "call_text": call_text,
         }
@@ -111,31 +108,27 @@ def get_function_summary_tool(
 def create_sub_agent_tool(
         line_number: int,
         column_number: int,
-        function_signature: str,
+        function_identifier: str,
         arguments: List[str],
         call_text: str,
         caller_function: str = "",
         argument_constraints: Optional[List[str]] = None,
         reason: str = "",
 ) -> Dict[str, Any]:
-    """
-    创建子 Agent 深入分析子函数
+    """创建子 Agent 深入分析子函数。
     
     当污点数据传播到子函数中，或需要深入分析子函数时调用。
     通过提供调用点的位置信息（行号、列号、函数名等），Agent 会自动解析出具体的函数。
     
-    Args:
+    Parameters:
         line_number: 调用所在行号（从代码左侧的方括号中获取，如 [ 8] 表示第8行）
         column_number: 调用所在列号（函数名开始的列）
-        function_signature: 目标函数签名（如 "sub_13E15CC", "Lpackage/Class;->method(Args)Ret"）
+        function_identifier: 目标函数唯一标识符
         arguments: 参数表达式列表（如 ["ptr", "size", "data"]）
         call_text: 完整调用文本（包含参数和调用语句，如 "result = func(ptr, size);")
         caller_function: 调用者函数名
-        argument_constraints: 参数约束列表（纯文本格式），如 ["参数1 ptr: 已通过 ptr != NULL 检查", "参数2 size: 0 < size <= 1024"]
+        argument_constraints: 参数约束列表（纯文本格式）
         reason: 创建原因
-    
-    Returns:
-        子 Agent 创建结果
     
     Example:
         对于代码：
@@ -146,18 +139,19 @@ def create_sub_agent_tool(
         调用参数：
         - line_number: 8
         - column_number: 16
-        - function_signature: "sub_13E15CC"
+        - function_identifier: "sub_13E15CC"
         - arguments: ["**(*(result + 272) + 72LL)", "*a2", "&v3"]
         - call_text: "result = sub_13E15CC(**(*(result + 272) + 72LL), *a2, &v3);"
         - caller_function: "sub_13E16E8"
         - argument_constraints: ["参数1: 污点数据"]
         - reason: "污点数据传播到子函数"
     """
+    # Returns: 子 Agent 创建结果
     return {
         "callsite": {
             "line_number": line_number,
             "column_number": column_number,
-            "function_signature": function_signature,
+            "function_identifier": function_identifier,
             "arguments": arguments,
             "call_text": call_text,
         },
@@ -180,13 +174,12 @@ def report_vulnerability_tool(
         remediation: str = "",
         evidence: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    报告发现的漏洞
+    """报告发现的漏洞。
     
     当你在当前函数中发现安全漏洞时，调用此工具报告漏洞详情。
     可以在任意分析迭代轮次中调用，无需等到最后。
     
-    Args:
+    Parameters:
         vuln_type: 漏洞类型，如 BUFFER_OVERFLOW, ARRAY_OOB, NULL_POINTER, FORMAT_STRING 等
         name: 漏洞名称
         description: 详细描述，包括漏洞原理、利用条件等
@@ -198,9 +191,6 @@ def report_vulnerability_tool(
         data_flow_intermediate: 中间传播节点列表
         remediation: 修复建议
         evidence: 证据代码行列表
-    
-    Returns:
-        漏洞报告确认
     
     Example:
         report_vulnerability_tool(
@@ -217,6 +207,7 @@ def report_vulnerability_tool(
             evidence=["[  15]     memcpy(buf, input, len);"]
         )
     """
+    # Returns: 漏洞报告确认
     return {
         "vulnerability": {
             "type": vuln_type,
@@ -241,8 +232,7 @@ def finalize_analysis_tool(
         constraints_extracted: Optional[List[str]] = None,
         taint_sources_identified: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    完成分析并输出最终漏洞报告
+    """完成分析并输出最终漏洞报告。
     
     当你认为已经收集了足够的信息，可以输出最终漏洞分析结果时调用此工具。
     这是分析的最后一个步骤，调用后将结束当前的迭代循环。
@@ -250,13 +240,10 @@ def finalize_analysis_tool(
     注意：如果你已经在分析过程中通过 `report_vulnerability_tool` 报告了漏洞，
     此处只需提供分析总结，无需重复列出漏洞详情。
     
-    Args:
+    Parameters:
         analysis_summary: 分析总结
         constraints_extracted: 提取的约束条件列表
         taint_sources_identified: 识别的污点源列表
-    
-    Returns:
-        最终分析结果标记
     
     Example:
         finalize_analysis_tool(
@@ -265,6 +252,7 @@ def finalize_analysis_tool(
             taint_sources_identified=["user_input", "param_1"]
         )
     """
+    # Returns: 最终分析结果标记
     return {
         "analysis_summary": analysis_summary,
         "constraints_extracted": constraints_extracted or [],
@@ -329,7 +317,7 @@ class AgentExecutionState:
     """Agent 执行状态"""
     agent_id: str
     parent_id: Optional[str]
-    function_signature: str
+    function_identifier: str
     call_stack: List[str]
     depth: int
     start_time: datetime
@@ -342,7 +330,7 @@ class AgentExecutionState:
         return {
             "agent_id": self.agent_id,
             "parent_id": self.parent_id,
-            "function_signature": self.function_signature,
+            "function_identifier": self.function_identifier,
             "call_stack": self.call_stack,
             "depth": self.depth,
             "start_time": self.start_time.isoformat(),
@@ -389,6 +377,7 @@ class DeepVulnAgent(BaseAgent):
             precondition: Optional[Precondition] = None,
             progress_logger: Optional[Any] = None,
             source_root: Optional[str] = None,
+            system_prompt: Optional[str] = None,
     ):
         """
         初始化 DeepVulnAgent
@@ -406,6 +395,7 @@ class DeepVulnAgent(BaseAgent):
             precondition: 前置条件定义
             progress_logger: 进度日志回调函数，接收 (message, level) 参数
             source_root: 源码根目录（用于 CallsiteAgent）
+            system_prompt: 自定义系统提示词（用于 Orchestrator 动态注入）
         """
         super().__init__(
             engine=engine,
@@ -414,6 +404,9 @@ class DeepVulnAgent(BaseAgent):
             verbose=verbose,
             max_concurrency=max_concurrency,
         )
+
+        # 自定义系统提示词（用于 Orchestrator 动态注入）
+        self._custom_system_prompt = system_prompt
 
         # 源码根目录，用于 CallsiteAgent
         self.source_root = source_root or getattr(engine, 'project_root', '.')
@@ -506,13 +499,13 @@ class DeepVulnAgent(BaseAgent):
         if self.call_stack and not self.call_stack_detailed:
             # 从简单格式构建详细格式（信息可能不完整）
             self.call_stack_detailed = [
-                CallStackFrame(function_signature=sig)
+                CallStackFrame(function_identifier=sig)
                 for sig in self.call_stack
             ]
         elif self.call_stack_detailed and not self.call_stack:
             # 从详细格式构建简单格式
             self.call_stack = [
-                frame.function_signature for frame in self.call_stack_detailed
+                frame.function_identifier for frame in self.call_stack_detailed
             ]
 
     def _log_progress(self, message: str, level: str = "info"):
@@ -532,9 +525,9 @@ class DeepVulnAgent(BaseAgent):
             return
 
         # 构建有意义的标识符：函数名 + Agent类型
-        if self.execution_state and self.execution_state.function_signature:
-            # 提取函数名（从签名中提取）
-            func_sig = self.execution_state.function_signature
+        if self.execution_state and self.execution_state.function_identifier:
+            # 提取函数名（从标识符中提取）
+            func_sig = self.execution_state.function_identifier
             # 尝试提取简单函数名
             if '(' in func_sig:
                 func_name = func_sig[:func_sig.index('(')].strip()
@@ -556,12 +549,12 @@ class DeepVulnAgent(BaseAgent):
         else:
             print(f"  [*] {prefix} {message}")
 
-    async def _register_execution_state(self, function_signature: str):
+    async def _register_execution_state(self, function_identifier: str):
         """注册执行状态"""
         self.execution_state = AgentExecutionState(
             agent_id=self.agent_id,
             parent_id=self.parent_id,
-            function_signature=function_signature,
+            function_identifier=function_identifier,
             call_stack=self.call_stack.copy(),
             depth=len(self.call_stack),
             start_time=datetime.now(),
@@ -573,7 +566,7 @@ class DeepVulnAgent(BaseAgent):
         self._agent_logger.log_execution_start(
             agent_id=self.agent_id,
             agent_type="DeepVulnAgent",
-            target_function=function_signature,
+            target_function=function_identifier,
             parent_id=self.parent_id,
             call_stack=self.call_stack.copy(),
         )
@@ -587,22 +580,22 @@ class DeepVulnAgent(BaseAgent):
 
     async def run(
             self,
-            function_signature: str,
+            function_identifier: str,
             context: Optional[FunctionContext] = None,
     ) -> Dict[str, Any]:
         """
         执行漏洞挖掘
         
         Args:
-            function_signature: 目标函数签名
+            function_identifier: 目标函数唯一标识符（全局唯一）
             context: 函数分析上下文（包含约束、污点源等）
         
         Returns:
             包含漏洞列表和约束信息的字典
         """
-        await self._register_execution_state(function_signature)
+        await self._register_execution_state(function_identifier)
 
-        self._log_progress(f"开始分析函数: {function_signature}")
+        self._log_progress(f"开始分析函数: {function_identifier}")
         self._log_progress(f"调用深度: {len(self.call_stack)}/{self.max_depth}")
 
         if self.precondition:
@@ -610,7 +603,7 @@ class DeepVulnAgent(BaseAgent):
 
         result = None
         try:
-            result = await self._deep_analysis(function_signature, context)
+            result = await self._deep_analysis(function_identifier, context)
             await self._update_execution_state(status="completed")
             vuln_count = len(result.get("vulnerabilities", []))
             self._agent_logger.log_execution_end(
@@ -646,7 +639,7 @@ class DeepVulnAgent(BaseAgent):
 
     async def _deep_analysis(
             self,
-            function_signature: str,
+            function_identifier: str,
             context: Optional[FunctionContext],
     ) -> Dict[str, Any]:
         """
@@ -665,16 +658,17 @@ class DeepVulnAgent(BaseAgent):
         - 避免 LLM 重复请求已提供的信息
         """
         # 获取函数信息
-        func_def = await self.engine.get_function_def(function_signature)
+        func_def = await self.engine.get_function_def(function_identifier)
         if not func_def:
+            self._log_progress(f"获取方法定义失败: {function_identifier}")
             return {"vulnerabilities": [], "constraints": [], "error": "Failed to get function definition"}
 
         # 初始化上下文
         if context is None:
             context = FunctionContext(
-                function_signature=function_signature,
+                function_identifier=function_identifier,
                 function_name=func_def.name,
-                call_stack=self.call_stack + [function_signature],
+                call_stack=self.call_stack + [function_identifier],
                 call_stack_detailed=self.call_stack_detailed,
                 depth=len(self.call_stack),
                 max_depth=self.max_depth,
@@ -778,6 +772,16 @@ class DeepVulnAgent(BaseAgent):
             if reported_vulns:
                 for vuln_args in reported_vulns:
                     try:
+                        # 处理 evidence 可能是 JSON 字符串的情况
+                        evidence = vuln_args.get('evidence', [])
+                        if isinstance(evidence, str):
+                            try:
+                                evidence = json.loads(evidence)
+                            except json.JSONDecodeError:
+                                evidence = [evidence] if evidence else []
+                        elif not isinstance(evidence, list):
+                            evidence = []
+
                         vuln_result = VulnerabilityResult(
                             type=vuln_args.get('vuln_type', 'UNKNOWN'),
                             name=vuln_args.get('name', 'Unnamed Vulnerability'),
@@ -785,7 +789,7 @@ class DeepVulnAgent(BaseAgent):
                             location=vuln_args.get('location', ''),
                             confidence=vuln_args.get('confidence', 5),
                             severity=vuln_args.get('severity', 'MEDIUM'),
-                            evidence=vuln_args.get('evidence', []),
+                            evidence=evidence,
                             data_flow=DataFlowInfo(
                                 source=vuln_args.get('data_flow', {}).get('source', ''),
                                 sink=vuln_args.get('data_flow', {}).get('sink', ''),
@@ -802,12 +806,12 @@ class DeepVulnAgent(BaseAgent):
                         try:
                             vuln_manager = get_vulnerability_manager()
                             vuln_obj = self._convert_single_vulnerability(
-                                vuln_result, function_signature
+                                vuln_result, function_identifier
                             )
                             if vuln_obj:
                                 vuln_manager.import_from_agent_result(
                                     vulnerabilities=[vuln_obj],
-                                    function_signature=function_signature,
+                                    function_identifier=function_identifier,
                                     agent_id=self.agent_id,
                                     parent_agent_id=self.parent_id,
                                 )
@@ -825,7 +829,7 @@ class DeepVulnAgent(BaseAgent):
             if subagent_calls:
                 unique_subagent_calls = []
                 for call_args in subagent_calls:
-                    func_name = call_args.get('function_signature', '')
+                    func_name = call_args.get('function_identifier', '')
                     line_num = call_args.get('line_number', 0)
                     dedup_key = f"{func_name}:{line_num}"
 
@@ -848,7 +852,7 @@ class DeepVulnAgent(BaseAgent):
                 # 去重：过滤掉已经请求过的函数摘要
                 unique_summary_calls = []
                 for call_args in summary_calls:
-                    func_name = call_args.get('function_signature', '')
+                    func_name = call_args.get('function_identifier', '')
                     line_num = call_args.get('line_number', 0)
                     dedup_key = f"{func_name}:{line_num}"
 
@@ -865,7 +869,7 @@ class DeepVulnAgent(BaseAgent):
                     self._log_progress(f"[执行任务] {len(unique_summary_calls)} 个摘要任务")
                     summary_results = await self._execute_summary_tasks(
                         unique_summary_calls,
-                        caller_signature=context.function_signature if context else None,
+                        caller_identifier=context.function_identifier if context else None,
                         caller_code=func_def.code if func_def else None
                     )
 
@@ -881,7 +885,7 @@ class DeepVulnAgent(BaseAgent):
                 tool_call_id = f"call_{iteration}_{idx}"
 
                 if 'get_function_summary' in name:
-                    func_name = args.get('function_signature', 'unknown')
+                    func_name = args.get('function_identifier', 'unknown')
                     # 查找该函数的执行结果
                     result = summary_results_map.get(func_name)
                     if result:
@@ -899,7 +903,7 @@ class DeepVulnAgent(BaseAgent):
                         name=name
                     ))
                 elif 'create_sub_agent' in name:
-                    func_name = args.get('function_signature', 'unknown')
+                    func_name = args.get('function_identifier', 'unknown')
                     messages.append(ToolMessage(
                         content=f"子 Agent 已启动分析函数: {func_name}。该 Agent 将在后台独立执行深度分析。",
                         tool_call_id=tool_call_id,
@@ -920,11 +924,18 @@ class DeepVulnAgent(BaseAgent):
                     ))
 
             # 检查是否完成
-            should_finalize = (
-                    finalize_called or
-                    tool_calls_result.get('analysis_complete', False) or
-                    (not summary_calls and not subagent_calls and not finalize_called)
-            )
+            has_tool_calls = len(ai_tool_calls) > 0
+            should_finalize = finalize_called
+
+            # 如果没有 tool call 但有 content，提示 LLM 调用工具完成分析
+            if not has_tool_calls and not should_finalize:
+                self._log_progress(f"[提示] LLM 返回分析内容但未调用工具，提示调用 finalize_analysis_tool 完成分析")
+                messages.append(HumanMessage(
+                    content="你已完成分析并在上述内容中描述了发现，但尚未调用工具来报告结果。"
+                            "请调用 `report_vulnerability_tool` 报告发现的漏洞，"
+                            "或调用 `finalize_analysis_tool` 完成分析。"
+                ))
+                continue  # 继续下一轮，让 LLM 调用工具
 
             if should_finalize:
                 self._log_progress(f"分析完成于第 {iteration + 1} 轮")
@@ -933,7 +944,7 @@ class DeepVulnAgent(BaseAgent):
         # 分析完成，转换所有漏洞为 Vulnerability 对象用于返回
         vulnerabilities = self._convert_to_vulnerabilities(
             all_vulnerabilities,
-            function_signature,
+            function_identifier,
         )
 
         # 更新执行状态
@@ -1011,7 +1022,11 @@ class DeepVulnAgent(BaseAgent):
         Returns:
             包含 tool_calls 和 analysis_complete 的字典
         """
-        system_prompt = get_vuln_agent_system_prompt(self.engine_type)
+        # 优先使用自定义系统提示词（用于 Orchestrator 动态注入）
+        if self._custom_system_prompt:
+            system_prompt = self._custom_system_prompt
+        else:
+            system_prompt = get_vuln_agent_system_prompt(self.engine_type)
 
         # 检查是否达到最大深度
         is_max_depth = context.depth >= context.max_depth
@@ -1055,15 +1070,9 @@ class DeepVulnAgent(BaseAgent):
                 elif 'report_vulnerability' in name:
                     reported_vulns.append(args)
 
-            if result.content:
-                # 检查文本响应中是否表示分析完成
-                complete_keywords = ['分析完成', '无需继续', '没有发现漏洞', 'no more analysis', 'done']
-                analysis_complete = any(kw in result.content.lower() for kw in complete_keywords)
-
             return {
                 'tool_calls': result.tool_calls,
                 'content': result.content,
-                'analysis_complete': analysis_complete or has_finalize or len(result.tool_calls) == 0,
                 'reported_vulnerabilities': reported_vulns,
             }
 
@@ -1078,7 +1087,7 @@ class DeepVulnAgent(BaseAgent):
     async def _execute_summary_tasks(
             self,
             calls: List[Dict[str, Any]],
-            caller_signature: Optional[str] = None,
+            caller_identifier: Optional[str] = None,
             caller_code: Optional[str] = None,
     ) -> List[Tuple[str, Optional[SimpleFunctionSummary]]]:
         """
@@ -1086,7 +1095,7 @@ class DeepVulnAgent(BaseAgent):
         
         Args:
             calls: Tool Call 参数列表（包含 callsite 信息）
-            caller_signature: 调用者函数签名（用于解析 callsite）
+            caller_identifier: 调用者函数标识符（用于解析 callsite）
             caller_code: 调用者源代码（用于 CallsiteAgent）
             
         Returns:
@@ -1099,10 +1108,10 @@ class DeepVulnAgent(BaseAgent):
                 # 解析 callsite
                 callsite = CallsiteInfo.from_dict(call_args)
 
-                # 解析 callsite 为函数签名
-                func_sig = await self._resolve_callsite(callsite, caller_signature, caller_code)
+                # 解析 callsite 为函数标识符
+                func_sig = await self._resolve_callsite(callsite, caller_identifier, caller_code)
                 if not func_sig:
-                    func_sig = callsite.function_signature
+                    func_sig = callsite.function_identifier
 
                 result = await self._get_sub_function_summary(func_sig)
                 return func_sig, result
@@ -1131,7 +1140,7 @@ class DeepVulnAgent(BaseAgent):
     async def _resolve_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str],
+            caller_identifier: Optional[str],
             caller_code: Optional[str] = None,
     ) -> Optional[str]:
         """
@@ -1141,7 +1150,7 @@ class DeepVulnAgent(BaseAgent):
         
         参数:
             callsite: 调用点信息
-            caller_signature: 调用者函数签名
+            caller_identifier: 调用者函数标识符
             caller_code: 调用者源代码
         
         返回:
@@ -1151,19 +1160,19 @@ class DeepVulnAgent(BaseAgent):
             # 委托给 Engine 处理
             signature = await self.engine.resolve_function_by_callsite(
                 callsite=callsite,
-                caller_signature=caller_signature,
+                caller_identifier=caller_identifier,
                 caller_code=caller_code,
             )
-            
+
             if signature:
-                self._log_progress(f"Resolved callsite {callsite.function_signature} -> {signature}")
+                self._log_progress(f"Resolved callsite {callsite.function_identifier} -> {signature}")
                 return signature
-            
-            return callsite.function_signature
-            
+
+            return callsite.function_identifier
+
         except Exception as e:
             self._log_progress(f"[Callsite解析] 解析失败: {e}", "warning")
-            return callsite.function_signature
+            return callsite.function_identifier
 
     def _start_sub_agent_background(
             self,
@@ -1176,7 +1185,7 @@ class DeepVulnAgent(BaseAgent):
         """
         # 获取 callsite 信息
         callsite_data = call_args
-        func_name = callsite_data.get('function_signature', 'unknown') if callsite_data else 'unknown'
+        func_name = callsite_data.get('function_identifier', 'unknown') if callsite_data else 'unknown'
 
         current_call_stack = parent_context.call_stack if parent_context else self.call_stack
         call_path = " -> ".join(current_call_stack + [func_name])
@@ -1208,11 +1217,11 @@ class DeepVulnAgent(BaseAgent):
 
     async def _get_sub_function_summary(
             self,
-            function_signature: str,
+            function_identifier: str,
     ) -> Optional[SimpleFunctionSummary]:
         """获取子函数摘要（精简格式）"""
         try:
-            summary = await self.summary_agent.analyze(function_signature)
+            summary = await self.summary_agent.analyze(function_identifier)
             return summary
         except Exception as e:
             self.log(f"[{self.agent_id}] Failed to get summary: {e}", "WARNING")
@@ -1236,11 +1245,11 @@ class DeepVulnAgent(BaseAgent):
 
         callsite = CallsiteInfo.from_dict(callsite_data)
 
-        # 解析 callsite 为函数签名
-        caller_signature = parent_context.function_signature if parent_context else None
-        func_sig = await self._resolve_callsite(callsite, caller_signature, caller_code)
+        # 解析 callsite 为函数标识符
+        caller_identifier = parent_context.function_identifier if parent_context else None
+        func_sig = await self._resolve_callsite(callsite, caller_identifier, caller_code)
         if not func_sig:
-            func_sig = callsite.function_signature
+            func_sig = callsite.function_identifier
 
         current_call_stack = parent_context.call_stack if parent_context else self.call_stack
         current_call_stack_detailed = parent_context.call_stack_detailed if parent_context else self.call_stack_detailed
@@ -1250,7 +1259,7 @@ class DeepVulnAgent(BaseAgent):
 
         # 构建新的调用栈帧
         new_frame = CallStackFrame(
-            function_signature=func_sig,
+            function_identifier=func_sig,
             function_name=func_sig.split('(')[0] if '(' in func_sig else func_sig,
             call_line=callsite.line_number,
             call_code=callsite.call_text,
@@ -1266,7 +1275,7 @@ class DeepVulnAgent(BaseAgent):
         call_path_str = " -> ".join(current_call_stack + [func_sig])
 
         # 检查循环调用
-        call_sigs_in_stack = [frame.function_signature for frame in current_call_stack_detailed]
+        call_sigs_in_stack = [frame.function_identifier for frame in current_call_stack_detailed]
         if func_sig in call_sigs_in_stack[:-1]:
             self._log_progress(f"[子Agent跳过] 检测到循环调用 | 目标: {func_sig}", "warning")
             return {"vulnerabilities": [], "skipped": True, "reason": "circular_call"}
@@ -1296,7 +1305,7 @@ class DeepVulnAgent(BaseAgent):
 
         # 构建子函数上下文
         sub_context = FunctionContext(
-            function_signature=func_sig,
+            function_identifier=func_sig,
             call_stack=parent_context.call_stack + [func_sig],
             call_stack_detailed=current_call_stack_detailed,
             depth=parent_context.depth + 1,
@@ -1330,7 +1339,7 @@ class DeepVulnAgent(BaseAgent):
         self._log_progress(f"[子Agent创建] 目标: {func_sig} | 深度: {sub_context.depth}/{self.max_depth}")
 
         # 执行子 Agent
-        result = await sub_agent.run(function_signature=func_sig, context=sub_context)
+        result = await sub_agent.run(function_identifier=func_sig, context=sub_context)
 
         sub_vulns = result.get("vulnerabilities", [])
         if sub_vulns:
@@ -1351,7 +1360,7 @@ class DeepVulnAgent(BaseAgent):
 
         parts = []
         for frame in call_stack_detailed:
-            name = frame.function_name or frame.function_signature
+            name = frame.function_name or frame.function_identifier
             if frame.call_line > 0:
                 parts.append(f"{name}:{frame.call_line}")
             else:
@@ -1388,7 +1397,7 @@ class DeepVulnAgent(BaseAgent):
 
     def _build_call_context_precondition(
             self,
-            function_signature: str,
+            function_identifier: str,
             call_args: Dict[str, Any],
             argument_constraints: List[str],
             call_path_str: str,
@@ -1400,9 +1409,9 @@ class DeepVulnAgent(BaseAgent):
             return None
 
         return Precondition(
-            name=f"CallContext_{function_signature}",
+            name=f"CallContext_{function_identifier}",
             description=f"基于调用点生成的上下文 - {call_path_str}",
-            target=function_signature,
+            target=function_identifier,
             text_content="",
             taint_sources=[],
         )
@@ -1437,23 +1446,23 @@ class DeepVulnAgent(BaseAgent):
                     filtered_calls.append(tc)
                     continue
 
-                # 尝试解析函数签名
-                function_signature = callsite_data.get('function_signature', '')
+                # 尝试解析函数标识符
+                func_identifier = callsite_data.get('function_identifier', '')
                 line_number = callsite_data.get('line_number', 0)
 
                 # 构建去重键
-                dedup_key = f"{function_signature}:{line_number}"
+                dedup_key = f"{func_identifier}:{line_number}"
 
                 # 检查是否已经存在该函数的摘要
-                if function_signature in sub_summaries:
+                if func_identifier in sub_summaries:
                     duplicate_calls.append({
-                        'function_signature': function_signature,
+                        'function_identifier': func_identifier,
                         'line_number': line_number,
                         'call_text': callsite_data.get('call_text', ''),
                         'reason': 'already_provided'
                     })
                     self._log_progress(
-                        f"[去重过滤] 跳过重复的函数摘要请求: {function_signature} (行 {line_number})",
+                        f"[去重过滤] 跳过重复的函数摘要请求: {func_identifier} (行 {line_number})",
                         "info"
                     )
                 else:
@@ -1474,7 +1483,7 @@ class DeepVulnAgent(BaseAgent):
     def _convert_to_vulnerabilities(
             self,
             results: List[VulnerabilityResult],
-            function_signature: str,
+            function_identifier: str,
     ) -> List[Vulnerability]:
         """将 LLM 输出转换为 Vulnerability 对象，包含完整的调用路径和代码行信息"""
         vulnerabilities = []
@@ -1533,7 +1542,7 @@ class DeepVulnAgent(BaseAgent):
             # 使用 Agent 的详细调用栈（包含调用点信息）
             if self.call_stack_detailed:
                 for idx, frame in enumerate(self.call_stack_detailed, 1):
-                    func = frame.function_name or frame.function_signature
+                    func = frame.function_name or frame.function_identifier
                     if frame.call_line > 0:
                         if frame.call_code:
                             code_preview = frame.call_code[:60] + "..." if len(
@@ -1544,10 +1553,10 @@ class DeepVulnAgent(BaseAgent):
                     else:
                         call_stack_info.append(f"  [{idx}] {func}")
                 # 添加当前函数
-                call_stack_info.append(f"  [{len(self.call_stack_detailed) + 1}] {function_signature}")
+                call_stack_info.append(f"  [{len(self.call_stack_detailed) + 1}] {function_identifier}")
             # 使用简单调用栈作为回退
             else:
-                for idx, func in enumerate(self.call_stack + [function_signature], 1):
+                for idx, func in enumerate(self.call_stack + [function_identifier], 1):
                     call_stack_info.append(f"  [{idx}] {func}")
 
             call_stack_str = "\n".join(call_stack_info) if call_stack_info else "  (无调用栈信息)"
@@ -1581,40 +1590,42 @@ class DeepVulnAgent(BaseAgent):
 """
 
             # 构建详细的调用栈数据（包含 Agent 的调用栈和当前函数）
-            final_call_stack = self.call_stack + [function_signature]
+            final_call_stack = self.call_stack + [function_identifier]
             final_call_stack_detailed = [
                                             frame.to_dict() for frame in self.call_stack_detailed
                                         ] + [{
-                "function": function_signature,
-                "function_name": function_signature.split('(')[0] if '(' in function_signature else function_signature,
+                "function": function_identifier,
+                "function_name": function_identifier.split('(')[
+                    0] if '(' in function_identifier else function_identifier,
                 "line_number": 0,
                 "code_snippet": "",
-                "caller": self.call_stack_detailed[-1].function_signature if self.call_stack_detailed else "",
+                "caller": self.call_stack_detailed[-1].function_identifier if self.call_stack_detailed else "",
             }]
 
             # 构建带行号的调用路径
             call_path_with_lines = []
             for frame in self.call_stack_detailed:
                 call_path_with_lines.append({
-                    "function": frame.function_signature,
+                    "function": frame.function_identifier,
                     "function_name": frame.function_name,
                     "line_number": frame.call_line,
                     "code_snippet": frame.call_code,
                     "caller": frame.caller_function,
                 })
             call_path_with_lines.append({
-                "function": function_signature,
-                "function_name": function_signature.split('(')[0] if '(' in function_signature else function_signature,
+                "function": function_identifier,
+                "function_name": function_identifier.split('(')[
+                    0] if '(' in function_identifier else function_identifier,
                 "line_number": 0,
                 "code_snippet": "",
-                "caller": self.call_stack_detailed[-1].function_signature if self.call_stack_detailed else "",
+                "caller": self.call_stack_detailed[-1].function_identifier if self.call_stack_detailed else "",
             })
 
             vuln = Vulnerability(
                 type=vuln_type,
                 name=result.name,
                 description=full_description,
-                location=f"{function_signature}: {result.location}",
+                location=f"{function_identifier}: {result.location}",
                 severity=severity,
                 confidence=confidence,
                 data_flow=DataFlowPath(
@@ -1643,7 +1654,7 @@ class DeepVulnAgent(BaseAgent):
 
         return vulnerabilities
 
-    def _format_call_path_for_vulnerability(self, function_signature: str) -> str:
+    def _format_call_path_for_vulnerability(self, function_identifier: str) -> str:
         """
         格式化调用路径信息（用于漏洞保存）
         
@@ -1671,7 +1682,7 @@ class DeepVulnAgent(BaseAgent):
         for idx, frame in enumerate(self.call_stack_detailed):
             # 获取调用者信息
             caller = frame.caller_function if frame.caller_function else "入口函数"
-            callee = frame.function_name or frame.function_signature
+            callee = frame.function_name or frame.function_identifier
 
             # 提取函数名（去除签名部分）
             if '(' in callee:
@@ -1714,7 +1725,7 @@ class DeepVulnAgent(BaseAgent):
     def _convert_single_vulnerability(
             self,
             result: VulnerabilityResult,
-            function_signature: str,
+            function_identifier: str,
     ) -> Optional[Vulnerability]:
         """将单个 VulnerabilityResult 转换为 Vulnerability 对象"""
         try:
@@ -1749,43 +1760,44 @@ class DeepVulnAgent(BaseAgent):
             path_description = "\n  ".join(path_nodes)
 
             # 构建调用路径信息（使用新的格式）
-            call_path_str = self._format_call_path_for_vulnerability(function_signature)
+            call_path_str = self._format_call_path_for_vulnerability(function_identifier)
 
             # 构建简洁的调用栈列表（用于快速查看）
             call_stack_list = []
             if self.call_stack_detailed:
                 for idx, frame in enumerate(self.call_stack_detailed, 1):
-                    func = frame.function_name or frame.function_signature
+                    func = frame.function_name or frame.function_identifier
                     call_stack_list.append(
                         f"  [{idx}] {func}:{frame.call_line}" if frame.call_line > 0 else f"  [{idx}] {func}")
-                call_stack_list.append(f"  [{len(self.call_stack_detailed) + 1}] {function_signature}")
+                call_stack_list.append(f"  [{len(self.call_stack_detailed) + 1}] {function_identifier}")
             else:
-                for idx, func in enumerate(self.call_stack + [function_signature], 1):
+                for idx, func in enumerate(self.call_stack + [function_identifier], 1):
                     call_stack_list.append(f"  [{idx}] {func}")
 
-            call_stack_str = "\n".join(call_stack_list) if call_stack_list else "  (无调用栈信息)"
+            # 构建调用栈数据 (字符串列表格式，用于前端展示)
+            call_stack_display = []
+            if self.call_stack_detailed:
+                for idx, frame in enumerate(self.call_stack_detailed, 1):
+                    func = frame.function_name or frame.function_identifier
+                    if frame.call_line > 0:
+                        call_stack_display.append(f"[{idx}] {func}:{frame.call_line}")
+                    else:
+                        call_stack_display.append(f"[{idx}] {func}")
+                call_stack_display.append(f"[{len(self.call_stack_detailed) + 1}] {function_identifier}")
+            else:
+                for idx, func in enumerate(self.call_stack + [function_identifier], 1):
+                    call_stack_display.append(f"[{idx}] {func}")
 
-            # 构建完整描述
-            full_description = f"""{result.description}
+            # 构建调用栈数据 (原始列表格式)
+            final_call_stack = self.call_stack + [function_identifier]
 
-【调用路径详情】
-{call_path_str}
-
-【调用栈】
-{call_stack_str}
-
-【数据传播路径】
-  {path_description}
-"""
-
-            # 构建调用栈数据
-            final_call_stack = self.call_stack + [function_signature]
-
+            # description 只包含纯漏洞描述
+            # 调用路径、调用栈、数据流信息分别存储到对应字段
             return Vulnerability(
                 type=vuln_type,
                 name=result.name,
-                description=full_description,
-                location=f"{function_signature}: {result.location}",
+                description=result.description,
+                location=f"{function_identifier}: {result.location}",
                 severity=severity,
                 confidence=confidence,
                 data_flow=DataFlowPath(
@@ -1798,6 +1810,8 @@ class DeepVulnAgent(BaseAgent):
                 metadata={
                     "evidence": result.evidence,
                     "call_stack": final_call_stack,
+                    "call_path": call_path_str,
+                    "call_stack_display": call_stack_display,
                 },
             )
         except Exception as e:

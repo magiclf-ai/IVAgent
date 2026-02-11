@@ -91,7 +91,7 @@ class CallStackFrame:
     表示调用链中的一个节点，包含函数信息和调用点细节
     用于构建可追溯、可分析的完整调用路径
     """
-    function_signature: str             # 函数签名
+    function_identifier: str            # 函数唯一标识符
     function_name: Optional[str] = None # 函数名（简化显示）
     
     # 调用点信息（由父函数调用当前函数时的上下文）
@@ -112,7 +112,7 @@ class CallStackFrame:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
-            "function_signature": self.function_signature,
+            "function_identifier": self.function_identifier,
             "function_name": self.function_name,
             "call_line": self.call_line,
             "call_code": self.call_code,
@@ -124,14 +124,14 @@ class CallStackFrame:
     
     def to_short_string(self) -> str:
         """转换为简短字符串表示"""
-        name = self.function_name or self.function_signature
+        name = self.function_name or self.function_identifier
         if self.call_line > 0:
             return f"{name}:{self.call_line}"
         return name
     
     def to_detailed_string(self) -> str:
         """转换为详细字符串表示"""
-        lines = [f"Function: {self.function_name or self.function_signature}"]
+        lines = [f"Function: {self.function_name or self.function_identifier}"]
         if self.call_line > 0:
             lines.append(f"  Line: {self.call_line}")
         if self.call_code:
@@ -150,7 +150,7 @@ class FunctionContext:
     包含函数参数约束、父函数传递的约束等信息
     用于在函数调用链中传播约束条件（纯文本格式）
     """
-    function_signature: str             # 函数签名
+    function_identifier: str            # 函数唯一标识符
     function_name: Optional[str] = None # 函数名
     
     # 父函数传递的约束（纯文本格式）
@@ -176,7 +176,7 @@ class FunctionContext:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
-            "function_signature": self.function_signature,
+            "function_identifier": self.function_identifier,
             "function_name": self.function_name,
             "parent_constraints": self.parent_constraints,
             "call_stack": self.call_stack,
@@ -188,17 +188,17 @@ class FunctionContext:
         }
     
     def get_call_stack_simple(self) -> List[str]:
-        """获取简单调用栈（函数签名列表）"""
+        """获取简单调用栈（函数标识符列表）"""
         if self.call_stack:
             return self.call_stack
-        return [frame.function_signature for frame in self.call_stack_detailed]
+        return [frame.function_identifier for frame in self.call_stack_detailed]
     
     def build_call_path_with_lines(self) -> List[Dict[str, Any]]:
         """构建带行号的调用路径"""
         path = []
         for frame in self.call_stack_detailed:
             path.append({
-                "function": frame.function_signature,
+                "function": frame.function_identifier,
                 "function_name": frame.function_name,
                 "line_number": frame.call_line,
                 "code_snippet": frame.call_code,
@@ -206,11 +206,11 @@ class FunctionContext:
             })
         # 添加当前函数
         path.append({
-            "function": self.function_signature,
+            "function": self.function_identifier,
             "function_name": self.function_name,
             "line_number": 0,
             "code_snippet": "",
-            "caller": self.call_stack_detailed[-1].function_signature if self.call_stack_detailed else "",
+            "caller": self.call_stack_detailed[-1].function_identifier if self.call_stack_detailed else "",
         })
         return path
 

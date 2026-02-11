@@ -10,6 +10,7 @@ from .program_analyzer import ProgramAnalyzer
 from .function_summary_agent import FunctionSummaryAgent
 from .deep_vuln_agent import DeepVulnAgent
 from .callsite_agent import CallsiteAgent
+from .semantic_analysis_agent import SemanticAnalysisAgent
 
 __all__ = [
     # Agent 基类
@@ -22,4 +23,6 @@ __all__ = [
     "FunctionSummaryAgent",
     # Callsite 识别 Agent
     "CallsiteAgent",
+    # 语义分析 Agent
+    "SemanticAnalysisAgent",
 ]

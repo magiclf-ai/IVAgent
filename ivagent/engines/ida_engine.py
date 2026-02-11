@@ -315,9 +315,9 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             raise RuntimeError("RPC Client not initialized")
 
     def _to_function_def(
-        self,
-        data: Dict[str, Any],
-        callees: Optional[List[CallSite]] = None
+            self,
+            data: Dict[str, Any],
+            callees: Optional[List[CallSite]] = None
     ) -> Optional[FunctionDef]:
         """
         将服务端返回的数据转换为 FunctionDef
@@ -332,7 +332,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
         code: str = data.get("pseudocode", "")
         if not code:
             return None
-            
+
         lines = code.splitlines()
 
         # 限制代码行数
@@ -349,14 +349,14 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
         if callees:
             for i, callee in enumerate(callees):
                 name = callee.callee_name
-                signature = callee.callee_signature
+                signature = callee.callee_identifier
                 line_number = callee.line_number
                 arguments = callee.arguments if callee.arguments else []
                 # 获取调用点的代码行（如果行号有效）
                 callsite_code = ""
                 if 0 <= line_number < len(lines):
                     callsite_code = lines[line_number].strip()
-                
+
                 call_comments += f"// <调用点_{i}> <name>{name}</name> <signature>{signature}</signature> <line>{line_number}</line> <callsite_code>{callsite_code}</callsite_code> <参数>{arguments}</参数> </调用点_{i}>\n"
         else:
             call_comments += "// (无调用点信息)\n"
@@ -382,12 +382,14 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         call_sites = []
         for item in data:
+            if not item:
+                continue
             try:
                 call_sites.append(CallSite(
                     caller_name=item.get("caller", ""),
-                    caller_signature=item.get("caller", ""),
+                    caller_identifier=item.get("caller", ""),
                     callee_name=item.get("callee", ""),
-                    callee_signature=item.get("callee", ""),
+                    callee_identifier=item.get("callee", ""),
                     line_number=item.get("line_index", -1),
                     file_path=None,
                     call_context=item.get("call_address"),
@@ -404,7 +406,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
     async def get_function_def(
             self,
             function_name: Optional[str] = None,
-            function_signature: Optional[str] = None,
+            function_identifier: Optional[str] = None,
             location: Optional[str] = None,
     ) -> Optional[FunctionDef]:
         """
@@ -416,7 +418,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
         await self._ensure_client()
 
         # 确定查询标识（地址或函数名）
-        query = location or function_name or function_signature
+        query = location or function_name or function_identifier
         if not query:
             return None
 
@@ -437,56 +439,56 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         return None
 
-    async def get_callee(self, function_signature: str) -> List[CallSite]:
+    async def get_callee(self, function_identifier: str) -> List[CallSite]:
         """异步获取函数内调用的子函数"""
         await self._ensure_client()
-        result = await self._client.get_callee(function_signature)
+        result = await self._client.get_callee(function_identifier)
         return self._to_call_sites(result) if isinstance(result, list) else []
 
-    async def get_caller(self, function_signature: str) -> List[CallSite]:
+    async def get_caller(self, function_identifier: str) -> List[CallSite]:
         """异步获取调用该函数的父函数"""
         await self._ensure_client()
-        result = await self._client.get_caller(function_signature)
+        result = await self._client.get_caller(function_identifier)
         return self._to_call_sites(result) if isinstance(result, list) else []
 
     async def _resolve_static_callsite(
             self,
             callsite: CallsiteInfo,
-            caller_signature: Optional[str] = None,
+            caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
         [实现基类方法] 静态分析：根据调用点信息解析函数签名
         
         实现策略：
-        1. 如果提供了 caller_signature，先获取调用者函数定义
+        1. 如果提供了 caller_identifier，先获取调用者函数定义
         2. 从调用者的 callee 列表中查找匹配行号和函数名的调用
         3. 返回被调用函数的签名
         """
         await self._ensure_client()
 
-        if not callsite.function_signature:
+        if not callsite.function_identifier:
             return None
 
-        # 策略1: 如果有调用者签名，从调用者上下文中解析
-        if caller_signature:
+        # 策略1: 如果有调用者标识符，从调用者上下文中解析
+        if caller_identifier:
             try:
                 # 获取调用者的 callee 列表
-                callees = await self.get_callee(caller_signature)
+                callees = await self.get_callee(caller_identifier)
 
                 # 在 callee 中查找匹配的行号和函数名
                 for callee in callees:
                     # 匹配行号（允许一定的误差范围，因为 LLM 提供的行号可能不完全准确）
                     line_match = abs(callee.line_number - callsite.line_number) <= 2
                     # 匹配函数名
-                    name_match = callee.callee_name == callsite.function_signature
+                    name_match = callee.callee_name == callsite.function_identifier
 
                     if line_match and name_match:
-                        return callee.callee_signature
+                        return callee.callee_identifier
 
                 # 如果没有精确匹配，尝试只匹配函数名
                 for callee in callees:
-                    if callee.callee_name == callsite.function_signature:
-                        return callee.callee_signature
+                    if callee.callee_name == callsite.function_identifier:
+                        return callee.callee_identifier
 
             except Exception as e:
                 print(f"[!] Error resolving callsite from caller context: {e}")
@@ -494,17 +496,17 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
         # 策略2: 直接通过函数名搜索
         try:
             # 尝试直接获取函数信息
-            func_info = await self._client.get_function_info(callsite.function_signature)
+            func_info = await self._client.get_function_info(callsite.function_identifier)
             if func_info and "error" not in func_info:
-                return func_info.get("name", callsite.function_signature)
+                return func_info.get("name", callsite.function_identifier)
         except Exception:
             pass
 
         # 策略3: 搜索匹配函数名的函数
         try:
-            matching_funcs = await self.search_functions(callsite.function_signature, limit=10)
+            matching_funcs = await self.search_symbol(callsite.function_identifier, limit=10)
             for func in matching_funcs:
-                if callsite.function_signature in func.name:
+                if callsite.function_identifier in func.name:
                     return func.signature
         except Exception:
             pass
@@ -531,7 +533,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
     async def get_variable_constraints(
             self,
-            function_signature: str,
+            function_identifier: str,
             var_name: str,
             line_number: Optional[int] = None,
     ) -> List[VariableConstraint]:
@@ -539,89 +541,66 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
         # TODO: 服务端实现后透传
         return []
 
-    async def search_functions(
+    async def search_symbol(
             self,
             query: str,
             options: Optional[SearchOptions] = None,
     ) -> List[SearchResult]:
         """
-        异步搜索函数
-        
-        支持子串匹配和正则表达式匹配
+        异步搜索符号（函数）
+
+        使用正则表达式匹配函数名
         """
+        from .base_static_analysis_engine import SymbolType
+
         await self._ensure_client()
 
         if options is None:
             options = SearchOptions()
 
-        # 获取所有函数（数量限制放大以支持过滤）
-        fetch_limit = (options.limit + options.offset) * 10
-        all_funcs = await self._client.get_function_list(limit=fetch_limit)
+        # 获取所有函数
+        all_funcs = await self._client.get_function_list(limit=100000)
         if not isinstance(all_funcs, list):
             return []
 
-        # 准备匹配模式
-        if options.use_regex:
-            try:
-                flags = 0 if options.case_sensitive else re.IGNORECASE
-                pattern = re.compile(query, flags)
-            except re.error:
-                # 无效正则，回退到普通字符串匹配
-                pattern = None
-        else:
-            pattern = None
+        # 准备正则表达式模式
+        try:
+            flags = 0 if options.case_sensitive else re.IGNORECASE
+            pattern = re.compile(query, flags)
+        except re.error:
+            # 无效正则，返回空结果
+            return []
 
         results = []
-        query_cmp = query if options.case_sensitive else query.lower()
 
         for item in all_funcs:
             name = item.get("name", "")
             if not name:
                 continue
 
-            matched = False
-            match_score = 0.5  # 基础匹配分数
-
-            # 执行匹配
-            if options.use_regex and pattern:
-                if options.match_full_signature:
-                    matched = bool(pattern.search(name))
-                else:
-                    # 只匹配函数名部分（去掉地址前缀等）
-                    func_name = name.split("::")[-1] if "::" in name else name
-                    matched = bool(pattern.search(func_name))
-                if matched:
-                    match_score = 0.9
+            # 执行正则匹配
+            if options.match_full_signature:
+                match = pattern.search(name)
             else:
-                # 子串匹配
-                name_cmp = name if options.case_sensitive else name.lower()
-                if options.match_full_signature:
-                    matched = query_cmp in name_cmp
-                else:
-                    func_name = name.split("::")[-1] if "::" in name else name
-                    func_name_cmp = func_name if options.case_sensitive else func_name.lower()
-                    matched = query_cmp in func_name_cmp
+                # 只匹配函数名部分（去掉地址前缀等）
+                match = pattern.search(name)
 
-                if matched:
-                    # 根据匹配位置计算分数
-                    if name_cmp.startswith(query_cmp):
-                        match_score = 1.0
-                    elif func_name.startswith(query_cmp) if not options.case_sensitive else func_name.startswith(query):
-                        match_score = 0.95
-                    else:
-                        match_score = 0.7
+            if not match:
+                continue
 
-            if matched:
-                func_def = self._to_function_def(item)
-                if func_def:
-                    results.append(SearchResult(
-                        function=func_def,
-                        match_score=match_score,
-                        match_reason=f"Name matches '{query}'"
-                    ))
+            func_def = await self.get_function_def(name)
+            if func_def:
+                results.append(SearchResult(
+                    name=func_def.name,
+                    signature=func_def.signature,
+                    symbol_type=SymbolType.FUNCTION,
+                    file_path=func_def.file_path,
+                    line=func_def.start_line,
+                    match_score=0.9,
+                    match_reason=f"Name matches regex '{query}'"
+                ))
 
-        # 按匹配分数排序并分页
-        results.sort(key=lambda x: x.match_score, reverse=True)
+        # 最后应用分页
         start_idx = options.offset
         end_idx = start_idx + options.limit
 
