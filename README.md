@@ -704,3 +704,10 @@ requested_summaries.add(func_name)
 ## 贡献指南
 
 欢迎贡献代码、报告问题或提出改进建议！
+
+[https://github.com/magiclf-ai/IVAgent](https://github.com/magiclf-ai/IVAgent)
+
+
+抛砖引玉，在这个 AI 时代，希望找些同路人一起探索 !
+
+![alt text](images/qq.jpg)
