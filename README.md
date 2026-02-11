@@ -684,9 +684,9 @@ requested_summaries.add(func_name)
 ---
 
 ## 发展路线图
-- [] 核心能力提供 mcp 服务，接入 Claude
-- [] 支持更多类型的静态分析任务
-- [] 提高分析结果的准确性和可解释性
+- [ ] 核心能力提供 mcp 服务，接入 Claude
+- [ ] 支持更多类型的静态分析任务
+- [ ] 提高分析结果的准确性和可解释性
 
 ---
 
@@ -710,4 +710,4 @@ requested_summaries.add(func_name)
 
 抛砖引玉，在这个 AI 时代，希望找些同路人一起探索 !
 
-![alt text](images/qq.jpg)
+<img src="images/qq.jpg" alt="alt text" width="200">
