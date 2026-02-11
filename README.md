@@ -707,6 +707,8 @@ requested_summaries.add(func_name)
 - [LangChain](https://github.com/langchain-ai/langchain) - LLM 应用框架
 - [IDA Pro](https://hex-rays.com/ida-pro/) - 交互式反汇编器
 - [JEB Decompiler](https://www.pnfsoftware.com/) - Android 反编译器
+- [abc-decompiler](https://github.com/ohos-decompiler/abc-decompiler)
+- [aixcc-afc-atlantis](https://github.com/Team-Atlanta/aixcc-afc-atlantis)
 
 ---
 
