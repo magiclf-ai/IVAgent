@@ -61,11 +61,12 @@ python launch_web.py
 
 llm 日志交互
 
-![alt text](llm-log-image.png)
+![alt text](images/llm-log-image.png)
 
 
 漏洞信息
-![alt text](vuln-web-image.png)
+
+![alt text](images/vuln-web-image.png)
 
 
 
