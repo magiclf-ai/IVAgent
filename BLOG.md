@@ -400,6 +400,4 @@ IVAgent 是一个探索性的项目，尝试将大语言模型的智能分析能
 
 ---
 
-**项目地址**: https://github.com/your-org/ivagent  
-**文档**: https://ivagent.readthedocs.io  
-**问题反馈**: https://github.com/your-org/ivagent/issues
+**项目地址**: https://github.com/magiclf-ai/IVAgent
