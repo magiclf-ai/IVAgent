@@ -59,6 +59,16 @@ python launch_web.py
 # 访问 http://localhost:8080
 ```
 
+llm 日志交互
+
+![alt text](llm-log-image.png)
+
+
+漏洞信息
+![alt text](vuln-web-image.png)
+
+
+
 ## 项目架构
 
 ```
