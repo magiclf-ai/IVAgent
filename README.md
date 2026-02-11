@@ -144,7 +144,6 @@ IVAgent → AbcDecompilerClient → MCP Server → Jadx AI MCP Plugin → ABC �
 
 1. **安装 Jadx AI MCP 插件**
    ```bash
-   # 下载并安装插件到 Jadx
    # https://github.com/magiclf-ai/abc-decompiler-mcp
    ```
 
