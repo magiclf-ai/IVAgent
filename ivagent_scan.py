@@ -19,9 +19,10 @@ from ivagent.scanner import IVAgentScanner, ScanConfig
 from ivagent.models.constraints import Precondition
 
 # Default configurations
-DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY")
-DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL")
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL")
+DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY", "4d6beb96-4e00-4f7e-8751-2244ad7da982")
+DEFAULT_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "ep-20260108170122-9jn65")
+DEFAULT_MODEL = "deepseek-v3-2-251201"
 
 
 def get_preconditions_dir() -> Path:

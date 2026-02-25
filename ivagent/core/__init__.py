@@ -30,6 +30,14 @@ from .agent_logger import (
     AgentLogStorage,
 )
 
+from .context import (
+    ArtifactStore,
+    ArtifactReference,
+    MessageManager,
+    AgentMessage,
+    ContextAssembler,
+)
+
 __all__ = [
     # Tool Call LLM 客户端
     'ToolBasedLLMClient',
@@ -50,4 +58,11 @@ __all__ = [
     'AgentTaskLog',
     'AgentStatus',
     'AgentLogStorage',
+    # 上下文管理
+    'ArtifactStore',
+    'ArtifactReference',
+    'MessageManager',
+    'AgentMessage',
+    'ContextAssembler',
 ]
+

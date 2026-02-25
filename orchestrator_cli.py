@@ -20,7 +20,7 @@ sys.path.insert(0, str(project_root))
 
 from langchain_openai import ChatOpenAI
 
-from ivagent.orchestrator import TaskOrchestratorAgent, OrchestratorResult
+from ivagent.orchestrator import MasterOrchestrator, MasterOrchestratorResult
 
 
 def create_llm_client() -> ChatOpenAI:
@@ -59,8 +59,9 @@ async def run_workflow(
         engine_type: Optional[str] = None,
         target_path: Optional[str] = None,
         source_root: Optional[str] = None,
+        execution_mode: str = "parallel",
         verbose: bool = True,
-) -> OrchestratorResult:
+) -> MasterOrchestratorResult:
     """
     执行 Workflow
 
@@ -69,6 +70,7 @@ async def run_workflow(
         engine_type: 分析引擎类型 (ida, source)
         target_path: 目标程序路径（可选，如果 workflow 中未指定）
         source_root: 源代码根目录（可选，用于源码分析）
+        execution_mode: 执行模式 (sequential, parallel)
         verbose: 是否打印详细日志
 
     Returns:
@@ -77,12 +79,13 @@ async def run_workflow(
     # 创建 LLM 客户端
     llm_client = create_llm_client()
 
-    # 创建 Orchestrator（传入引擎配置）
-    orchestrator = TaskOrchestratorAgent(
+    # 创建 MasterOrchestrator（支持多 workflow 并发执行）
+    orchestrator = MasterOrchestrator(
         llm_client=llm_client,
         engine_type=engine_type,
         target_path=target_path,
         source_root=source_root,
+        execution_mode=execution_mode,
         verbose=verbose,
     )
 
@@ -104,9 +107,13 @@ def main():
   python -m ivagent.orchestrator_cli --workflow workflows/android_sql_injection.md \\
       --engine source --target /path/to/source --source-root /path/to/source
   
-  # 组合使用
+  # 并行执行模式（默认）
   python -m ivagent.orchestrator_cli --workflow workflows/android_sql_injection.md \\
-      --engine ida --target app.apk --source-root /path/to/source
+      --engine ida --target app.apk --mode parallel
+  
+  # 串行执行模式
+  python -m ivagent.orchestrator_cli --workflow workflows/android_sql_injection.md \\
+      --engine ida --target app.apk --mode sequential
         """
     )
 
@@ -118,8 +125,8 @@ def main():
 
     parser.add_argument(
         "--engine", "-e",
-        choices=["ida", "source", "jeb"],
-        help="分析引擎类型 (ida, jeb, source)",
+        choices=["ida", "source", "jeb", "abc"],
+        help="分析引擎类型 (ida, jeb, abc, source)",
     )
 
     parser.add_argument(
@@ -130,6 +137,13 @@ def main():
     parser.add_argument(
         "--source-root", "-s",
         help="源代码根目录（用于源码分析和 CallsiteAgent）",
+    )
+
+    parser.add_argument(
+        "--mode", "-m",
+        choices=["sequential", "parallel"],
+        default="parallel",
+        help="执行模式：sequential（串行）或 parallel（并行，默认）",
     )
 
     parser.add_argument(
@@ -159,6 +173,7 @@ def main():
     # 执行 Workflow
     print(f"[*] IVAgent Orchestrator")
     print(f"[*] Workflow: {args.workflow}")
+    print(f"[*] 执行模式: {args.mode}")
     print()
 
     try:
@@ -167,6 +182,7 @@ def main():
             engine_type=args.engine,
             target_path=args.target,
             source_root=args.source_root,
+            execution_mode=args.mode,
             verbose=verbose,
         ))
 
@@ -175,8 +191,13 @@ def main():
         print("执行结果")
         print("=" * 60)
         print(f"状态: {'成功' if result.success else '失败'}")
-        print(f"发现漏洞: {result.vulnerabilities_found}")
-        print(f"摘要: {result.summary}")
+        print(f"总 Workflow 数: {result.total_workflows}")
+        print(f"完成 Workflow 数: {result.completed_workflows}")
+        print(f"发现漏洞总数: {result.total_vulnerabilities}")
+        print(f"执行时间: {result.execution_time:.2f} 秒")
+        print()
+        print("摘要:")
+        print(result.summary)
 
         if result.errors:
             print()
@@ -191,6 +212,8 @@ def main():
         sys.exit(130)
     except Exception as e:
         print(f"\n[X] 执行失败: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

@@ -8,8 +8,8 @@ Orchestrator Tools - 简化的 Tool 管理
 - llm_client: LLM 客户端
 - agents: 创建的 Agent 缓存
 - vulnerabilities: 发现的漏洞列表
-- task_manager: 任务管理器
 """
+
 
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -17,12 +17,14 @@ from pathlib import Path
 import uuid
 import json
 
+from .agent_delegate import AgentDelegate
 from ..models.workflow import WorkflowContext
-from ..models.task import TaskStatus
-from .task_manager import TaskManager
+
 from ..engines import create_engine, BaseStaticAnalysisEngine
 from ..agents.deep_vuln_agent import DeepVulnAgent
 from ..agents.prompts import get_vuln_agent_system_prompt
+from ..core.context import ArtifactStore
+
 
 
 @dataclass
@@ -62,7 +64,10 @@ class OrchestratorTools:
             engine_type: Optional[str] = None,
             target_path: Optional[str] = None,
             source_root: Optional[str] = None,
+            artifact_store: Optional[ArtifactStore] = None,
+            session_id: Optional[str] = None,
     ):
+
         self.llm_client = llm_client
         self.workflow_context = workflow_context
 
@@ -72,13 +77,25 @@ class OrchestratorTools:
         self.agents: Dict[str, AgentInstance] = {}
         self.vulnerabilities: List[VulnerabilityInfo] = []
         self._last_agent_id: Optional[str] = None
-        self.task_manager: TaskManager = TaskManager()
+        self.artifact_store: Optional[ArtifactStore] = artifact_store
+
 
         # 延迟初始化参数（用于异步初始化）
+
         self._pending_engine_type = engine_type
         self._pending_target_path = target_path
         self._pending_source_root = source_root
         self._initialized = False
+        
+        # 工作流规划状态
+        self._planned_workflows: Optional[List[Dict[str, Any]]] = None
+        self._is_multi_workflow: bool = False
+        
+        # 新设计的组件（简化的任务编排）
+        self._session_id = session_id
+        self._task_list_manager: Optional[Any] = None
+        self._file_manager: Optional[Any] = None
+        self._agent_delegate: Optional[AgentDelegate] = None
 
     # ==================== 内部方法 ====================
 
@@ -129,23 +146,112 @@ class OrchestratorTools:
         if not self._initialized or not self.engine:
             raise ValueError("Engine not initialized. Call initialize() first.")
 
+    def set_artifact_store(self, artifact_store: ArtifactStore) -> None:
+        """设置 ArtifactStore（用于 read_artifact 工具）"""
+        self.artifact_store = artifact_store
+
+    def initialize_orchestrator_components(self, session_dir: Path) -> None:
+        """初始化简化的任务编排组件（幂等）
+        
+        Args:
+            session_dir: Session 目录路径（如 .ivagent/sessions/{session_id}）
+        """
+        from .task_list_manager import TaskListManager
+        from .file_manager import FileManager
+        from .agent_delegate import AgentDelegate
+        
+        # 初始化 FileManager（幂等）
+        if not self._file_manager:
+            self._file_manager = FileManager(session_dir=session_dir)
+        
+        # 初始化 TaskListManager（幂等）
+        if not self._task_list_manager:
+            tasks_file = session_dir / "tasks.md"
+            self._task_list_manager = TaskListManager(tasks_file=tasks_file)
+        
+        # 初始化 AgentDelegate（幂等）
+        if self.engine and self.llm_client and not self._agent_delegate:
+            self._agent_delegate = AgentDelegate(
+                engine=self.engine,
+                llm_client=self.llm_client,
+                file_manager=self._file_manager,
+            )
+
     # ==================== Tool 定义 ====================
 
-    async def query_code(
+    async def read_artifact(
             self,
+            artifact_id: str,
+            offset: int = 0,
+            limit: int = 200,
+    ) -> str:
+        """读取已归档的 Artifact 内容。
+
+        参数:
+            artifact_id: Artifact ID
+            offset: 起始行号（从0开始）
+            limit: 返回行数上限
+        """
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化"
+
+        content = self.artifact_store.read(artifact_id, offset=offset, limit=limit)
+        metadata = self.artifact_store.read_metadata(artifact_id)
+
+        lines = [
+            "=== Artifact 内容 ===",
+            "",
+            f"Artifact ID: {artifact_id}",
+        ]
+        if isinstance(metadata, dict) and not metadata.get("error"):
+            summary = metadata.get("summary", "")
+            size = metadata.get("size", "")
+            lines.append(f"大小: {size}")
+            if summary:
+                lines.append(f"摘要: {summary}")
+        lines.extend([
+            "",
+            "【内容】",
+            content,
+        ])
+        return "\n".join(lines)
+
+    async def delegate_task(
+            self,
+            agent_type: str,
             query: str,
             context: Optional[str] = None,
+            function_identifier: Optional[str] = None,
+            max_depth: int = 10,
+            max_iterations: int = 15,
     ) -> str:
-        """语义级代码查询。使用自然语言描述查询需求，返回分析结果。
+        """委托任务给专门的 Agent 执行。
         
-        内部调用 SemanticAnalysisAgent 通过 Tool Call 循环自主探索代码，
-        结合基础代码探索（grep/read_file）和高级静态分析能力完成深度分析。
+        这是一个统一的 Agent 调度接口，类似 Claude 的 task 工具。
+        根据 agent_type 自动创建并调用相应的 Agent，返回markdown格式的文本结果。
         
         参数:
-            query: 自然语言查询描述
-            context: 可选上下文信息
+            agent_type: Agent 类型，可选值：
+                - "code_explorer": 代码探索 Agent（搜索、读取、语义分析）
+                - "vuln_analysis": 漏洞挖掘 Agent（深度漏洞分析）
+            
+            query: 任务描述（自然语言）
+                - 对于 code_explorer: "找到所有处理用户输入的函数"
+                - 对于 vuln_analysis: "分析 parse_request 函数的缓冲区溢出风险"
+            
+            context: 可选的上下文信息
+                - 前置条件、约束、背景知识等
+            
+            function_identifier: 函数唯一标识符（仅 vuln_analysis 使用）
+                - 如果提供，直接使用此标识符，不从 query 中提取
+                - 格式示例: "PasswordProvider.query", "parse_request", "com.example.MyClass.method"
+                - 推荐：先使用 search_symbol 或 query_code 获取准确的函数标识符，再传入此参数
+            
+            max_depth: 最大分析深度（仅 vuln_analysis 使用）
+            max_iterations: 最大迭代次数
+        
+        返回: markdown格式的文本结果（包含分析摘要和关键发现）
         """
-        # 返回: 格式化的分析结果文本，包含分析摘要、发现的代码项、证据片段等
         if not self.engine:
             return "[错误] 引擎未初始化，请先调用 initialize_engine"
 
@@ -153,282 +259,170 @@ class OrchestratorTools:
             return "[错误] LLM 客户端不可用"
 
         try:
-            from ..agents.semantic_analysis_agent import SemanticAnalysisAgent
+            if agent_type == "code_explorer":
+                # 创建 CodeExplorerAgent
+                from ..agents.code_explorer_agent import CodeExplorerAgent
 
-            agent = SemanticAnalysisAgent(
-                engine=self.engine,
-                llm_client=self.llm_client,
-                max_iterations=10,
-                enable_logging=True,
-                session_id=getattr(self, 'session_id', None),
-            )
-
-            result = await agent.analyze(
-                query=query,
-                context=context
-            )
-
-            return result
-
-        except Exception as e:
-            return f"[错误] 查询执行失败: {str(e)}"
-
-    async def search_symbol(
-            self,
-            pattern: str,
-            limit: int = 30,
-            offset: int = 0,
-            case_sensitive: bool = False,
-    ) -> str:
-        """搜索程序中的符号（函数、字符串、变量）。
-
-        参数:
-            pattern: 搜索字符串（Python 正则表达式）
-            limit: 返回结果数量上限
-            offset: 结果起始偏移量，返回 [offset, offset + limit) 范围内的结果
-            case_sensitive: 是否区分大小写，默认为 False（忽略大小写）
-        """
-        # 返回: 格式化的搜索结果文本
-        if not self.engine:
-            return "[错误] 引擎未初始化，请先调用 initialize_engine"
-
-        try:
-            import re
-            from ..engines.base_static_analysis_engine import SearchOptions
-
-            # 验证正则表达式有效性
-            flags = 0 if case_sensitive else re.IGNORECASE
-            try:
-                re.compile(pattern, flags)
-            except re.error as e:
-                return f"[错误] 正则表达式无效: {str(e)}"
-
-            # 调用引擎搜索，由引擎处理 offset/limit/case_sensitive/regex
-            search_results = await self.engine.search_symbol(
-                query=pattern,
-                options=SearchOptions(
-                    limit=limit,
-                    offset=offset,
-                    case_sensitive=case_sensitive,
-                    use_regex=True,
+                agent = CodeExplorerAgent(
+                    engine=self.engine,
+                    llm_client=self.llm_client,
+                    max_iterations=max_iterations,
+                    enable_logging=True,
+                    session_id=getattr(self, 'session_id', None),
                 )
-            )
 
-            if not search_results:
-                return f"搜索 '{pattern}' 未找到匹配的符号。"
+                result = await agent.explore(
+                    query=query,
+                    context=context
+                )
 
-            # 格式化为易读的文本
-            lines = [
-                f"=== 符号搜索结果 ===",
-                f"",
-                f"搜索模式: {pattern}",
-                f"正则标志: {'区分大小写' if case_sensitive else '忽略大小写'}",
-                f"找到结果: {len(search_results)} 个",
-                f"",
-                f"【匹配结果列表】",
-            ]
+                return result
 
-            for i, sr in enumerate(search_results, offset + 1):
-                lines.append(f"\n--- 结果 #{i} ---")
-                lines.append(f"  名称: {sr.name}")
-                if sr.signature and sr.signature != sr.name:
-                    lines.append(f"  签名: {sr.signature}")
-                lines.append(f"  类型: {sr.symbol_type.value}")
-                if sr.file_path:
-                    lines.append(f"  文件: {sr.file_path}")
-                if sr.line:
-                    lines.append(f"  行号: {sr.line}")
+            elif agent_type == "vuln_analysis":
+                # function_identifier 是必需的
+                target_function_id = function_identifier
+                if not target_function_id:
+                    return """[错误] 必须提供 function_identifier 参数
 
-            return "\n".join(lines)
+请按以下步骤操作：
+1. 使用 search_symbol 或其他工具查找目标函数
+2. 从结果中提取标准格式的函数标识符
+3. 再次调用 delegate_task 并传递 function_identifier
+
+示例：
+  search_symbol(pattern="PasswordProvider")
+  # 从结果中获取: com.example.auth.PasswordProvider.query
+  delegate_task(
+      agent_type="vuln_analysis",
+      query="分析SQL注入漏洞",
+      function_identifier="com.example.auth.PasswordProvider.query",
+      context="参数来自用户输入，未验证"
+  )
+"""
+
+                # 构建前置条件
+                preconditions = context if context else query
+
+                # 创建 DeepVulnAgent
+                from ..agents.deep_vuln_agent import DeepVulnAgent
+                from ..agents.prompts import get_vuln_agent_system_prompt
+
+                base_prompt = get_vuln_agent_system_prompt(self.engine_name or "ida")
+
+                specialization = f"""## 当前分析任务特化
+
+### 分析目标
+函数: `{target_function_id}`
+
+### 前置条件约束
+{preconditions}
+"""
+                if self.workflow_context and self.workflow_context.background_knowledge:
+                    specialization += f"\n### 背景知识\n{self.workflow_context.background_knowledge}\n"
+
+                full_prompt = f"{base_prompt}\n\n{specialization}"
+
+                agent = DeepVulnAgent(
+                    engine=self.engine,
+                    llm_client=self.llm_client,
+                    max_iterations=max_iterations,
+                    max_depth=max_depth,
+                    verbose=True,
+                    system_prompt=full_prompt,
+                )
+
+                agent_id = str(uuid.uuid4())[:8]
+                self.agents[agent_id] = AgentInstance(
+                    agent_id=agent_id,
+                    agent_type="DeepVulnAgent",
+                    engine_name=self.engine_name or "unknown",
+                    analysis_focus=target_function_id,
+                    instance=agent,
+                )
+                self._last_agent_id = agent_id
+
+                # 执行分析
+                result = await agent.run(function_identifier=target_function_id)
+                
+                # 格式化结果为markdown文本
+                return self._format_vuln_result(result, target_function_id, agent_id)
+
+            else:
+                return f"[错误] 不支持的 Agent 类型: {agent_type}，支持的类型: code_explorer, vuln_analysis"
 
         except Exception as e:
-            return f"[错误] 搜索失败: {str(e)}"
+            return f"[错误] Agent 执行失败: {str(e)}"
+    
+    def _log(self, message: str, level: str = "info"):
+        """打印日志"""
+        prefix = "[OrchestratorTools]"
+        if level == "error":
+            print(f"  [X] {prefix} {message}")
+        elif level == "warning":
+            print(f"  [!] {prefix} {message}")
+        elif level == "success":
+            print(f"  [+] {prefix} {message}")
+        else:
+            print(f"  [*] {prefix} {message}")
 
-    async def get_function_code(
+    def _format_vuln_result(
             self,
+            result: Dict[str, Any],
             function_identifier: str,
+            agent_id: str
     ) -> str:
-        """根据函数标识符获取函数的代码。
+        """格式化漏洞分析结果为markdown文本"""
+        vulns = result.get("vulnerabilities", [])
 
-        参数:
-            function_identifier: 函数标识符, 可以使用 search_symbol 获取完整的函数标识符
-        """
-        # 返回: 格式化的函数代码文本
-        if not self.engine:
-            return "[错误] 引擎未初始化，请先调用 initialize_engine"
+        all_vulns = []
+        for v in vulns:
+            vuln_info = VulnerabilityInfo(
+                name=getattr(v, 'name', 'Unknown'),
+                vuln_type=getattr(v, 'type', 'UNKNOWN'),
+                description=getattr(v, 'description', ''),
+                location=getattr(v, 'location', ''),
+                severity=getattr(v, 'severity', 0.5),
+                confidence=getattr(v, 'confidence', 0.5),
+            )
+            self.vulnerabilities.append(vuln_info)
+            all_vulns.append(vuln_info)
 
-        try:
-            func_def = await self.engine.get_function_def(function_identifier=function_identifier)
+        # 格式化为markdown文本
+        lines = [
+            "# 漏洞分析结果",
+            "",
+            f"**目标函数**: {function_identifier}",
+            f"**Agent ID**: {agent_id}",
+            "",
+            f"## 分析摘要",
+            "",
+            f"- 本次发现漏洞: {len(all_vulns)} 个",
+            f"- 累计漏洞总数: {len(self.vulnerabilities)} 个",
+            "",
+        ]
 
-            if func_def is None:
-                return f"[错误] 未找到函数: {function_identifier}"
-
-            # 格式化为易读的文本
-            lines = [
-                f"=== 函数代码 ===",
-                f"",
-                f"函数名: {func_def.name}",
-                f"签名: {func_def.signature}",
-            ]
-
-            if func_def.location:
-                lines.append(f"地址: {func_def.location}")
-            if func_def.file_path:
-                lines.append(f"文件: {func_def.file_path}")
-            if func_def.start_line and func_def.end_line:
-                lines.append(f"行号: {func_def.start_line} - {func_def.end_line}")
-
-            lines.extend([
-                f"",
-                f"【代码】",
-                f"```",
-                func_def.code if func_def.code else "(无代码内容)",
-                f"```",
-            ])
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"[错误] 获取函数代码失败: {str(e)}"
-
-    async def get_xref(
-            self,
-            target: str,
-            xref_type: str = "both",
-            limit: int = 20,
-    ) -> str:
-        """获取函数或地址的交叉引用。
-        
-        参数:
-            target: 目标函数签名或地址
-            xref_type: 交叉引用类型 (to: 被谁调用, from: 调用了谁, both: 两者都返回)
-            limit: 返回结果数量上限
-        """
-        # 返回: 格式化的交叉引用结果文本
-        if not self.engine:
-            return "[错误] 引擎未初始化，请先调用 initialize_engine"
-
-        try:
-            lines = [
-                f"=== 交叉引用分析 ===",
-                f"",
-                f"目标: {target}",
-                f"",
-            ]
-
-            # 获取被谁调用（入边）
-            if xref_type in ["to", "both"]:
-                callers = await self.engine.get_caller(target)
-                lines.append(f"【被以下函数调用】(共 {len(callers)} 个)")
-                if callers:
-                    for i, c in enumerate(callers[:limit], 1):
-                        lines.append(f"  {i}. {c.caller_name}")
-                        if c.caller_identifier and c.caller_identifier != c.caller_name:
-                            lines.append(f"     标识符: {c.caller_identifier}")
-                        if c.line_number:
-                            lines.append(f"     行号: {c.line_number}")
-                else:
-                    lines.append("  (无)")
+        if all_vulns:
+            lines.append("## 漏洞详情")
+            lines.append("")
+            for i, v in enumerate(all_vulns, 1):
+                lines.append(f"### 漏洞 #{i}: {v.name}")
                 lines.append("")
-
-            # 获取调用了谁（出边）
-            if xref_type in ["from", "both"]:
-                callees = await self.engine.get_callee(target)
-                lines.append(f"【调用了以下函数】(共 {len(callees)} 个)")
-                if callees:
-                    for i, c in enumerate(callees[:limit], 1):
-                        lines.append(f"  {i}. {c.callee_name}")
-                        if c.callee_identifier and c.callee_identifier != c.callee_name:
-                            lines.append(f"     标识符: {c.callee_identifier}")
-                        if c.line_number:
-                            lines.append(f"     行号: {c.line_number}")
-                else:
-                    lines.append("  (无)")
+                lines.append(f"- **类型**: {v.vuln_type}")
+                lines.append(f"- **位置**: {v.location}")
+                lines.append(f"- **严重度**: {v.severity:.2f}")
+                lines.append(f"- **置信度**: {v.confidence:.2f}")
+                lines.append(f"- **描述**: {v.description}")
                 lines.append("")
+        else:
+            lines.append("## 分析结果")
+            lines.append("")
+            lines.append("本次分析未发现漏洞。")
+            lines.append("")
 
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"[错误] 获取交叉引用失败: {str(e)}"
-
-    async def read_file(
-            self,
-            file_path: str,
-            offset: int = 0,
-            limit: int = 200,
-    ) -> str:
-        """读取指定文件的内容。
-        
-        参数:
-            file_path: 文件路径（绝对路径或相对于源代码根目录的路径）
-            offset: 起始行号（从0开始）
-            limit: 读取的最大行数
-        """
-        try:
-            import os
-            from pathlib import Path
-
-            # 解析文件路径
-            path = Path(file_path)
-
-            # 如果路径不存在，尝试相对于 source_root 解析
-            if not path.is_absolute() and self._pending_source_root:
-                path = Path(self._pending_source_root) / path
-
-            # 检查文件是否存在
-            if not path.exists():
-                return f"[错误] 文件不存在: {file_path}"
-
-            # 检查是否为文件
-            if not path.is_file():
-                return f"[错误] 路径不是文件: {file_path}"
-
-            # 读取文件内容
-            try:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    all_lines = f.readlines()
-            except Exception as e:
-                return f"[错误] 读取文件失败: {str(e)}"
-
-            total_lines = len(all_lines)
-
-            # 计算实际的起始和结束行
-            start_line = max(0, offset)
-            end_line = min(total_lines, offset + limit)
-
-            if start_line >= total_lines:
-                return f"[错误] 起始行 {offset} 超出文件范围（文件共 {total_lines} 行）"
-
-            # 获取指定范围的行
-            selected_lines = all_lines[start_line:end_line]
-
-            # 格式化为易读的文本
-            lines = [
-                f"=== 文件内容 ===",
-                f"",
-                f"文件路径: {path.absolute()}",
-                f"总行数: {total_lines}",
-                f"显示行号: {start_line + 1} - {end_line}",
-                f"",
-                f"【内容】",
-                f"```",
-            ]
-
-            # 添加行号前缀
-            for i, line in enumerate(selected_lines, start=start_line + 1):
-                lines.append(f"{i:6}|{line.rstrip()}")
-
-            lines.append("```")
-
-            if end_line < total_lines:
-                lines.append(f"\n... 还有 {total_lines - end_line} 行未显示")
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"[错误] 读取文件失败: {str(e)}"
+        return "\n".join(lines)
 
     async def run_vuln_analysis(
+
             self,
             function_identifier: str,
             preconditions: str,
@@ -542,279 +536,495 @@ class OrchestratorTools:
         except Exception as e:
             return f"[错误] 漏洞分析执行失败: {str(e)}"
 
-    async def create_task(
-            self,
-            description: str,
-            parent_id: Optional[str] = None,
-    ) -> str:
-        """创建新任务。
+    # ==================== 简化的 Tool 接口（新设计）====================
 
-        LLM 可以在执行开始前创建任务列表，将复杂任务分解为多个子任务。
-        同一时刻只能有一个任务处于 in_progress 状态。
 
-        参数:
-            description: 任务描述，简洁明确说明任务目标（如"分析入口函数"、"识别污点参数"）
-            parent_id: 父任务 ID（可选，用于构建任务树）
+    async def plan_tasks(self, workflows: List[Dict[str, Any]]) -> str:
+        """规划任务列表，支持单/多 workflow 模式。
 
-        返回: 创建成功的任务信息，包含任务 ID 和当前任务状态摘要
+        每个 workflow 字典应包含: tasks (必需的任务列表), workflow_id (可选标识符),
+        workflow_name (可选名称), workflow_description (可选描述),
+        execution_mode (可选，sequential 或 parallel)。
+        
+        tasks 支持两种形式：
+        - 字符串：任务描述
+        - 字典：显式任务对象，字段包括 description / agent_type / function_identifier
+          其中 agent_type 为 vuln_analysis 时必须提供 function_identifier
+          function_identifier 必须来自 search_symbol 的验证结果，保持原样
+
+        Args:
+            workflows: Workflow 配置列表
+
+        Returns:
+            规划结果摘要（Markdown 格式）
         """
         try:
-            task = self.task_manager.create_task(description, parent_id)
-            current_task = self.task_manager.get_current_task()
-            summary = self.task_manager.get_progress_summary()
+            # 1. 验证参数
+            if not workflows:
+                return "[错误] workflows 参数为空"
 
-            lines = [
-                f"=== 任务创建成功 ===",
-                f"",
-                f"任务 ID: {task.id}",
-                f"描述: {task.description}",
-                f"状态: {task.status.value}",
-                f"父任务: {parent_id if parent_id else '（无）'}",
-                f"",
-                f"【当前执行进度】",
-                f"总任务数: {summary['total']}",
-                f"已完成: {summary['completed']}",
-                f"进行中: {summary['in_progress']}",
-                f"待执行: {summary['pending']}",
-                f"完成率: {summary['completion_rate']}%",
-                f"",
-                f"【当前任务】",
-                f"{'任务: ' + current_task.description + ' (' + current_task.id + ')' if current_task else '无进行中的任务'}",
-            ]
+            if not isinstance(workflows, list):
+                return "[错误] workflows 必须是列表类型"
 
-            return "\n".join(lines)
+            for i, wf in enumerate(workflows):
+                if not isinstance(wf, dict):
+                    return f"[错误] workflow[{i}] 不是字典类型"
+                if "tasks" not in wf:
+                    return f"[错误] workflow[{i}] 缺少必需字段 'tasks'"
+                
+                # 修复：确保tasks是列表，如果是dict则转换
+                tasks = wf["tasks"]
+                if isinstance(tasks, dict):
+                    # 如果是dict，尝试提取任务列表
+                    if "tasks" in tasks:
+                        wf["tasks"] = tasks["tasks"]
+                    elif "task_list" in tasks:
+                        wf["tasks"] = tasks["task_list"]
+                    else:
+                        # 尝试从dict的values中提取
+                        wf["tasks"] = list(tasks.values()) if tasks else []
+                    tasks = wf["tasks"]
+                
+                if not isinstance(tasks, list) or not tasks:
+                    return f"[错误] workflow[{i}] 的 'tasks' 必须是非空列表"
+                
+                # 校验并标准化 task 结构
+                for j, task in enumerate(tasks):
+                    if isinstance(task, str):
+                        tasks[j] = task.strip()
+                        continue
+                    if isinstance(task, dict):
+                        if "description" not in task:
+                            return f"[错误] workflow[{i}] 的 tasks[{j}] 缺少 description 字段"
+                        if task.get("agent_type") == "vuln_analysis" and not task.get("function_identifier"):
+                            return f"[错误] workflow[{i}] 的 tasks[{j}] 缺少 function_identifier（vuln_analysis 必需）"
+                        tasks[j] = {
+                            "description": str(task["description"]).strip(),
+                            "agent_type": task.get("agent_type"),
+                            "function_identifier": task.get("function_identifier"),
+                        }
+                        continue
+                    return f"[错误] workflow[{i}] 的 tasks[{j}] 类型不支持（仅支持字符串或字典）"
 
-        except Exception as e:
-            return f"[错误] 创建任务失败: {str(e)}"
-
-    async def update_task_status(
-            self,
-            task_id: str,
-            status: str,
-            result: Optional[str] = None,
-            error_message: Optional[str] = None,
-    ) -> str:
-        """更新任务状态。
-
-        LLM 在开始执行任务时调用，将任务状态设为 in_progress。
-        任务完成后调用，将状态设为 completed 并提供执行结果。
-        任务失败时调用，将状态设为 failed 并提供错误信息。
-
-        参数:
-            task_id: 要更新的任务 ID
-            status: 新状态，可选值: "pending", "in_progress", "completed", "failed"
-            result: 任务执行结果（可选，仅在 completed 状态时使用）
-            error_message: 错误信息（可选，仅在 failed 状态时使用）
-
-        返回: 更新后的任务信息和当前进度摘要
-        """
-        try:
-            # 验证状态值
-            valid_statuses = ["pending", "in_progress", "completed", "failed"]
-            if status not in valid_statuses:
-                return f"[错误] 无效的状态值: {status}，有效值为: {', '.join(valid_statuses)}"
-
-            task_status = TaskStatus(status)
-            updated_task = self.task_manager.update_task_status(
-                task_id, task_status, result, error_message
+            # 2. 判断单/多 workflow（在标准化之前判断）
+            is_multi = len(workflows) > 1 or (
+                len(workflows) == 1 and workflows[0].get("workflow_id") is not None
             )
-            current_task = self.task_manager.get_current_task()
-            summary = self.task_manager.get_progress_summary()
 
-            lines = [
-                f"=== 任务状态更新 ===",
-                f"",
-                f"任务 ID: {updated_task.id}",
-                f"描述: {updated_task.description}",
-                f"新状态: {updated_task.status.value}",
-                f"",
-                f"【当前执行进度】",
-                f"总任务数: {summary['total']}",
-                f"已完成: {summary['completed']}",
-                f"进行中: {summary['in_progress']}",
-                f"待执行: {summary['pending']}",
-                f"完成率: {summary['completion_rate']}%",
-                f"",
-                f"【当前任务】",
-                f"{'任务: ' + current_task.description + ' (' + current_task.id + ')' if current_task else '无进行中的任务'}",
-            ]
+            # 3. 标准化 workflow 信息
+            normalized = self._normalize_workflows(workflows)
 
-            if updated_task.result:
-                lines.extend([
-                    "",
-                    f"【执行结果】",
-                    f"{updated_task.result}"
-                ])
+            # 4. 保存规划状态（关键！）
+            self._planned_workflows = normalized
+            self._is_multi_workflow = is_multi
 
-            if updated_task.error_message:
-                lines.extend([
-                    "",
-                    f"【错误信息】",
-                    f"{updated_task.error_message}"
-                ])
-
-            return "\n".join(lines)
-
-        except ValueError as e:
-            return f"[错误] 任务不存在: {str(e)}"
-        except Exception as e:
-            return f"[错误] 更新任务状态失败: {str(e)}"
-
-    async def get_task(self, task_id: str) -> str:
-        """获取指定任务的详细信息。
-
-        参数:
-            task_id: 任务 ID
-
-        返回: 任务详细信息，包括描述、状态、创建时间等
-        """
-        try:
-            task = self.task_manager.get_task(task_id)
-            if not task:
-                return f"[错误] 任务不存在: {task_id}"
-
-            lines = [
-                f"=== 任务详情 ===",
-                f"",
-                f"任务 ID: {task.id}",
-                f"描述: {task.description}",
-                f"状态: {task.status.value}",
-                f"父任务: {task.parent_id if task.parent_id else '（无）'}",
-                f"创建时间: {task.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
-            ]
-
-            if task.completed_at:
-                lines.append(f"完成时间: {task.completed_at.strftime('%Y-%m-%d %H:%M:%S')}")
-
-            if task.result:
-                lines.extend([
-                    f"",
-                    f"【执行结果】",
-                    f"{task.result}",
-                ])
-
-            if task.error_message:
-                lines.extend([
-                    f"",
-                    f"【错误信息】",
-                    f"{task.error_message}",
-                ])
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"[错误] 获取任务失败: {str(e)}"
-
-    async def list_tasks(self, status: Optional[str] = None) -> str:
-        """获取任务列表。
-
-        参数:
-            status: 按状态过滤，可选值: "pending", "in_progress", "completed", "failed"
-                    不提供则返回所有任务
-
-        返回: 任务列表，包含任务 ID、描述和状态
-        """
-        try:
-            # 解析状态过滤
-            task_status = None
-            if status:
-                valid_statuses = ["pending", "in_progress", "completed", "failed"]
-                if status not in valid_statuses:
-                    return f"[错误] 无效的状态值: {status}，有效值为: {', '.join(valid_statuses)}"
-                task_status = TaskStatus(status)
-
-            tasks = self.task_manager.list_tasks(status=task_status)
-
-            if not tasks:
-                status_desc = f"（状态: {status}）" if status else ""
-                return f"无任务{status_desc}"
-
-            lines = [
-                f"=== 任务列表 ===",
-                f"",
-                f"共 {len(tasks)} 个任务",
-                f"",
-            ]
-
-            if status:
-                lines.append(f"过滤条件: 状态 = {status}")
-                lines.append("")
-
-            for i, task in enumerate(tasks, 1):
-                lines.append(f"--- 任务 #{i} ---")
-                lines.append(f"  ID: {task.id}")
-                lines.append(f"  描述: {task.description}")
-                lines.append(f"  状态: {task.status.value}")
-                if task.parent_id:
-                    lines.append(f"  父任务: {task.parent_id}")
-                lines.append("")
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            return f"[错误] 获取任务列表失败: {str(e)}"
-
-    async def get_current_task(self) -> str:
-        """获取当前正在执行的任务。
-
-        LLM 可以使用此工具确认当前应该执行哪个任务。
-        同一时刻只能有一个 in_progress 的任务。
-
-        返回: 当前 in_progress 任务的详细信息，无则提示选择下一个待执行任务
-        """
-        try:
-            current_task = self.task_manager.get_current_task()
-
-            if current_task:
-                lines = [
-                    f"=== 当前执行任务 ===",
-                    f"",
-                    f"任务 ID: {current_task.id}",
-                    f"描述: {current_task.description}",
-                    f"状态: {current_task.status.value}",
-                ]
-
-                if current_task.parent_id:
-                    lines.append(f"父任务: {current_task.parent_id}")
-
-                return "\n".join(lines)
+            # 5. 根据模式返回不同的摘要
+            if is_multi:
+                return self._format_multi_workflow_summary(normalized)
             else:
-                # 获取待执行任务
-                pending_tasks = self.task_manager.list_tasks(status=TaskStatus.PENDING)
+                # 单 workflow：直接创建任务列表
+                if not hasattr(self, '_task_list_manager') or not hasattr(self, '_file_manager'):
+                    return "[错误] TaskListManager 或 FileManager 未初始化。请先初始化 Orchestrator。"
 
-                if pending_tasks:
-                    lines = [
-                        f"=== 无当前任务 ===",
-                        f"",
-                        f"当前没有正在执行的任务。",
-                        f"",
-                        f"【待执行任务】 ({len(pending_tasks)} 个):",
-                        f"",
-                    ]
-
-                    for i, task in enumerate(pending_tasks, 1):
-                        lines.append(f"{i}. {task.description} (ID: {task.id})")
-
-                    lines.append("")
-                    lines.append("请使用 update_task_status 开始执行某个任务。")
-
-                    return "\n".join(lines)
-                else:
-                    # 所有任务已完成
-                    lines = [
-                        f"=== 任务执行完毕 ===",
-                        f"",
-                        f"所有任务已完成或失败。",
-                        f"",
-                        f"可以使用 list_tasks 查看完整任务列表和结果。",
-                    ]
-
-                    return "\n".join(lines)
+                self._task_list_manager.create_tasks(normalized[0]["tasks"])
+                return self._format_single_workflow_summary(normalized[0])
 
         except Exception as e:
-            return f"[错误] 获取当前任务失败: {str(e)}"
+            return f"[错误] 规划任务失败: {str(e)}"
+
+
+    async def execute_next_task(
+        self,
+        agent_type: str,
+        additional_context: str = ""
+    ) -> str:
+        """执行下一个待执行任务（自动处理所有细节）
+        
+        自动获取下一个待执行任务，读取前置任务的输出文件，生成输出文件路径，
+        调用 AgentDelegate 执行任务，更新任务状态，返回执行结果和完整任务列表。
+        
+        Args:
+            agent_type: Agent 类型，支持 code_explorer 用于代码探索和分析，或 vuln_analysis 用于漏洞挖掘分析
+            additional_context: 额外的上下文信息，如补充说明或约束条件
+        
+        重要要求：
+            - 如果 agent_type 为 vuln_analysis，当前任务必须在 plan_tasks 阶段显式提供 function_identifier
+
+        自动处理：
+            - 自动获取下一个待执行任务
+            - 自动读取前置任务的输出文件（如果有）
+            - 自动生成输出文件路径
+            - 自动更新任务状态
+            - 自动传递上下文给子 Agent
+        
+        Returns:
+            执行结果 + 完整任务列表状态，例如：
+            '''
+            ## 执行结果
+            
+            任务: task_1 - 分析攻击面
+            状态: 已完成
+            输出文件: artifacts/task_1_output.md
+            
+            关键发现:
+            - 找到 5 个对外暴露的函数
+            - 主要入口点: handle_request, process_input
+            
+            ---
+            
+            ## 当前任务列表
+            
+            - [x] task_1: 分析攻击面，找到所有对外暴露的函数
+            - [ ] task_2: 对攻击面函数进行漏洞挖掘
+            
+            总计: 2 个任务
+            已完成: 1 个
+            待执行: 1 个
+            '''
+        """
+        try:
+            # 检查是否已初始化
+            if not self._task_list_manager or not self._file_manager:
+                return "[错误] TaskListManager 或 FileManager 未初始化。请先初始化 Orchestrator。"
+            
+            if not self._agent_delegate:
+                if not self.engine:
+                    return "[错误] 引擎未初始化，无法创建 AgentDelegate。请先初始化引擎并重新初始化 Orchestrator。"
+                if not self.llm_client:
+                    return "[错误] LLM 客户端未初始化，无法创建 AgentDelegate。"
+                if not self._file_manager:
+                    return "[错误] FileManager 未初始化，无法创建 AgentDelegate。"
+                from .agent_delegate import AgentDelegate
+                self._agent_delegate = AgentDelegate(
+                    engine=self.engine,
+                    llm_client=self.llm_client,
+                    file_manager=self._file_manager,
+                )
+            
+            # 1. 获取下一个待执行任务
+            current_task = self._task_list_manager.get_current_task()
+            
+            if not current_task:
+                # 检查任务列表是否为空
+                all_tasks = self._task_list_manager.get_all_tasks()
+                if not all_tasks:
+                    return "[错误] 任务列表为空。请先使用 plan_tasks 工具规划任务。"
+                
+                # 检查是否所有任务已完成
+                if self._task_list_manager.is_all_completed():
+                    stats = self._task_list_manager.get_statistics()
+                    return self._format_all_completed_message(stats)
+                else:
+                    return "[错误] 没有待执行的任务，但任务列表不为空且未全部完成。这可能是一个异常状态。"
+            
+            # 2. 获取函数标识符（仅 vuln_analysis 使用）
+            function_identifier = getattr(current_task, "function_identifier", None)
+            if agent_type == "vuln_analysis" and not function_identifier:
+                return "[错误] 当前任务缺少 function_identifier（vuln_analysis 必需）。请在 plan_tasks 阶段显式提供。"
+
+            # 3. 更新任务状态为 in_progress
+            from .task_list_manager import TaskStatus
+            self._task_list_manager.update_task_status(
+                task_id=current_task.id,
+                status=TaskStatus.IN_PROGRESS
+            )
+            
+            # 4. 读取前置任务的输出文件（如果有）
+            input_files = self._get_previous_task_outputs(current_task.id)
+            
+            # 5. 生成输出文件路径
+            output_file = self._file_manager.get_artifact_path(
+                task_id=current_task.id,
+                artifact_name="output"
+            )
+            
+            # 6. 调用 AgentDelegate 执行任务
+            result = await self._agent_delegate.delegate(
+                agent_type=agent_type,
+                task_description=current_task.description,
+                input_files=input_files,
+                output_file=output_file,
+                context=additional_context,
+                function_identifier=function_identifier,
+            )
+            
+            # 7. 更新任务状态
+            if result.success:
+                self._task_list_manager.update_task_status(
+                    task_id=current_task.id,
+                    status=TaskStatus.COMPLETED
+                )
+            else:
+                self._task_list_manager.update_task_status(
+                    task_id=current_task.id,
+                    status=TaskStatus.FAILED,
+                    error_message=result.error_message
+                )
+            
+            # 8. 格式化返回结果
+            return self._format_execution_result(
+                task=current_task,
+                result=result,
+                output_file=output_file
+            )
+        
+        except Exception as e:
+            return f"[错误] 执行任务失败: {str(e)}"
+
+    async def get_task_status(self) -> str:
+        """获取当前任务列表状态
+        
+        读取 tasks.md，返回完整任务列表和统计信息。
+        
+        Returns:
+            完整任务列表（Markdown 格式）+ 统计信息
+        """
+        try:
+            # 检查是否已初始化
+            if not hasattr(self, '_task_list_manager'):
+                return "[错误] TaskListManager 未初始化。请先初始化 Orchestrator。"
+            
+            # 获取所有任务和统计信息
+            all_tasks = self._task_list_manager.get_all_tasks()
+            stats = self._task_list_manager.get_statistics()
+            
+            if not all_tasks:
+                return "# 任务列表\n\n（无任务）"
+            
+            # 格式化返回结果
+            lines = [
+                "# 任务列表",
+                "",
+            ]
+            
+            for task in all_tasks:
+                lines.append(task.to_markdown_line())
+            
+            lines.extend([
+                "",
+                "---",
+                "",
+                f"**总计**: {stats['total']} 个任务",
+                f"**待执行**: {stats['pending']} 个",
+                f"**执行中**: {stats['in_progress']} 个",
+                f"**已完成**: {stats['completed']} 个",
+                f"**失败**: {stats['failed']} 个",
+                f"**完成率**: {stats['completion_rate']}%",
+            ])
+            
+            # 如果所有任务已完成，添加祝贺信息
+            if self._task_list_manager.is_all_completed():
+                lines.extend([
+                    "",
+                    "🎉 **所有任务已完成！**",
+                ])
+            
+            return "\n".join(lines)
+        
+        except Exception as e:
+            return f"[错误] 获取任务状态失败: {str(e)}"
+
+    async def read_task_output(self, task_id: str) -> str:
+        """读取指定任务的输出文件
+        
+        根据 task_id 找到输出文件，返回文件内容。
+        
+        Args:
+            task_id: 任务 ID，例如 "task_1"
+        
+        Returns:
+            任务输出文件的内容
+        """
+        try:
+            # 检查是否已初始化
+            if not hasattr(self, '_file_manager'):
+                return "[错误] FileManager 未初始化。请先初始化 Orchestrator。"
+            
+            # 生成输出文件路径
+            output_file = self._file_manager.get_artifact_path(
+                task_id=task_id,
+                artifact_name="output"
+            )
+            
+            # 检查文件是否存在
+            if not output_file.exists():
+                return f"[错误] 任务 {task_id} 的输出文件不存在: {output_file}"
+            
+            # 读取文件内容
+            content = self._file_manager.read_artifact(output_file)
+            
+            # 格式化返回结果
+            lines = [
+                f"# 任务输出: {task_id}",
+                "",
+                f"**文件路径**: {output_file}",
+                "",
+                "---",
+                "",
+                content,
+            ]
+            
+            return "\n".join(lines)
+        
+        except FileNotFoundError:
+            return f"[错误] 任务 {task_id} 的输出文件不存在"
+        except Exception as e:
+            return f"[错误] 读取任务输出失败: {str(e)}"
 
     # ==================== 辅助方法 ====================
+
+    def _get_previous_task_outputs(self, current_task_id: str) -> List[Path]:
+        """
+        获取前置任务的输出文件列表
+        
+        Args:
+            current_task_id: 当前任务 ID (如 task_2)
+        
+        Returns:
+            List[Path]: 前置任务的输出文件路径列表
+        """
+        # 提取当前任务编号
+        import re
+        match = re.match(r"task_(\d+)", current_task_id)
+        if not match:
+            return []
+        
+        current_num = int(match.group(1))
+        
+        # 获取所有前置任务的输出文件
+        input_files = []
+        for i in range(1, current_num):
+            prev_task_id = f"task_{i}"
+            output_file = self._file_manager.get_artifact_path(
+                task_id=prev_task_id,
+                artifact_name="output"
+            )
+            
+            # 只添加存在的文件
+            if output_file.exists():
+                input_files.append(output_file)
+        
+        return input_files
+
+    def _format_execution_result(
+        self,
+        task: Any,
+        result: Any,
+        output_file: Path
+    ) -> str:
+        """
+        格式化任务执行结果
+        
+        Args:
+            task: 任务对象
+            result: AgentDelegate 返回的结果
+            output_file: 输出文件路径
+        
+        Returns:
+            str: 格式化的结果文本
+        """
+        lines = [
+            "## 执行结果",
+            "",
+            f"**任务**: {task.id} - {task.description}",
+        ]
+        
+        if result.success:
+            lines.extend([
+                f"**状态**: 已完成 ✓",
+                f"**输出文件**: {output_file.relative_to(self._file_manager.session_dir)}",
+                "",
+            ])
+            
+            # 提取关键发现（从输出中提取前几行作为摘要）
+            if result.output:
+                summary_lines = result.output.split('\n')[:10]
+                lines.extend([
+                    "**关键发现**:",
+                    "",
+                    '\n'.join(summary_lines),
+                    "",
+                    "（完整结果已保存到输出文件）",
+                ])
+        else:
+            lines.extend([
+                f"**状态**: 失败 ✗",
+                f"**错误**: {result.error_message}",
+                "",
+            ])
+        
+        lines.extend([
+            "",
+            "---",
+            "",
+            "## 当前任务列表",
+            "",
+        ])
+        
+        # 添加任务列表
+        all_tasks = self._task_list_manager.get_all_tasks()
+        for task_item in all_tasks:
+            lines.append(task_item.to_markdown_line())
+        
+        # 添加统计信息
+        stats = self._task_list_manager.get_statistics()
+        lines.extend([
+            "",
+            "---",
+            "",
+            f"**总计**: {stats['total']} 个任务",
+            f"**已完成**: {stats['completed']} 个",
+            f"**待执行**: {stats['pending']} 个",
+            f"**进度**: {stats['completion_rate']}%",
+        ])
+        
+        # 如果所有任务已完成，添加祝贺信息
+        if self._task_list_manager.is_all_completed():
+            lines.extend([
+                "",
+                "🎉 **所有任务已完成！**",
+            ])
+        
+        return "\n".join(lines)
+
+    def _format_all_completed_message(self, stats: Dict[str, Any]) -> str:
+        """
+        格式化所有任务已完成的消息
+        
+        Args:
+            stats: 统计信息
+        
+        Returns:
+            str: 格式化的消息
+        """
+        lines = [
+            "## 执行结果",
+            "",
+            "**状态**: 所有任务已完成 🎉",
+            "",
+            "---",
+            "",
+            "## 任务列表",
+            "",
+        ]
+        
+        # 添加任务列表
+        all_tasks = self._task_list_manager.get_all_tasks()
+        for task in all_tasks:
+            lines.append(task.to_markdown_line())
+        
+        # 添加统计信息
+        lines.extend([
+            "",
+            "---",
+            "",
+            f"**总计**: {stats['total']} 个任务",
+            f"**已完成**: {stats['completed']} 个",
+            f"**失败**: {stats['failed']} 个",
+            f"**完成率**: {stats['completion_rate']}%",
+        ])
+        
+        return "\n".join(lines)
 
     def _build_query_prompt(self, query: str, context: Optional[str]) -> str:
         """构建代码查询提示词"""
@@ -840,6 +1050,108 @@ class OrchestratorTools:
 
         return "\n".join(lines)
 
+    def _normalize_workflows(self, workflows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """标准化 workflow 信息，补充默认值"""
+        normalized = []
+        for i, wf in enumerate(workflows, 1):
+            normalized_wf = {
+                "workflow_id": wf.get("workflow_id", f"workflow_{i}"),
+                "workflow_name": wf.get("workflow_name", f"Workflow {i}"),
+                "workflow_description": wf.get("workflow_description", ""),
+                "tasks": wf["tasks"],
+                "execution_mode": wf.get("execution_mode", "sequential"),
+            }
+            normalized.append(normalized_wf)
+        return normalized
+
+    def _format_single_workflow_summary(self, workflow: Dict[str, Any]) -> str:
+        """格式化单 workflow 摘要"""
+        tasks = workflow["tasks"]
+        lines = [
+            "# 任务规划完成",
+            "",
+            f"**模式**: 单 Workflow",
+            f"**任务数量**: {len(tasks)}",
+            "",
+            "## 任务列表",
+            "",
+        ]
+        
+        for i, task in enumerate(tasks, 1):
+            if isinstance(task, dict):
+                task_desc = task.get("description", "")
+            else:
+                task_desc = str(task)
+            lines.append(f"{i}. {task_desc}")
+        
+        lines.extend([
+            "",
+            "---",
+            "",
+            "✅ 任务列表已创建，可以开始执行任务。",
+        ])
+        
+        return "\n".join(lines)
+
+    def _format_multi_workflow_summary(self, workflows: List[Dict[str, Any]]) -> str:
+        """格式化多 workflow 摘要"""
+        total_tasks = sum(len(wf["tasks"]) for wf in workflows)
+        
+        lines = [
+            "# 任务规划完成",
+            "",
+            f"**模式**: 多 Workflow",
+            f"**Workflow 数量**: {len(workflows)}",
+            f"**总任务数量**: {total_tasks}",
+            "",
+            "## Workflow 列表",
+            "",
+        ]
+        
+        for i, wf in enumerate(workflows, 1):
+            lines.extend([
+                f"### {i}. {wf['workflow_name']}",
+                "",
+                f"**ID**: `{wf['workflow_id']}`",
+            ])
+            
+            if wf.get("workflow_description"):
+                lines.append(f"**描述**: {wf['workflow_description']}")
+            
+            lines.extend([
+                f"**执行模式**: {wf['execution_mode']}",
+                f"**任务数量**: {len(wf['tasks'])}",
+                "",
+                "**任务列表**:",
+                "",
+            ])
+            
+            for j, task in enumerate(wf["tasks"], 1):
+                if isinstance(task, dict):
+                    task_desc = task.get("description", "")
+                else:
+                    task_desc = str(task)
+                lines.append(f"{j}. {task_desc}")
+            
+            lines.append("")
+        
+        lines.extend([
+            "---",
+            "",
+            "✅ 多 Workflow 规划完成，MasterOrchestrator 将协调执行。",
+        ])
+        
+        return "\n".join(lines)
+
+    # 新增：供 MasterOrchestrator 查询的方法
+    def get_planned_workflows(self) -> Optional[List[Dict[str, Any]]]:
+        """获取规划的 workflow 列表"""
+        return self._planned_workflows
+
+    def is_multi_workflow(self) -> bool:
+        """判断是否为多 workflow 模式"""
+        return self._is_multi_workflow
+
     # ==================== LangChain Tool 导出 ====================
 
     def get_tools(self) -> List[Any]:
@@ -848,17 +1160,15 @@ class OrchestratorTools:
         供 OrchestratorAgent 使用。
         """
         return [
-            # 任务管理工具
-            self.create_task,
-            self.update_task_status,
-            self.get_task,
-            self.list_tasks,
-            self.get_current_task,
-            # 分析工具
-            self.query_code,
-            self.search_symbol,
-            self.get_function_code,
-            self.get_xref,
-            self.read_file,
-            self.run_vuln_analysis,
+            # 简化的任务编排工具（新设计）
+            self.plan_tasks,
+            self.execute_next_task,
+            self.get_task_status,
+            self.read_task_output,
+            # 统一的 Agent 委托接口
+            self.delegate_task,
+            # 数据访问工具
+            self.read_artifact,
         ]
+
+
