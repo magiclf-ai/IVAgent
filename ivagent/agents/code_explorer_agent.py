@@ -22,13 +22,17 @@ CodeExplorerAgent - 统一的代码探索与语义分析 Agent
 import os
 import subprocess
 import uuid
-from typing import Dict, List, Optional, Any
+import time
+import json
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 
 from .base import BaseAgent
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine, SearchOptions
+from ..core.context import AgentMessage, ContextCompressor, ReadArtifactPruner
+from ..core import SummaryService
 
 # 导入 ToolBasedLLMClient
 try:
@@ -60,6 +64,27 @@ CODE_EXPLORER_SYSTEM_PROMPT = """
 ## 输出要求（重要）
 - 最终输出必须是**markdown格式的纯文本**，不是JSON
 - 输出应包含：分析摘要、发现的代码项、关键证据、代码位置等
+- 输出必须基于代码事实，禁止使用“应当/需要/建议”等规范性表达
+- `summary` 必须是可直接复用的高保真压缩摘要，且包含以下章节（无内容写“无”）：
+  - `## 核心结论`
+  - `## 函数标识符`
+  - `## 关键约束（入参/边界/全局/状态）`
+  - `## 风险操作与证据锚点`
+  - `## 关键调用链`
+  - `## 未知项与待验证`
+- 当任务涉及函数枚举/函数标识符时，`result` 与 `summary` 都必须优先保留 `search_symbol` 返回的标准 `function_identifier`（原样），不要仅保留 `typeN @0x...` 这类弱标识
+- 当用户要求“入参约束/全局约束/风险点”时，必须新增章节：
+  - `## 目标函数约束清单`
+  - 每个函数包含：function_identifier（search_symbol 标准格式）、入参约束、全局约束、风险点（纯文本）
+- 当输出将用于 `vuln_analysis` 规划时，额外提供 `## 可直接写入 analysis_context` 章节，按固定标题组织：
+  - `## 目标函数`
+  - `## 攻击者可控性`
+  - `## 输入与边界约束`
+  - `## 全局/状态/认证约束`
+  - `## 风险操作与漏洞假设`
+  - `## 可利用性前提`
+  - `## 证据锚点`
+  - `## 未知项与待验证`
 - **函数标识符规范**：当返回函数信息时，必须使用 `search_symbol` 工具返回的标准函数标识符
   - 标准格式示例：
     * IDA/Ghidra: `function_name` 或 `namespace::function_name`
@@ -68,6 +93,47 @@ CODE_EXPLORER_SYSTEM_PROMPT = """
   - ❌ 错误：使用简化名称如 `ClassName.method` (JEB场景)
   - ✅ 正确：使用 `search_symbol` 返回的完整标识符
 - 只输出和用户需求相关的内容
+
+## 上下文摘要定义（关键）
+当用户要求“入参约束/全局约束/风险点”时，你需要输出**上下文摘要**，用于后续漏洞分析任务。
+上下文摘要的核心是**攻击者可控性与约束建模**，必须覆盖：
+- 输入来源与可控性：参数/字段是否来自外部输入（网络/文件/IPC/用户交互），哪些参数/字段/指针/对象成员可直接或间接受控
+- 入参约束：长度/计数/索引等由谁决定，是否有校验或状态机约束，是否与上层 header/上下文绑定
+- 全局约束：全局变量/对象状态/缓冲区大小/配置限制等
+- 风险点：基于代码证据的潜在问题与可触发路径
+
+### 通用示例（不要照搬真实测试用例）
+示例 1（长度字段影响拷贝）：
+```c
+void handle(const uint8_t *payload, size_t payload_len) {
+    uint32_t n = *(uint32_t*)payload;
+    memcpy(dst, payload + 4, n);
+}
+```
+对应摘要示例：
+- 入参约束：`payload` 来自外部消息体，`payload_len` 由上层解包提供；`n` 来自 payload，可控；`payload_len` 可能受 header 限制
+- 全局约束：`dst` 为固定大小缓冲
+- 风险点：使用可控 `n` 进行拷贝，可能越界
+
+示例 2（结构体指针与计数循环）：
+```c
+typedef struct { uint32_t count; Item *items; } Req;
+for (i = 0; i < req->count; i++) { use(req->items[i]); }
+```
+对应摘要示例：
+- 入参约束：`req` 来自外部输入解析；`count` 可控；`items` 可能指向 payload 内部偏移
+- 全局约束：未见全局变量约束或固定容量限制的证据
+- 风险点：未校验 `count/items` 会导致越界访问
+
+示例 3（字符串指针使用）：
+```c
+char *path = (char*)payload + offset;
+fopen(path, "r");
+```
+对应摘要示例：
+- 入参约束：`payload` 来自外部输入；`offset` 可控或半可控，`path` 内容可控
+- 全局约束：未见路径长度/终止符约束的证据
+- 风险点：路径注入、越界读取、NUL 终止缺失
 
 ## 工作流程
 
@@ -97,7 +163,9 @@ CODE_EXPLORER_SYSTEM_PROMPT = """
 - 重复探索和分析过程，直到获得足够信息
 
 ### 4. 输出结果
-当分析完成时，调用 `finish_exploration` 工具提交**markdown格式的文本结果**。
+当分析完成时，调用 `finish_exploration` 工具同时提交：
+- `result`: markdown格式的正文结果
+- `summary`: 对正文结果的精简摘要（Markdown 纯文本）
 
 ## 函数标识符提取规范（关键）
 
@@ -206,6 +274,9 @@ class CodeExplorerAgent(BaseAgent):
         enable_logging: bool = True,
         session_id: Optional[str] = None,
         agent_id: Optional[str] = None,
+        enable_context_compression: bool = True,
+        compression_token_threshold: int = 8000,
+        compression_max_rounds: int = 2,
     ):
         super().__init__(
             engine=engine,
@@ -228,10 +299,14 @@ class CodeExplorerAgent(BaseAgent):
         self.session_id = session_id
         self.agent_id = agent_id or f"code_explorer_{uuid.uuid4().hex[:8]}"
         self._agent_log_manager = get_agent_log_manager() if (enable_logging and get_agent_log_manager) else None
+        self.enable_context_compression = enable_context_compression
+        self.compression_token_threshold = compression_token_threshold
+        self.compression_max_rounds = compression_max_rounds
         
         # 初始化 ToolBasedLLMClient
         if ToolBasedLLMClient:
             if not isinstance(llm_client, ToolBasedLLMClient):
+                self._base_llm = llm_client
                 self._tool_client = ToolBasedLLMClient(
                     llm=llm_client,
                     max_retries=3,
@@ -246,8 +321,28 @@ class CodeExplorerAgent(BaseAgent):
                 )
             else:
                 self._tool_client = llm_client
+                self._base_llm = llm_client.llm
         else:
             raise RuntimeError("ToolBasedLLMClient is required")
+
+        self._context_compressor = None
+        self._read_artifact_pruner = None
+        if self.enable_context_compression:
+            summary_service = SummaryService(
+                llm_client=self._base_llm,
+                max_retries=2,
+                retry_delay=1.0,
+                enable_logging=self.enable_logging,
+                verbose=self.verbose,
+                session_id=self.session_id,
+                agent_id=self.agent_id,
+                agent_type="code_explorer",
+                target_function="code_explorer",
+            )
+            self._context_compressor = ContextCompressor(
+                summary_service=summary_service,
+            )
+            self._read_artifact_pruner = ReadArtifactPruner()
         
         self.log(f"CodeExplorerAgent initialized (agent_id={self.agent_id})")
     
@@ -435,7 +530,7 @@ class CodeExplorerAgent(BaseAgent):
             
             result = [
                 f"Function: {func_def.name}",
-                f"Signature: {func_def.signature}",
+                f"identifier: {func_def.signature}",
                 f"Location: {func_def.location or 'N/A'}",
                 f"Parameters: {func_def.parameters}",
                 f"Return Type: {func_def.return_type or 'N/A'}",
@@ -588,8 +683,8 @@ class CodeExplorerAgent(BaseAgent):
     # 完成工具
     # ==========================================================================
     
-    def finish_exploration(self, result: str) -> str:
-        """完成探索并返回markdown格式的文本结果。
+    def finish_exploration(self, result: str, summary: str) -> str:
+        """完成探索并返回markdown格式的文本结果，同时要求提供摘要。
         
         当任务要求返回函数标识符时，必须使用以下结构化格式：
         
@@ -624,6 +719,7 @@ class CodeExplorerAgent(BaseAgent):
         
         Parameters:
             result: 探索结果描述（markdown格式），包含核心发现、关键证据和相关代码位置
+            summary: 精简摘要（markdown纯文本），用于后续上下文选择
         
         Returns:
             格式化后的探索结果文本
@@ -638,7 +734,7 @@ class CodeExplorerAgent(BaseAgent):
         self,
         query: str,
         context: Optional[str] = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         执行代码探索
         
@@ -647,7 +743,7 @@ class CodeExplorerAgent(BaseAgent):
             context: 可选上下文
         
         Returns:
-            探索结果字符串（markdown格式）
+            dict: {"output": markdown结果, "summary": 摘要, "error": 可选错误信息}
         """
         self.log(f"Starting exploration for query: {query[:100]}...")
         
@@ -711,13 +807,21 @@ class CodeExplorerAgent(BaseAgent):
                 # 如果是最后一次迭代，注入提示词要求总结
                 is_last_iteration = (iteration == self.max_iterations - 1)
                 if is_last_iteration:
-                    finalize_prompt = """\n\n[系统通知] 已达到最大迭代次数限制。请基于已收集的所有信息，立即调用 finish_exploration 工具提交markdown格式的探索结果。
+                    finalize_prompt = """\n\n[系统通知] 已达到最大迭代次数限制。请基于已收集的所有信息，立即调用 finish_exploration 工具提交结果。
 
 要求：
 1. 根据已有信息给出最佳探索结果
-2. 必须调用 finish_exploration 工具提交结果
-3. 输出必须是markdown格式的纯文本
-4. 在结果中说明探索因迭代限制而终止"""
+2. 必须调用 finish_exploration 工具提交结果（包含 result 与 summary）
+3. result 必须是 markdown 格式纯文本
+4. summary 必须是 markdown 纯文本高保真摘要，并包含章节：
+   - ## 核心结论
+   - ## 函数标识符
+   - ## 关键约束（入参/边界/全局/状态）
+   - ## 风险操作与证据锚点
+   - ## 关键调用链
+   - ## 未知项与待验证
+5. 若涉及函数，summary 中必须保留标准 `function_identifier`（search_symbol 原样）
+6. 在 result 中说明探索因迭代限制而终止"""
                     messages.append(HumanMessage(content=finalize_prompt))
                 
                 # 调用 LLM
@@ -728,7 +832,11 @@ class CodeExplorerAgent(BaseAgent):
                 )
                 
                 if result is None:
-                    final_result = f"[探索失败] LLM call failed"
+                    final_result = {
+                        "output": "",
+                        "summary": "",
+                        "error": "[探索失败] LLM call failed",
+                    }
                     break
                 
                 # 处理 tool calls
@@ -739,7 +847,11 @@ class CodeExplorerAgent(BaseAgent):
                         messages.append(AIMessage(content=content))
                         continue
                     else:
-                        final_result = "[探索失败] No exploration result generated"
+                        final_result = {
+                            "output": "",
+                            "summary": "",
+                            "error": "[探索失败] No exploration result generated",
+                        }
                         break
                 
                 # 添加 AI message with tool calls
@@ -776,7 +888,22 @@ class CodeExplorerAgent(BaseAgent):
                         elif tool_name == "search_symbol":
                             output = await self.search_symbol(**args)
                         elif tool_name == "finish_exploration":
-                            final_result = self.finish_exploration(args.get("result", ""))
+                            summary = (args.get("summary") or "").strip()
+                            output = self.finish_exploration(
+                                args.get("result", ""),
+                                summary,
+                            )
+                            if not summary:
+                                final_result = {
+                                    "output": output,
+                                    "summary": "",
+                                    "error": "[探索失败] 缺少摘要，无法完成探索",
+                                }
+                            else:
+                                final_result = {
+                                    "output": output,
+                                    "summary": summary,
+                                }
                             break
                         else:
                             output = f"Unknown tool: {tool_name}"
@@ -787,26 +914,188 @@ class CodeExplorerAgent(BaseAgent):
                 
                 if final_result:
                     break
+
+                if self.enable_context_compression:
+                    messages = await self._maybe_compress_messages(messages)
             
             if final_result is None:
-                final_result = f"[探索失败] 达到最大迭代次数({self.max_iterations})但未获得有效结果"
+                final_result = {
+                    "output": "",
+                    "summary": "",
+                    "error": f"[探索失败] 达到最大迭代次数({self.max_iterations})但未获得有效结果",
+                }
         
         except Exception as e:
-            final_result = f"[探索失败] Exploration failed: {str(e)}"
+            final_result = {
+                "output": "",
+                "summary": "",
+                "error": f"[探索失败] Exploration failed: {str(e)}",
+            }
         
         # 记录 Agent 执行日志结束
         if self._agent_log_manager and agent_log:
-            is_failed = final_result.startswith("[探索失败]") if isinstance(final_result, str) else False
+            is_failed = bool(final_result.get("error")) if isinstance(final_result, dict) else True
             status = AgentStatus.FAILED if is_failed else AgentStatus.COMPLETED
             self._agent_log_manager.log_execution_end(
                 agent_id=self.agent_id,
                 status=status,
                 llm_calls=iteration + 1,
-                summary=final_result[:200] if isinstance(final_result, str) else "",
-                error_message=final_result if is_failed else None,
+                summary=(final_result.get("output") or "")[:200] if isinstance(final_result, dict) else "",
+                error_message=final_result.get("error") if isinstance(final_result, dict) and is_failed else None,
             )
         
         return final_result
+
+    async def _maybe_compress_messages(self, messages: List[Any]) -> List[Any]:
+        """在需要时压缩上下文消息列表"""
+        if (
+            not self._context_compressor
+            or self.compression_token_threshold <= 0
+            or self.compression_max_rounds <= 0
+        ):
+            return messages
+
+        for _ in range(self.compression_max_rounds):
+            agent_messages, _ = self._wrap_messages_for_compression(messages)
+            if not agent_messages:
+                return messages
+
+            estimated_tokens = self._estimate_messages_tokens(agent_messages)
+            if estimated_tokens <= self.compression_token_threshold:
+                return messages
+
+            first_system_idx = next((i for i, m in enumerate(messages) if isinstance(m, SystemMessage)), None)
+            first_user_idx = next((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), None)
+            preserve_indices: List[int] = []
+            if first_system_idx is not None and (
+                first_user_idx is None or first_system_idx < first_user_idx
+            ):
+                preserve_indices.append(first_system_idx)
+            if first_user_idx is not None:
+                preserve_indices.append(first_user_idx)
+            preserve_indices = sorted(set(preserve_indices))
+            preserve_set = set(preserve_indices)
+            preserve_messages = [messages[i] for i in preserve_indices]
+            candidate_messages = [m for i, m in enumerate(messages) if i not in preserve_set]
+            if not candidate_messages:
+                return messages
+
+            candidate_agent_messages, id_to_index = self._wrap_messages_for_compression(candidate_messages)
+            if not candidate_agent_messages:
+                return messages
+
+            head = candidate_agent_messages
+
+            if self._read_artifact_pruner and head:
+                prune_result = await self._read_artifact_pruner.prune(head)
+                if prune_result.remove_message_ids:
+                    head_ids = {m.message_id for m in head}
+                    remove_ids = [mid for mid in prune_result.remove_message_ids if mid in head_ids]
+                    if remove_ids:
+                        remove_indices = {
+                            id_to_index[mid] for mid in remove_ids if mid in id_to_index
+                        }
+                        if remove_indices:
+                            candidate_messages = [
+                                msg for idx, msg in enumerate(candidate_messages) if idx not in remove_indices
+                            ]
+                            candidate_agent_messages, id_to_index = self._wrap_messages_for_compression(candidate_messages)
+                            if not candidate_agent_messages:
+                                return preserve_messages
+                            head = candidate_agent_messages
+
+            result = await self._context_compressor.compress(head)
+            if not result.summary:
+                return messages
+
+            compressed_message = AIMessage(content=f"【上下文压缩摘要】\n{result.summary}")
+            messages = preserve_messages + [compressed_message]
+
+        return messages
+
+    def _wrap_messages_for_compression(
+        self,
+        messages: List[Any],
+    ) -> Tuple[List[AgentMessage], Dict[str, int]]:
+        agent_messages: List[AgentMessage] = []
+        id_to_index: Dict[str, int] = {}
+        for idx, msg in enumerate(messages):
+            role = "assistant"
+            if isinstance(msg, SystemMessage):
+                role = "system"
+            elif isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, ToolMessage):
+                role = "tool"
+
+            metadata: Dict[str, Any] = {}
+            if role == "assistant" and getattr(msg, "tool_calls", None):
+                metadata["tool_calls"] = msg.tool_calls
+            if role == "tool":
+                if getattr(msg, "name", None):
+                    metadata["tool_name"] = msg.name
+                if getattr(msg, "tool_call_id", None):
+                    metadata["tool_call_id"] = msg.tool_call_id
+
+            message_id = f"msg_{idx}"
+            id_to_index[message_id] = idx
+            agent_messages.append(
+                AgentMessage(
+                    message_id=message_id,
+                    role=role,
+                    content_display=msg.content or "",
+                    content_full=msg.content or "",
+                    created_at=time.time(),
+                    artifacts=[],
+                    metadata=metadata,
+                )
+            )
+        return agent_messages, id_to_index
+
+    def _split_for_compression(
+        self,
+        messages: List[AgentMessage],
+    ) -> Tuple[List[AgentMessage], List[AgentMessage]]:
+        last_tool_call_idx = None
+        last_user_idx = None
+
+        for idx, msg in enumerate(messages):
+            if msg.role == "user":
+                last_user_idx = idx
+            if msg.role == "assistant" and msg.metadata.get("tool_calls"):
+                last_tool_call_idx = idx
+
+        if last_tool_call_idx is not None:
+            prev_user_idx = None
+            for idx in range(last_tool_call_idx - 1, -1, -1):
+                if messages[idx].role == "user":
+                    prev_user_idx = idx
+                    break
+            tail_start = prev_user_idx if prev_user_idx is not None else last_tool_call_idx
+        elif last_user_idx is not None:
+            tail_start = last_user_idx
+        else:
+            tail_start = max(0, len(messages) - 1)
+
+        head = messages[:tail_start]
+        tail = messages[tail_start:]
+        return head, tail
+
+    def _estimate_messages_tokens(self, messages: List[AgentMessage]) -> int:
+        total = 0
+        for msg in messages:
+            total += self._estimate_message_tokens(msg)
+        return total
+
+    def _estimate_message_tokens(self, msg: AgentMessage) -> int:
+        content = msg.content_display or ""
+        if msg.metadata.get("tool_calls"):
+            content += "\n" + json.dumps(msg.metadata.get("tool_calls"), ensure_ascii=False)
+        return self._estimate_tokens(content)
+
+    def _estimate_tokens(self, text: str) -> int:
+        # 粗略估算：1 token ≈ 4 字符
+        return max(1, len(text) // 4) if text else 0
     
     async def _call_llm_with_tools(
         self,
@@ -849,7 +1138,7 @@ class CodeExplorerAgent(BaseAgent):
             self.log(f"LLM call failed: {e}", "ERROR")
             return None
     
-    async def run(self, **kwargs) -> str:
+    async def run(self, **kwargs) -> dict:
         """实现 BaseAgent 的抽象方法"""
         query = kwargs.get("query", "")
         context = kwargs.get("context")

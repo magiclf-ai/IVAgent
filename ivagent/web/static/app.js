@@ -83,6 +83,11 @@ const state = {
         page: 1,
         limit: 2, // 每页只显示 1-2 个 Agent
         total: 0
+    },
+    batchSelection: {
+        enabled: false,
+        selectedIds: new Set(),
+        logDetails: new Map() // 存储已加载的日志详情
     }
 };
 
@@ -136,6 +141,9 @@ const logStateManager = {
 // DOM 元素
 const elements = {};
 let bsModal = null;
+let currentLogDetail = null;
+let copyResetTimer = null;
+let batchCopyResetTimer = null;
 
 // 初始化
 async function init() {
@@ -220,6 +228,8 @@ function cacheElements() {
     elements.modal = document.getElementById('log-modal');
     elements.modalBody = document.getElementById('modal-body');
     elements.closeModal = document.getElementById('close-modal');
+    elements.copyIncludeMetadata = document.getElementById('copy-include-metadata');
+    elements.copyLogData = document.getElementById('copy-log-data');
     
     // 其他
     elements.refreshBtn = document.getElementById('refresh-btn');
@@ -230,6 +240,15 @@ function cacheElements() {
     // 全局搜索
     elements.globalSearch = document.getElementById('global-search');
     elements.searchBtn = document.getElementById('search-btn');
+    
+    // 批量选择相关
+    elements.toggleBatchMode = document.getElementById('toggle-batch-mode');
+    elements.batchActionsBar = document.getElementById('batch-actions-bar');
+    elements.selectAllLogs = document.getElementById('select-all-logs');
+    elements.selectAllPage = document.getElementById('select-all-page');
+    elements.selectedCount = document.getElementById('selected-count');
+    elements.copySelectedLogs = document.getElementById('copy-selected-logs');
+    elements.cancelSelection = document.getElementById('cancel-selection');
 }
 
 // 绑定事件
@@ -274,6 +293,43 @@ function bindEvents() {
     elements.modal.addEventListener('click', (e) => {
         if (e.target === elements.modal) closeModal();
     });
+    if (elements.copyLogData) {
+        elements.copyLogData.addEventListener('click', copyInteractionData);
+    }
+    if (elements.copyIncludeMetadata) {
+        elements.copyIncludeMetadata.addEventListener('change', () => {
+            if (currentLogDetail) {
+                elements.copyLogData.focus();
+            }
+        });
+    }
+    if (elements.modal) {
+        elements.modal.addEventListener('hidden.bs.modal', () => {
+            currentLogDetail = null;
+            setCopyLogButtonState(false);
+            setCopyMetadataToggle(false);
+        });
+    }
+    
+    // 批量选择相关事件
+    if (elements.toggleBatchMode) {
+        elements.toggleBatchMode.addEventListener('click', (e) => {
+            e.preventDefault();
+            toggleBatchSelectionMode();
+        });
+    }
+    if (elements.cancelSelection) {
+        elements.cancelSelection.addEventListener('click', exitBatchSelectionMode);
+    }
+    if (elements.selectAllLogs) {
+        elements.selectAllLogs.addEventListener('change', (e) => toggleSelectAllLogs(e.target.checked));
+    }
+    if (elements.selectAllPage) {
+        elements.selectAllPage.addEventListener('change', (e) => toggleSelectAllPage(e.target.checked));
+    }
+    if (elements.copySelectedLogs) {
+        elements.copySelectedLogs.addEventListener('click', copySelectedLogsAsLLMFormat);
+    }
     
     // 刷新
     elements.refreshBtn.addEventListener('click', () => {
@@ -1021,19 +1077,31 @@ function formatTokenCount(tokens) {
 }
 
 function renderLogRows(logs, showToken = false) {
+    const batchEnabled = state.batchSelection.enabled;
+    const baseColCount = showToken ? 8 : 7;
+    const colCount = baseColCount + (batchEnabled ? 1 : 0);
+    
     if (logs.length === 0) {
-        return `<tr><td colspan="${showToken ? 8 : 7}" class="empty-state">暂无日志数据</td></tr>`;
+        return `<tr><td colspan="${colCount}" class="empty-state">暂无日志数据</td></tr>`;
     }
     
     return logs.map(log => {
         const isViewed = logStateManager.isViewed(log.id);
         const isStarred = logStateManager.isStarred(log.id);
+        const isSelected = state.batchSelection.selectedIds.has(log.id);
         const rowClass = isViewed ? 'log-row viewed' : 'log-row';
         const safeId = String(log.id).replace(/'/g, "\\'");
         const tokenCount = estimateTokens(log);
         
+        // 复选框列（仅在批量模式下显示）
+        const selectCol = batchEnabled ? `
+            <td class="batch-select-col text-center">
+                <input type="checkbox" class="form-check-input log-select-checkbox" data-log-id="${log.id}" ${isSelected ? 'checked' : ''}>
+            </td>` : '';
+        
         return `
         <tr data-id="${log.id}" class="${rowClass}">
+            ${selectCol}
             <td>${formatTime(log.timestamp)}</td>
             <td>${renderAgentType(log.agent_type)}</td>
             <td class="target-function-cell"><span class="target-function-tag" title="${escapeHtml(log.target_function || '-')}">${escapeHtml(log.target_function || '-')}</span></td>
@@ -1119,9 +1187,10 @@ function changeRecentPage(delta) {
 function bindTableEvents(tbody) {
     if (!tbody) return;
     
-    // 行双击事件 - 查看详情
+    // 行双击事件 - 查看详情（仅在非批量模式下）
     tbody.querySelectorAll('tr[data-id]').forEach(row => {
         row.addEventListener('dblclick', () => {
+            if (state.batchSelection.enabled) return;
             const logId = row.dataset.id;
             if (logId) {
                 // 标记为已查看
@@ -1149,6 +1218,208 @@ function bindTableEvents(tbody) {
             if (logId) toggleLogStar(logId, btn);
         });
     });
+    
+    // 批量选择复选框事件
+    tbody.querySelectorAll('.log-select-checkbox').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            e.stopPropagation();
+            const logId = cb.dataset.logId;
+            if (logId) toggleLogSelection(logId, e.target.checked);
+        });
+    });
+}
+
+// ==================== 批量选择功能 ====================
+
+function toggleBatchSelectionMode() {
+    state.batchSelection.enabled = !state.batchSelection.enabled;
+    updateBatchSelectionUI();
+}
+
+function exitBatchSelectionMode() {
+    state.batchSelection.enabled = false;
+    state.batchSelection.selectedIds.clear();
+    state.batchSelection.logDetails.clear();
+    updateBatchSelectionUI();
+}
+
+function updateBatchSelectionUI() {
+    const enabled = state.batchSelection.enabled;
+    
+    // 显示/隐藏批量操作栏
+    if (elements.batchActionsBar) {
+        elements.batchActionsBar.style.display = enabled ? 'block' : 'none';
+    }
+    
+    // 显示/隐藏表格中的选择列
+    document.querySelectorAll('.batch-select-col').forEach(col => {
+        col.style.display = enabled ? 'table-cell' : 'none';
+    });
+    
+    // 更新表格行显示
+    updateLogsTable(state.logs);
+    
+    // 更新选择计数
+    updateSelectedCount();
+    
+    // 更新按钮状态
+    if (elements.toggleBatchMode) {
+        elements.toggleBatchMode.classList.toggle('active', enabled);
+    }
+}
+
+function toggleSelectAllLogs(checked) {
+    if (checked) {
+        // 选择所有可见的日志
+        state.logs.forEach(log => {
+            state.batchSelection.selectedIds.add(log.id);
+        });
+    } else {
+        state.batchSelection.selectedIds.clear();
+    }
+    
+    // 更新UI
+    document.querySelectorAll('.log-select-checkbox').forEach(cb => {
+        cb.checked = checked;
+    });
+    
+    if (elements.selectAllPage) {
+        elements.selectAllPage.checked = checked;
+    }
+    
+    updateSelectedCount();
+}
+
+function toggleSelectAllPage(checked) {
+    const checkboxes = document.querySelectorAll('.log-select-checkbox');
+    checkboxes.forEach(cb => {
+        cb.checked = checked;
+        const logId = cb.dataset.logId;
+        if (logId) {
+            if (checked) {
+                state.batchSelection.selectedIds.add(logId);
+            } else {
+                state.batchSelection.selectedIds.delete(logId);
+            }
+        }
+    });
+    updateSelectedCount();
+}
+
+function toggleLogSelection(logId, checked) {
+    if (checked) {
+        state.batchSelection.selectedIds.add(logId);
+    } else {
+        state.batchSelection.selectedIds.delete(logId);
+    }
+    updateSelectedCount();
+}
+
+function updateSelectedCount() {
+    const count = state.batchSelection.selectedIds.size;
+    if (elements.selectedCount) {
+        elements.selectedCount.textContent = `已选择 ${count} 条`;
+    }
+    if (elements.copySelectedLogs) {
+        elements.copySelectedLogs.disabled = count === 0;
+    }
+    if (elements.selectAllLogs) {
+        elements.selectAllLogs.checked = count > 0 && count === state.logs.length;
+    }
+}
+
+async function copySelectedLogsAsLLMFormat() {
+    const selectedIds = Array.from(state.batchSelection.selectedIds);
+    if (selectedIds.length === 0) {
+        showError('请先选择至少一条日志');
+        return;
+    }
+    
+    // 显示加载状态
+    const originalText = elements.copySelectedLogs.innerHTML;
+    elements.copySelectedLogs.disabled = true;
+    elements.copySelectedLogs.innerHTML = '<i class="bi bi-hourglass-split"></i> 加载中...';
+    
+    try {
+        // 获取所有选中日志的详情
+        const logs = [];
+        for (const logId of selectedIds) {
+            // 优先使用已缓存的详情
+            let logDetail = state.batchSelection.logDetails.get(logId);
+            if (!logDetail) {
+                logDetail = await apiGet(`/api/logs/${logId}`);
+                state.batchSelection.logDetails.set(logId, logDetail);
+            }
+            logs.push(logDetail);
+        }
+        
+        // 按时间排序
+        logs.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        
+        // 生成格式化的文本
+        const formattedText = formatMultipleLogsForLLM(logs);
+        
+        // 复制到剪贴板
+        await navigator.clipboard.writeText(formattedText);
+        
+        // 显示成功状态
+        elements.copySelectedLogs.classList.add('copied');
+        elements.copySelectedLogs.innerHTML = '<i class="bi bi-check2"></i> 已复制';
+        
+        if (batchCopyResetTimer) clearTimeout(batchCopyResetTimer);
+        batchCopyResetTimer = setTimeout(() => {
+            elements.copySelectedLogs.classList.remove('copied');
+            elements.copySelectedLogs.innerHTML = originalText;
+            elements.copySelectedLogs.disabled = false;
+        }, 2000);
+        
+    } catch (error) {
+        console.error('Failed to copy logs:', error);
+        showError('复制失败: ' + error.message);
+        elements.copySelectedLogs.innerHTML = originalText;
+        elements.copySelectedLogs.disabled = false;
+    }
+}
+
+function formatMultipleLogsForLLM(logs) {
+    const sections = [];
+    
+    sections.push('# LLM 交互日志集合');
+    sections.push('');
+    sections.push(`共 ${logs.length} 条日志，按时间顺序排列`);
+    sections.push('');
+    sections.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    sections.push('');
+    
+    logs.forEach((log, index) => {
+        const isFirst = index === 0;
+        const isLast = index === logs.length - 1;
+        
+        // 日志头部分隔线
+        sections.push('╔══════════════════════════════════════════════════════════════════════════════╗');
+        sections.push(`║  日志 ${String(index + 1).padStart(2, '0')} / ${String(logs.length).padStart(2, '0')}                                                          ║`);
+        sections.push('╚══════════════════════════════════════════════════════════════════════════════╝');
+        sections.push('');
+        
+        // 日志内容
+        sections.push(formatInteractionDataMarkdown(log, false));
+        
+        // 日志尾部分隔线
+        if (!isLast) {
+            sections.push('');
+            sections.push('───────────────────────────────────────────────────────────────────────────────');
+            sections.push('');
+        }
+    });
+    
+    // 整体结束标记
+    sections.push('');
+    sections.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    sections.push('');
+    sections.push('// 日志集合结束');
+    sections.push('');
+    
+    return sections.join('\n');
 }
 
 function updateSessionsGrid(sessions) {
@@ -1470,6 +1741,9 @@ async function viewLog(logId) {
 
 function showLogDetail(log) {
     console.log('[DEBUG] showLogDetail called with:', log);
+    currentLogDetail = log;
+    setCopyLogButtonState(true);
+    setCopyMetadataToggle(false);
     
     // 分离 system prompt 和非 system 消息
     const messages = log.messages || [];
@@ -1757,6 +2031,282 @@ function closeModal() {
     }
 }
 
+function setCopyLogButtonState(enabled) {
+    if (!elements.copyLogData) return;
+    elements.copyLogData.disabled = !enabled;
+    elements.copyLogData.classList.remove('copied');
+    elements.copyLogData.innerHTML = '<i class="bi bi-copy"></i> 复制交互数据';
+    if (copyResetTimer) {
+        clearTimeout(copyResetTimer);
+        copyResetTimer = null;
+    }
+}
+
+function setCopyMetadataToggle(checked) {
+    if (!elements.copyIncludeMetadata) return;
+    elements.copyIncludeMetadata.checked = !!checked;
+}
+
+function setCopyLogButtonCopied() {
+    if (!elements.copyLogData) return;
+    elements.copyLogData.classList.add('copied');
+    elements.copyLogData.innerHTML = '<i class="bi bi-check2"></i> 已复制';
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+        setCopyLogButtonState(true);
+    }, 1500);
+}
+
+function buildInteractionPayload(log) {
+    return {
+        id: log.id,
+        timestamp: log.timestamp,
+        timestamp_local: log.timestamp ? formatTime(log.timestamp) : null,
+        session_id: log.session_id,
+        agent_id: log.agent_id || null,
+        agent_type: log.agent_type || null,
+        target_function: log.target_function || null,
+        model: log.model,
+        call_type: log.call_type,
+        status: log.status,
+        success: log.success,
+        latency_ms: log.latency_ms,
+        retry_count: log.retry_count,
+        system_prompt: log.system_prompt || null,
+        messages: log.messages || [],
+        output_schema: log.output_schema || null,
+        response: log.response || null,
+        error: log.error || null,
+        tools: log.tools || null,
+        tool_count: log.tool_count ?? null,
+        tool_names: log.tool_names || null,
+        tool_calls: log.tool_calls || null,
+        metadata: log.metadata || null
+    };
+}
+
+function formatInteractionData(log) {
+    const includeMetadata = elements.copyIncludeMetadata && elements.copyIncludeMetadata.checked;
+    return formatInteractionDataMarkdown(log, includeMetadata);
+}
+
+function formatInteractionDataMarkdown(log, includeMetadata) {
+    const lines = [];
+    const payload = buildInteractionPayload(log);
+    const allMessages = Array.isArray(payload.messages) ? payload.messages : [];
+
+    // 提取 system prompt（优先使用 log.system_prompt，否则从 messages 中提取）
+    let systemPromptContent = payload.system_prompt;
+    if (!systemPromptContent) {
+        const systemMessages = allMessages.filter(m => {
+            const msgType = (m.type || m.role || '').toLowerCase();
+            return msgType === 'system' || msgType === 'systemmessage';
+        });
+        if (systemMessages.length > 0) {
+            systemPromptContent = systemMessages.map(m => m.content).join('\n\n');
+        }
+    }
+
+    // 过滤掉 system 类型的消息（与 UI 渲染保持一致）
+    const messages = allMessages.filter(m => {
+        const msgType = (m.type || m.role || '').toLowerCase();
+        return msgType !== 'system' && msgType !== 'systemmessage';
+    });
+
+    lines.push('# 日志交互数据');
+    lines.push('');
+    lines.push('===== 基本信息 =====');
+    lines.push(`- ID: ${formatScalar(payload.id)}`);
+    lines.push(`- 时间: ${formatScalar(payload.timestamp)}`);
+    lines.push(`- 本地时间: ${formatScalar(payload.timestamp_local)}`);
+    lines.push(`- 会话: ${formatScalar(payload.session_id)}`);
+    lines.push(`- Agent: ${formatScalar(payload.agent_id)}`);
+    lines.push(`- Agent 类型: ${formatScalar(payload.agent_type)}`);
+    lines.push(`- 目标函数: ${formatScalar(payload.target_function)}`);
+    lines.push(`- 模型: ${formatScalar(payload.model)}`);
+    lines.push(`- 类型: ${formatScalar(payload.call_type)}`);
+    lines.push(`- 状态: ${formatScalar(payload.status)}`);
+    lines.push(`- 成功: ${formatScalar(payload.success)}`);
+    lines.push(`- 延迟(ms): ${formatScalar(payload.latency_ms)}`);
+    lines.push(`- 重试次数: ${formatScalar(payload.retry_count)}`);
+    lines.push('');
+
+    lines.push('===== System Prompt =====');
+    lines.push(formatTextBlock(systemPromptContent));
+    lines.push('');
+
+    lines.push('===== 消息 =====');
+    if (messages.length === 0) {
+        lines.push(formatTextBlock(null));
+        lines.push('');
+    } else {
+        messages.forEach((message, index) => {
+            const msg = normalizeMessageEntry(message);
+            const typeOrRole = (msg.type || msg.role || '').toString();
+            const label = getMessageRoleLabel(typeOrRole);
+            const headerParts = [label];
+            if (typeOrRole && typeOrRole.toLowerCase() !== label.toLowerCase()) {
+                headerParts.push(typeOrRole);
+            }
+            if (msg.name) {
+                headerParts.push(msg.name);
+            }
+            lines.push(`<message index="${index + 1}" type="${headerParts.join(' / ')}">`);
+            lines.push(formatContentBlock(msg.content));
+
+            let toolCalls = null;
+            if (msg && typeof msg === 'object' && 'tool_calls' in msg) {
+                toolCalls = msg.tool_calls;
+            }
+            if (toolCalls) {
+                lines.push('<tool_calls>');
+                lines.push(formatJsonBlock(toolCalls));
+                lines.push('</tool_calls>');
+            }
+            lines.push('</message>');
+            lines.push('');
+        });
+    }
+
+    lines.push('===== 输出模式 =====');
+    lines.push(formatTextBlock(payload.output_schema));
+    lines.push('');
+
+    lines.push('===== 响应 =====');
+    lines.push(formatJsonBlock(payload.response));
+    lines.push('');
+
+    lines.push('===== 错误 =====');
+    lines.push(formatTextBlock(payload.error));
+    lines.push('');
+
+    if (includeMetadata) {
+        lines.push('===== 元数据 =====');
+        lines.push(formatJsonBlock(payload.metadata));
+        lines.push('');
+    }
+
+    return lines.join('\n');
+}
+
+function formatScalar(value) {
+    if (value === null || value === undefined || value === '') return '（空）';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    try {
+        return JSON.stringify(value);
+    } catch (e) {
+        return String(value);
+    }
+}
+
+function formatTextBlock(value) {
+    if (value === null || value === undefined || value === '') {
+        return createCodeBlock('text', '（空）');
+    }
+    if (typeof value === 'string') {
+        return createCodeBlock('text', value);
+    }
+    try {
+        return createCodeBlock('json', JSON.stringify(value, null, 2));
+    } catch (e) {
+        return createCodeBlock('text', String(value));
+    }
+}
+
+function formatContentBlock(value) {
+    if (value === null || value === undefined || value === '') {
+        return createCodeBlock('text', '（空）');
+    }
+    if (typeof value === 'string') {
+        return createCodeBlock('text', value);
+    }
+    try {
+        return createCodeBlock('json', JSON.stringify(value, null, 2));
+    } catch (e) {
+        return createCodeBlock('text', String(value));
+    }
+}
+
+function formatJsonBlock(value) {
+    if (value === null || value === undefined || value === '') {
+        return createCodeBlock('json', '（空）');
+    }
+    if (typeof value === 'string') {
+        return createCodeBlock('json', value);
+    }
+    try {
+        return createCodeBlock('json', JSON.stringify(value, null, 2));
+    } catch (e) {
+        return createCodeBlock('json', String(value));
+    }
+}
+
+function createCodeBlock(language, content) {
+    return `\`\`\`${language}\n${content}\n\`\`\``;
+}
+
+function normalizeMessageEntry(message) {
+    if (message && typeof message === 'object') return message;
+    return { content: message };
+}
+
+function getMessageRoleLabel(typeOrRole) {
+    const normalized = (typeOrRole || '').toLowerCase();
+    if (['aimessage', 'ai', 'assistant'].includes(normalized)) return 'AI';
+    if (['humanmessage', 'human', 'user'].includes(normalized)) return 'Human';
+    if (['toolmessage', 'tool'].includes(normalized)) return 'Tool';
+    if (['systemmessage', 'system'].includes(normalized)) return 'System';
+    if (normalized.includes('agent')) return 'Agent';
+    return normalized ? normalized : 'Unknown';
+}
+
+async function copyInteractionData() {
+    if (!currentLogDetail) {
+        showError('暂无可复制的日志');
+        return;
+    }
+
+    let text = '';
+    try {
+        text = formatInteractionData(currentLogDetail);
+    } catch (e) {
+        console.error('Format failed:', e);
+        showError('格式化失败，请检查日志内容');
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(text);
+        setCopyLogButtonCopied();
+    } catch (e) {
+        const success = fallbackCopyToClipboard(text);
+        if (success) {
+            setCopyLogButtonCopied();
+        } else {
+            console.error('Copy failed:', e);
+            showError('复制失败，请手动选择复制');
+        }
+    }
+}
+
+function fallbackCopyToClipboard(text) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    let success = false;
+    try {
+        success = document.execCommand('copy');
+    } catch (e) {
+        success = false;
+    }
+    document.body.removeChild(textarea);
+    return success;
+}
+
 function viewSession(sessionId) {
     // 切换到日志视图并筛选会话
     switchView('logs');
@@ -2022,6 +2572,10 @@ async function viewToolCallDetail(logId) {
 function showToolCallDetail(log) {
     const modalBody = document.getElementById('modal-body');
     if (!modalBody) return;
+
+    currentLogDetail = log;
+    setCopyLogButtonState(true);
+    setCopyMetadataToggle(false);
     
     // 构建工具调用详情
     const toolCallsHtml = log.tool_calls && log.tool_calls.length > 0 

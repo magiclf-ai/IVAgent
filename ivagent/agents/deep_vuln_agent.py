@@ -112,7 +112,8 @@ def create_sub_agent_tool(
         arguments: List[str],
         call_text: str,
         caller_function: str = "",
-        argument_constraints: Optional[List[str]] = None,
+        argument_constraints: Optional[str] = None,
+        global_constraints: Optional[str] = None,
         reason: str = "",
 ) -> Dict[str, Any]:
     """创建子 Agent 深入分析子函数。
@@ -127,7 +128,8 @@ def create_sub_agent_tool(
         arguments: 参数表达式列表（如 ["ptr", "size", "data"]）
         call_text: 完整调用文本（包含参数和调用语句，如 "result = func(ptr, size);")
         caller_function: 调用者函数名
-        argument_constraints: 参数约束列表（纯文本格式）
+        argument_constraints: 参数约束（纯文本 Markdown 列表）
+        global_constraints: 全局/类变量约束（纯文本 Markdown 列表）
         reason: 创建原因
     
     Example:
@@ -143,7 +145,8 @@ def create_sub_agent_tool(
         - arguments: ["**(*(result + 272) + 72LL)", "*a2", "&v3"]
         - call_text: "result = sub_13E15CC(**(*(result + 272) + 72LL), *a2, &v3);"
         - caller_function: "sub_13E16E8"
-        - argument_constraints: ["参数1: 污点数据"]
+        - argument_constraints: "- 参数1: 污点数据"
+        - global_constraints: "- 全局变量 g_size: 取值范围未知"
         - reason: "污点数据传播到子函数"
     """
     # Returns: 子 Agent 创建结果
@@ -156,7 +159,8 @@ def create_sub_agent_tool(
             "call_text": call_text,
         },
         "caller_function": caller_function,
-        "argument_constraints": argument_constraints or [],
+        "argument_constraints": argument_constraints or "",
+        "global_constraints": global_constraints or "",
         "reason": reason,
     }
 
@@ -687,6 +691,7 @@ class DeepVulnAgent(BaseAgent):
         # 多轮对话状态
         all_vulnerabilities: List[VulnerabilityResult] = []
         sub_summaries: Dict[str, SimpleFunctionSummary] = {}
+        final_analysis_summary = ""
 
         # 跟踪已创建的子 Agent，避免重复创建
         created_sub_agents: Set[str] = set()
@@ -917,6 +922,7 @@ class DeepVulnAgent(BaseAgent):
                         name=name
                     ))
                 elif 'finalize_analysis' in name:
+                    final_analysis_summary = (args.get("analysis_summary") or "").strip()
                     messages.append(ToolMessage(
                         content="分析已完成。",
                         tool_call_id=tool_call_id,
@@ -932,7 +938,8 @@ class DeepVulnAgent(BaseAgent):
                 self._log_progress(f"[提示] LLM 返回分析内容但未调用工具，提示调用 finalize_analysis_tool 完成分析")
                 messages.append(HumanMessage(
                     content="你已完成分析并在上述内容中描述了发现，但尚未调用工具来报告结果。"
-                            "请调用 `report_vulnerability_tool` 报告发现的漏洞，"
+                            "请**通过工具调用**执行操作，**不要输出 JSON 列表或纯文本**。"
+                            "调用 `report_vulnerability_tool` 报告发现的漏洞，"
                             "或调用 `finalize_analysis_tool` 完成分析。"
                 ))
                 continue  # 继续下一轮，让 LLM 调用工具
@@ -951,15 +958,13 @@ class DeepVulnAgent(BaseAgent):
         await self._update_execution_state(vulnerabilities_found=len(vulnerabilities))
 
         # 生成分析摘要
-        summary = f"分析完成于第 {iteration + 1} 轮，共发现 {len(vulnerabilities)} 个漏洞"
-        if sub_summaries:
-            summary += f"，分析了 {len(sub_summaries)} 个子函数"
+        summary = final_analysis_summary.strip()
 
         self._log_progress(f"深度分析完成，共发现 {len(vulnerabilities)} 个漏洞")
 
         return {
             "vulnerabilities": vulnerabilities,
-            "constraints": context.parent_constraints if context else [],
+            "constraints": context.parent_constraints if context else "",
             "taint_sources": context.taint_sources if context else [],
             "summary": summary,
         }
@@ -1061,8 +1066,11 @@ class DeepVulnAgent(BaseAgent):
             has_finalize = False
             reported_vulns = []
 
+            tool_calls = result.tool_calls
+            content = result.content or ""
+
             # 检查 tool calls
-            for tc in result.tool_calls:
+            for tc in tool_calls:
                 name = tc.get('name', '')
                 args = tc.get('args', {})
                 if 'finalize_analysis' in name:
@@ -1071,8 +1079,8 @@ class DeepVulnAgent(BaseAgent):
                     reported_vulns.append(args)
 
             return {
-                'tool_calls': result.tool_calls,
-                'content': result.content,
+                'tool_calls': tool_calls,
+                'content': content,
                 'reported_vulnerabilities': reported_vulns,
             }
 
@@ -1254,8 +1262,13 @@ class DeepVulnAgent(BaseAgent):
         current_call_stack = parent_context.call_stack if parent_context else self.call_stack
         current_call_stack_detailed = parent_context.call_stack_detailed if parent_context else self.call_stack_detailed
 
-        # 获取纯文本格式的参数约束
-        argument_constraints = call_args.get('argument_constraints', [])
+        # 获取纯文本格式的参数约束/全局约束（Markdown 列表）
+        argument_constraints = self._normalize_constraints_text(
+            call_args.get('argument_constraints', "")
+        )
+        global_constraints = self._normalize_constraints_text(
+            call_args.get('global_constraints', "")
+        )
 
         # 构建新的调用栈帧
         new_frame = CallStackFrame(
@@ -1265,7 +1278,8 @@ class DeepVulnAgent(BaseAgent):
             call_code=callsite.call_text,
             caller_function=call_args.get('caller_function', '') or (
                 current_call_stack[-1] if current_call_stack else ""),
-            argument_constraints=[{"constraint": c} for c in argument_constraints],
+            argument_constraints=argument_constraints,
+            global_constraints=global_constraints,
         )
 
         # 构建详细的调用路径
@@ -1284,16 +1298,8 @@ class DeepVulnAgent(BaseAgent):
             self._log_progress(f"[子Agent跳过] 超过递归深度 | 目标: {func_sig}", "warning")
             return {"vulnerabilities": [], "skipped": True, "reason": "max_depth"}
 
-        # 构建子函数上下文 - 使用纯文本约束
-        # 从 argument_constraints 提取污点源信息
-        sub_taint_sources = []
-        for constraint in argument_constraints:
-            if '污点' in constraint or 'taint' in constraint.lower():
-                # 尝试提取参数名
-                if '参数' in constraint and ':' in constraint:
-                    param_name = constraint.split(':')[0].replace('参数', '').strip()
-                    if param_name:
-                        sub_taint_sources.append(param_name)
+        # 构建子函数上下文 - 使用纯文本约束（不再解析约束内容）
+        sub_taint_sources = list(parent_context.taint_sources) if parent_context else []
 
         # 基于调用上下文生成 precondition
         sub_precondition = self._build_call_context_precondition(
@@ -1315,6 +1321,10 @@ class DeepVulnAgent(BaseAgent):
             parent_constraints=self._merge_constraints(
                 parent_context.parent_constraints,
                 argument_constraints
+            ),
+            global_constraints=self._merge_global_constraints(
+                parent_context.global_constraints,
+                global_constraints
             ),
             precondition=sub_precondition,
         )
@@ -1368,38 +1378,61 @@ class DeepVulnAgent(BaseAgent):
 
         return " -> ".join(parts)
 
+    def _normalize_constraints_text(self, value: Any) -> str:
+        """
+        将约束归一化为纯文本 Markdown 列表
+        """
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            if not items:
+                return ""
+            normalized = []
+            for item in items:
+                if item.lstrip().startswith("-"):
+                    normalized.append(item)
+                else:
+                    normalized.append(f"- {item}")
+            return "\n".join(normalized)
+        return str(value).strip()
+
     def _merge_constraints(
             self,
-            parent_constraints: Any,
-            current_constraints: List[str],
-    ) -> List[str]:
+            parent_constraints: str,
+            current_constraints: str,
+    ) -> str:
         """
-        合并父函数约束和当前约束（纯文本格式）
+        选择当前约束；若为空则回退父约束（纯文本 Markdown 格式）
         """
-        merged = []
+        current_text = self._normalize_constraints_text(current_constraints)
+        if current_text:
+            return current_text
+        return self._normalize_constraints_text(parent_constraints)
 
-        # 添加父约束
-        if isinstance(parent_constraints, list):
-            merged.extend(parent_constraints)
-        elif isinstance(parent_constraints, dict):
-            # 转换字典为文本列表
-            for param, constraints in parent_constraints.items():
-                if isinstance(constraints, list):
-                    for c in constraints:
-                        merged.append(f"{param}: {c}")
-                else:
-                    merged.append(f"{param}: {constraints}")
-
-        # 添加当前约束
-        merged.extend(current_constraints)
-
-        return merged
+    def _merge_global_constraints(
+            self,
+            parent_constraints: str,
+            current_constraints: str,
+    ) -> str:
+        """
+        累加全局/类变量约束（纯文本 Markdown 格式）
+        """
+        parent_text = self._normalize_constraints_text(parent_constraints)
+        current_text = self._normalize_constraints_text(current_constraints)
+        if not parent_text:
+            return current_text
+        if not current_text:
+            return parent_text
+        return f"{parent_text}\n{current_text}"
 
     def _build_call_context_precondition(
             self,
             function_identifier: str,
             call_args: Dict[str, Any],
-            argument_constraints: List[str],
+            argument_constraints: str,
             call_path_str: str,
     ) -> Optional[Any]:
         """
@@ -1703,20 +1736,21 @@ class DeepVulnAgent(BaseAgent):
             lines.append(f"调用点的代码: {call_code}")
             lines.append("")
 
-            # 参数约束
-            constraints = frame.argument_constraints if frame.argument_constraints else []
-            if constraints:
+            # 参数约束（纯文本 Markdown 列表）
+            constraints_text = self._normalize_constraints_text(frame.argument_constraints)
+            if constraints_text:
                 lines.append("参数约束")
-                for constraint in constraints:
-                    # 处理字典格式（如果 constraint 是 dict）
-                    if isinstance(constraint, dict):
-                        constraint_text = constraint.get('constraint', '')
-                        if constraint_text:
-                            lines.append(f"- {constraint_text}")
-                    else:
-                        lines.append(f"- {constraint}")
+                lines.append(constraints_text)
             else:
                 lines.append("参数约束: (无)")
+
+            # 全局/类变量约束（纯文本 Markdown 列表）
+            global_text = self._normalize_constraints_text(getattr(frame, "global_constraints", ""))
+            if global_text:
+                lines.append("全局/类变量约束")
+                lines.append(global_text)
+            else:
+                lines.append("全局/类变量约束: (无)")
 
             lines.append("")
 

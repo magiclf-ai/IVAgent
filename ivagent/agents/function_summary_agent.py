@@ -271,6 +271,7 @@ class FunctionSummaryAgent:
                 cache_kwargs["password"] = self.cache_config["password"]
 
             cache = get_cache(cache_type, namespace=namespace, ttl=ttl, **cache_kwargs)
+            cache.ensure_available()
 
             FunctionSummaryAgent._shared_cache = FunctionSummaryCache(
                 cache=cache,

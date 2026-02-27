@@ -204,6 +204,13 @@
                                     </div>
                                 </div>
                                 <div class="col-12 mt-2">
+                                    <div class="d-flex align-items-center gap-2">
+                                        <button class="btn btn-sm btn-outline-primary" id="toggle-batch-mode">
+                                            <i class="bi bi-check2-square"></i> 批量选择模式
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="col-12 mt-2">
                                     <div class="input-group input-group-sm">
                                         <span class="input-group-text text-secondary">时间范围</span>
                                         <input type="datetime-local" class="form-control" id="filter-start">
@@ -215,12 +222,38 @@
                         </div>
                     </div>
 
+                    <!-- 批量操作工具栏 -->
+                    <div class="card mb-3" id="batch-actions-bar" style="display: none;">
+                        <div class="card-body py-2">
+                            <div class="d-flex align-items-center justify-content-between">
+                                <div class="d-flex align-items-center gap-3">
+                                    <div class="form-check mb-0">
+                                        <input class="form-check-input" type="checkbox" id="select-all-logs">
+                                        <label class="form-check-label" for="select-all-logs">全选</label>
+                                    </div>
+                                    <span class="text-secondary small" id="selected-count">已选择 0 条</span>
+                                </div>
+                                <div class="d-flex gap-2">
+                                    <button class="btn btn-success btn-sm" id="copy-selected-logs" disabled>
+                                        <i class="bi bi-clipboard-data"></i> 复制为 LLM 格式
+                                    </button>
+                                    <button class="btn btn-outline-secondary btn-sm" id="cancel-selection">
+                                        <i class="bi bi-x"></i> 取消
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="card">
                         <div class="card-body p-0">
                             <div class="table-responsive">
                                 <table class="table table-hover mb-0" id="logs-table">
                                     <thead>
                                         <tr>
+                                            <th style="width: 40px; display: none;" class="batch-select-col text-center">
+                                                <input class="form-check-input" type="checkbox" id="select-all-page" title="全选当前页">
+                                            </th>
                                             <th style="width: 16%">时间</th>
                                             <th style="width: 12%">任务类型</th>
                                             <th style="width: 35%">目标函数</th>
@@ -402,7 +435,16 @@
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title">日志详情</h5>
-                    <button type="button" class="btn-close" id="close-modal" data-bs-dismiss="modal" aria-label="Close"></button>
+                    <div class="modal-actions">
+                        <div class="form-check form-switch copy-meta-toggle">
+                            <input class="form-check-input" type="checkbox" id="copy-include-metadata">
+                            <label class="form-check-label" for="copy-include-metadata">包含 metadata</label>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="copy-log-data" disabled>
+                            <i class="bi bi-copy"></i> 复制交互数据
+                        </button>
+                        <button type="button" class="btn-close" id="close-modal" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
                 </div>
                 <div class="modal-body" id="modal-body">
                     <!-- Dynamic Content -->

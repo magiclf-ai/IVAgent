@@ -44,6 +44,10 @@ class Task:
     depends_on: Optional[str] = None  # 依赖的任务 ID（未来扩展）
     agent_type: Optional[str] = None  # 建议的 Agent 类型（code_explorer / vuln_analysis）
     function_identifier: Optional[str] = None  # 目标函数标识符（vuln_analysis 必需）
+    task_group: Optional[str] = None  # 任务分组标识（由 workflow 生成）
+    workflow_name: Optional[str] = None  # 所属 workflow 名称
+    workflow_execution_mode: Optional[str] = None  # workflow 执行模式
+    analysis_context: Optional[str] = None  # 漏洞挖掘前置信息（文件引用或短文本）
     
     def to_markdown_line(self) -> str:
         """
@@ -84,6 +88,14 @@ class Task:
             metadata["agent_type"] = self.agent_type
         if self.function_identifier:
             metadata["function_identifier"] = self.function_identifier
+        if self.task_group:
+            metadata["task_group"] = self.task_group
+        if self.workflow_name:
+            metadata["workflow_name"] = self.workflow_name
+        if self.workflow_execution_mode:
+            metadata["workflow_execution_mode"] = self.workflow_execution_mode
+        if self.analysis_context:
+            metadata["analysis_context"] = self.analysis_context
         
         # 生成注释字符串
         metadata_str = ", ".join(f"{k}: {v}" for k, v in metadata.items())
@@ -135,6 +147,10 @@ class TaskListManager:
                     status=TaskStatus.PENDING,
                     agent_type=description.get("agent_type"),
                     function_identifier=description.get("function_identifier"),
+                    task_group=description.get("task_group"),
+                    workflow_name=description.get("workflow_name"),
+                    workflow_execution_mode=description.get("workflow_execution_mode"),
+                    analysis_context=description.get("analysis_context"),
                 )
             else:
                 task = Task(
@@ -146,22 +162,59 @@ class TaskListManager:
         
         # 写入文件
         self._save_tasks()
+
+    def append_tasks(self, task_descriptions: List[Any]) -> None:
+        """
+        追加任务到现有列表并写入文件
+
+        Args:
+            task_descriptions: 任务描述列表（字符串或包含 description 的字典）
+        """
+        # 计算当前最大任务编号
+        max_num = 0
+        for task_id in self._tasks.keys():
+            num = self._extract_task_number(task_id)
+            if num > max_num:
+                max_num = num
+
+        for idx, description in enumerate(task_descriptions, start=1):
+            task_id = f"task_{max_num + idx}"
+            if isinstance(description, dict):
+                task = Task(
+                    id=task_id,
+                    description=str(description["description"]).strip(),
+                    status=TaskStatus.PENDING,
+                    agent_type=description.get("agent_type"),
+                    function_identifier=description.get("function_identifier"),
+                    task_group=description.get("task_group"),
+                    workflow_name=description.get("workflow_name"),
+                    workflow_execution_mode=description.get("workflow_execution_mode"),
+                    analysis_context=description.get("analysis_context"),
+                )
+            else:
+                task = Task(
+                    id=task_id,
+                    description=str(description).strip(),
+                    status=TaskStatus.PENDING,
+                )
+            self._tasks[task_id] = task
+
+        self._save_tasks()
     
-    def get_current_task(self) -> Optional[Task]:
+    def get_current_task(self, task_group: Optional[str] = None) -> Optional[Task]:
         """
         获取当前待执行任务（第一个 PENDING 状态的任务）
-        
+
+        Args:
+            task_group: 任务分组标识（可选）
+
         Returns:
             Optional[Task]: 待执行任务，无则返回 None
         """
-        # 按任务 ID 排序（task_1, task_2, ...）
-        sorted_tasks = sorted(self._tasks.values(), key=lambda t: self._extract_task_number(t.id))
-        
-        # 返回第一个 PENDING 状态的任务
-        for task in sorted_tasks:
+        tasks = self.get_all_tasks(task_group=task_group)
+        for task in tasks:
             if task.status == TaskStatus.PENDING:
                 return task
-        
         return None
     
     def update_task_status(
@@ -199,26 +252,47 @@ class TaskListManager:
         # 写入文件
         self._save_tasks()
     
-    def get_all_tasks(self) -> List[Task]:
+    def set_task_function_identifier(self, task_id: str, function_identifier: str) -> None:
+        """Update task function_identifier and persist to tasks.md."""
+        if task_id not in self._tasks:
+            raise ValueError(f"Task not found: {task_id}")
+
+        normalized = (function_identifier or "").strip()
+        if not normalized:
+            raise ValueError("function_identifier cannot be empty")
+
+        self._tasks[task_id].function_identifier = normalized
+        self._save_tasks()
+
+    def get_all_tasks(self, task_group: Optional[str] = None) -> List[Task]:
         """
         获取所有任务
-        
+
+        Args:
+            task_group: 任务分组标识（可选）
+
         Returns:
             List[Task]: 任务列表（按 ID 排序）
         """
-        return sorted(self._tasks.values(), key=lambda t: self._extract_task_number(t.id))
+        tasks = sorted(self._tasks.values(), key=lambda t: self._extract_task_number(t.id))
+        if not task_group:
+            return tasks
+        return [task for task in tasks if task.task_group == task_group]
     
-    def is_all_completed(self) -> bool:
+    def is_all_completed(self, task_group: Optional[str] = None) -> bool:
         """
         检查是否所有任务已完成
-        
+
+        Args:
+            task_group: 任务分组标识（可选）
+
         Returns:
             bool: 是否所有任务已完成
         """
-        if not self._tasks:
+        tasks = self.get_all_tasks(task_group=task_group)
+        if not tasks:
             return False
-        
-        return all(task.status == TaskStatus.COMPLETED for task in self._tasks.values())
+        return all(task.status == TaskStatus.COMPLETED for task in tasks)
     
     def get_task(self, task_id: str) -> Optional[Task]:
         """
@@ -232,21 +306,25 @@ class TaskListManager:
         """
         return self._tasks.get(task_id)
     
-    def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self, task_group: Optional[str] = None) -> Dict[str, Any]:
         """
         获取任务统计信息
-        
+
+        Args:
+            task_group: 任务分组标识（可选）
+
         Returns:
             Dict[str, Any]: 统计信息
         """
-        total = len(self._tasks)
-        pending = sum(1 for t in self._tasks.values() if t.status == TaskStatus.PENDING)
-        in_progress = sum(1 for t in self._tasks.values() if t.status == TaskStatus.IN_PROGRESS)
-        completed = sum(1 for t in self._tasks.values() if t.status == TaskStatus.COMPLETED)
-        failed = sum(1 for t in self._tasks.values() if t.status == TaskStatus.FAILED)
-        
+        tasks = self.get_all_tasks(task_group=task_group)
+        total = len(tasks)
+        pending = sum(1 for t in tasks if t.status == TaskStatus.PENDING)
+        in_progress = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
+        completed = sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
+        failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+
         completion_rate = (completed / total * 100) if total > 0 else 0
-        
+
         return {
             "total": total,
             "pending": pending,
@@ -357,6 +435,14 @@ class TaskListManager:
                     task.agent_type = current_metadata["agent_type"]
                 if "function_identifier" in current_metadata:
                     task.function_identifier = current_metadata["function_identifier"]
+                if "task_group" in current_metadata:
+                    task.task_group = current_metadata["task_group"]
+                if "workflow_name" in current_metadata:
+                    task.workflow_name = current_metadata["workflow_name"]
+                if "workflow_execution_mode" in current_metadata:
+                    task.workflow_execution_mode = current_metadata["workflow_execution_mode"]
+                if "analysis_context" in current_metadata:
+                    task.analysis_context = current_metadata["analysis_context"]
                 
                 tasks[task_id] = task
                 

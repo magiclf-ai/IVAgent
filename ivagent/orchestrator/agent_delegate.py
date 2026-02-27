@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
-
+from ..models.constraints import FunctionContext, Precondition
 
 class AgentType(str, Enum):
     """支持的 Agent 类型"""
@@ -28,11 +28,13 @@ class DelegateResult:
     Attributes:
         success: 是否执行成功
         output: Agent 输出内容（markdown 格式）
+        summary: 输出摘要（markdown 纯文本）
         error_message: 错误信息（如果失败）
         agent_type: 使用的 Agent 类型
     """
     success: bool
     output: str
+    summary: str = ""
     error_message: Optional[str] = None
     agent_type: Optional[str] = None
 
@@ -108,17 +110,17 @@ class AgentDelegate:
                 agent_type=agent_type,
             )
         
-        # 读取输入文件内容
         input_content = ""
-        if input_files:
+        if agent_type_enum == AgentType.CODE_EXPLORER and input_files:
             input_content = await self._read_input_files(input_files)
-        
-        # 构造任务 Prompt
-        task_prompt = self._build_task_prompt(
-            task_description=task_description,
-            input_content=input_content,
-            context=context,
-        )
+
+        task_prompt = ""
+        if agent_type_enum == AgentType.CODE_EXPLORER:
+            task_prompt = self._build_task_prompt(
+                task_description=task_description,
+                input_content=input_content,
+                context=context,
+            )
         
         # 执行任务（带重试）
         result = await self._execute_with_retry(
@@ -126,16 +128,23 @@ class AgentDelegate:
             task_prompt=task_prompt,
             function_identifier=function_identifier,
             max_iterations=max_iterations,
+            analysis_context=context,
+            task_description=task_description,
         )
         
         # 写入输出文件
         if result.success and output_file and result.output:
             try:
-                await self._write_output_file(output_file, result.output)
+                await self._write_output_file(
+                    output_file=output_file,
+                    content=result.output,
+                    summary=result.summary,
+                )
             except Exception as e:
                 return DelegateResult(
                     success=False,
                     output=result.output,
+                    summary=result.summary,
                     error_message=f"写入输出文件失败: {str(e)}",
                     agent_type=agent_type,
                 )
@@ -221,13 +230,15 @@ class AgentDelegate:
         ])
         
         return "\n".join(prompt_parts)
-    
+
     async def _execute_with_retry(
         self,
         agent_type: AgentType,
         task_prompt: str,
         function_identifier: Optional[str],
         max_iterations: int,
+        analysis_context: Optional[str],
+        task_description: Optional[str],
     ) -> DelegateResult:
         """
         执行任务（带重试机制）
@@ -251,6 +262,8 @@ class AgentDelegate:
                     task_prompt=task_prompt,
                     function_identifier=function_identifier,
                     max_iterations=max_iterations,
+                    analysis_context=analysis_context,
+                    task_description=task_description,
                 )
                 
                 # 如果成功，直接返回
@@ -275,6 +288,7 @@ class AgentDelegate:
         return DelegateResult(
             success=False,
             output="",
+            summary="",
             error_message=f"执行失败（已重试 {self.MAX_RETRIES} 次）: {last_error}",
             agent_type=agent_type.value,
         )
@@ -285,6 +299,8 @@ class AgentDelegate:
         task_prompt: str,
         function_identifier: Optional[str],
         max_iterations: int,
+        analysis_context: Optional[str],
+        task_description: Optional[str],
     ) -> DelegateResult:
         """
         执行 Agent
@@ -307,12 +323,15 @@ class AgentDelegate:
                     task_prompt=task_prompt,
                     function_identifier=function_identifier,
                     max_iterations=max_iterations,
+                    analysis_context=analysis_context,
+                    task_description=task_description,
                 )
             
             else:
                 return DelegateResult(
                     success=False,
                     output="",
+                    summary="",
                     error_message=f"未实现的 Agent 类型: {agent_type.value}",
                     agent_type=agent_type.value,
                 )
@@ -321,6 +340,7 @@ class AgentDelegate:
             return DelegateResult(
                 success=False,
                 output="",
+                summary="",
                 error_message=f"Agent 执行异常: {str(e)}",
                 agent_type=agent_type.value,
             )
@@ -353,26 +373,59 @@ class AgentDelegate:
             
             # 执行探索
             result = await agent.explore(query=task_prompt)
-            
-            # 检查结果
-            if result and not result.startswith("[探索失败]"):
-                return DelegateResult(
-                    success=True,
-                    output=result,
-                    agent_type=AgentType.CODE_EXPLORER.value,
-                )
+
+            output = ""
+            summary = ""
+            error = ""
+            if isinstance(result, dict):
+                output = (result.get("output") or "").strip()
+                summary = (result.get("summary") or "").strip()
+                error = (result.get("error") or "").strip()
             else:
+                output = (result or "").strip()
+                if output.startswith("[探索失败]"):
+                    error = "代码探索失败"
+
+            if error:
                 return DelegateResult(
                     success=False,
-                    output=result or "",
+                    output=output,
+                    summary=summary,
+                    error_message=error,
+                    agent_type=AgentType.CODE_EXPLORER.value,
+                )
+
+            if not output:
+                return DelegateResult(
+                    success=False,
+                    output="",
+                    summary=summary,
                     error_message="代码探索失败",
                     agent_type=AgentType.CODE_EXPLORER.value,
                 )
+
+            if not summary:
+                return DelegateResult(
+                    success=False,
+                    output=output,
+                    summary="",
+                    error_message="代码探索缺少摘要，无法继续",
+                    agent_type=AgentType.CODE_EXPLORER.value,
+                )
+            
+            # 检查结果
+            return DelegateResult(
+                success=True,
+                output=output,
+                summary=summary,
+                agent_type=AgentType.CODE_EXPLORER.value,
+            )
         
         except ImportError as e:
             return DelegateResult(
                 success=False,
                 output="",
+                summary="",
                 error_message=f"无法导入 CodeExplorerAgent: {str(e)}",
                 agent_type=AgentType.CODE_EXPLORER.value,
             )
@@ -380,6 +433,7 @@ class AgentDelegate:
             return DelegateResult(
                 success=False,
                 output="",
+                summary="",
                 error_message=f"CodeExplorerAgent 执行失败: {str(e)}",
                 agent_type=AgentType.CODE_EXPLORER.value,
             )
@@ -389,6 +443,8 @@ class AgentDelegate:
         task_prompt: str,
         function_identifier: Optional[str],
         max_iterations: int,
+        analysis_context: Optional[str],
+        task_description: Optional[str],
     ) -> DelegateResult:
         """
         执行 VulnAnalysisAgent
@@ -406,6 +462,7 @@ class AgentDelegate:
                 return DelegateResult(
                     success=False,
                     output="",
+                    summary="",
                     error_message="缺少 function_identifier（vuln_analysis 必需）",
                     agent_type=AgentType.VULN_ANALYSIS.value,
                 )
@@ -422,9 +479,8 @@ class AgentDelegate:
             else:
                 engine_name = 'ida'  # 默认
             
-            # 构建 System Prompt
+            # 构建 System Prompt（仅基础提示词）
             base_prompt = get_vuln_agent_system_prompt(engine_name)
-            full_prompt = f"{base_prompt}\n\n## 当前分析任务\n\n{task_prompt}"
             
             # 创建 Agent
             agent = DeepVulnAgent(
@@ -433,18 +489,43 @@ class AgentDelegate:
                 max_iterations=max_iterations,
                 max_depth=10,
                 verbose=True,
-                system_prompt=full_prompt,
+                system_prompt=base_prompt,
             )
             
             # 执行分析（目标函数标识符显式传入）
-            result = await agent.run(function_identifier=function_identifier)
+            precondition_text = (analysis_context or "").strip()
+            if not precondition_text:
+                precondition_text = (task_description or "").strip()
+            precondition = None
+            if precondition_text:
+                precondition = Precondition.from_text(
+                    name="analysis_context",
+                    text_content=precondition_text,
+                    description="analysis context",
+                    target="vuln_analysis",
+                )
+            function_context = FunctionContext(
+                function_identifier=function_identifier,
+                precondition=precondition,
+            )
+            result = await agent.run(function_identifier=function_identifier, context=function_context)
             
             # 格式化结果
             formatted_result = self._format_vuln_result(result, function_identifier)
+            analysis_summary = (result.get("summary") or "").strip()
+            if not analysis_summary:
+                return DelegateResult(
+                    success=False,
+                    output=formatted_result,
+                    summary="",
+                    error_message="漏洞分析缺少摘要，无法继续",
+                    agent_type=AgentType.VULN_ANALYSIS.value,
+                )
             
             return DelegateResult(
                 success=True,
                 output=formatted_result,
+                summary=analysis_summary,
                 agent_type=AgentType.VULN_ANALYSIS.value,
             )
         
@@ -452,6 +533,7 @@ class AgentDelegate:
             return DelegateResult(
                 success=False,
                 output="",
+                summary="",
                 error_message=f"无法导入 DeepVulnAgent: {str(e)}",
                 agent_type=AgentType.VULN_ANALYSIS.value,
             )
@@ -459,6 +541,7 @@ class AgentDelegate:
             return DelegateResult(
                 success=False,
                 output="",
+                summary="",
                 error_message=f"VulnAnalysisAgent 执行失败: {str(e)}",
                 agent_type=AgentType.VULN_ANALYSIS.value,
             )
@@ -523,13 +606,19 @@ class AgentDelegate:
         
         return "\n".join(lines)
     
-    async def _write_output_file(self, output_file: Path, content: str) -> None:
+    async def _write_output_file(
+        self,
+        output_file: Path,
+        content: str,
+        summary: str,
+    ) -> None:
         """
-        写入输出文件
+        写入输出文件并写入摘要文件
         
         Args:
             output_file: 输出文件路径
             content: 文件内容
+            summary: 摘要内容（Markdown 纯文本）
         
         Raises:
             Exception: 写入失败
@@ -543,7 +632,15 @@ class AgentDelegate:
                 output_file.parent.mkdir(parents=True, exist_ok=True)
                 # 直接写入文件
                 output_file.write_text(content, encoding="utf-8")
-        
+
+            if not summary or not summary.strip():
+                raise Exception("摘要为空，无法写入 summary 文件")
+            summary_path = output_file.with_suffix(".summary.md")
+            if self.file_manager:
+                self.file_manager.write_artifact(summary_path, summary)
+            else:
+                summary_path.write_text(summary, encoding="utf-8")
+
         except Exception as e:
             raise Exception(f"写入输出文件失败: {str(e)}")
 

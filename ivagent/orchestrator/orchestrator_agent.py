@@ -12,14 +12,18 @@ import json
 import asyncio
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 
 
 from ..models.workflow import WorkflowContext
-from ..core import ToolBasedLLMClient
-from ..core.context import ArtifactStore, MessageManager, ContextAssembler
+from ..core import ToolBasedLLMClient, SummaryService
+from ..core.context import ArtifactStore, MessageManager, ContextAssembler, ContextCompressor, ReadArtifactPruner
 from .workflow_parser import WorkflowParser
 from .tools import OrchestratorTools
+from .planning_prompts import (
+    build_execution_system_prompt,
+    build_planning_user_prompt,
+)
 
 
 
@@ -41,7 +45,12 @@ class OrchestratorResult:
 class TaskOrchestratorAgent:
     """
     任务规划 Agent - LLM 驱动架构
-    
+
+    职责定义:
+    - 根据用户请求规划漏洞挖掘任务并拆分子任务
+    - 通过 plan_tasks 记录规划结果
+    - 执行过程中根据子 Agent 返回动态追加任务（append_tasks）
+
     核心原则:
     - 不做任何硬编码决策，全部委托给 LLM
     - 通过 Tools 暴露能力，让 LLM 决定何时调用
@@ -58,7 +67,7 @@ class TaskOrchestratorAgent:
         verbose: bool = True,
         enable_logging: bool = True,
         session_id: Optional[str] = None,
-        context_window_size: int = 12,
+        context_token_threshold: int = 24000,
         max_inline_chars: int = 4000,
         artifacts_dir: Optional[str] = None,
     ):
@@ -69,7 +78,7 @@ class TaskOrchestratorAgent:
         self.enable_logging = enable_logging
         self.session_id = session_id or f"session_{id(self)}"
         self.agent_id = f"orchestrator_{id(self)}"
-        self.context_window_size = context_window_size
+        self.context_token_threshold = context_token_threshold
         self.max_inline_chars = max_inline_chars
         self.artifacts_dir = artifacts_dir
         self.source_root = source_root
@@ -110,17 +119,37 @@ class TaskOrchestratorAgent:
             },
         )
 
+        # 初始化摘要服务
+        self.summary_service = SummaryService(
+            llm_client=self.llm,
+            max_retries=2,
+            retry_delay=1.0,
+            enable_logging=self.enable_logging,
+            verbose=self.verbose,
+            session_id=self.session_id,
+            agent_id=self.agent_id,
+            agent_type="orchestrator",
+            target_function=target_function,
+        )
+        self.tools_manager.summary_service = self.summary_service
+        self.tools_manager.tool_output_summary_threshold = self.max_inline_chars
+
         # 初始化上下文管理组件
         artifact_dir = self._resolve_artifact_dir(source_root)
         self.artifact_store = ArtifactStore(artifact_dir)
         self.message_manager = MessageManager(
             artifact_store=self.artifact_store,
-            summary_provider=self._summarize_large_content,
             max_inline_chars=self.max_inline_chars,
         )
+        self.context_compressor = ContextCompressor(
+            summary_service=self.summary_service,
+        )
+        self.read_artifact_pruner = ReadArtifactPruner()
         self.context_assembler = ContextAssembler(
             message_manager=self.message_manager,
-            recent_message_limit=self.context_window_size,
+            compressor=self.context_compressor,
+            read_artifact_pruner=self.read_artifact_pruner,
+            token_threshold=self.context_token_threshold,
         )
         self.tools_manager.set_artifact_store(self.artifact_store)
         
@@ -142,6 +171,21 @@ class TaskOrchestratorAgent:
                 print(f"  [+] {prefix} {message}")
             else:
                 print(f"  [*] {prefix} {message}")
+
+    def _normalize_tool_output(self, result_data: Any) -> tuple[str, Optional[str]]:
+        """
+        规范化工具输出，支持 content/summary 双轨返回。
+
+        返回:
+            (content, summary) 其中 summary 可能为 None
+        """
+        if isinstance(result_data, dict) and ("content" in result_data or "summary" in result_data):
+            content = str(result_data.get("content") or "")
+            summary = (result_data.get("summary") or "").strip()
+            return content, summary or None
+        if isinstance(result_data, str):
+            return result_data, None
+        return json.dumps(result_data, ensure_ascii=False), None
 
     def _init_orchestrator_components(self):
         """初始化简化的任务编排组件（TaskListManager, FileManager, AgentDelegate）"""
@@ -170,23 +214,6 @@ class TaskOrchestratorAgent:
         base_root = Path(source_root) if source_root else Path.cwd()
         session = self.session_id or self.agent_id
         return base_root / ".ivagent_artifacts" / "orchestrator" / session
-
-    async def _summarize_large_content(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> str:
-        """使用 LLM 对大文本生成摘要"""
-        meta = metadata or {}
-        tool_name = meta.get("tool_name", "")
-        tool_hint = f"工具: {tool_name}\n" if tool_name else ""
-        prompt = (
-            f"{tool_hint}请对以下内容生成精简摘要，保留关键结论与指标，字数不超过200字：\n\n"
-            f"{content}"
-        )
-        try:
-            return (await self.llm_client_wrapper.atext_call(
-                messages=[HumanMessage(content=prompt)],
-                system_prompt="你是一个上下文压缩助手，只输出纯文本摘要。",
-            )).strip()
-        except Exception:
-            return ""
 
     async def execute_workflow(self, workflow_path: str = None, target_path: str = None) -> OrchestratorResult:
         """
@@ -277,6 +304,8 @@ class TaskOrchestratorAgent:
         max_iterations = 20
         iteration = 0
         errors = []
+        stall_rounds = 0
+        forced_stop_reason: Optional[str] = None
 
         try:
             while True:
@@ -289,7 +318,7 @@ class TaskOrchestratorAgent:
                     break
 
                 # 组装上下文并调用 LLM
-                assembled_messages = self.context_assembler.build_messages(
+                assembled_messages = await self.context_assembler.build_messages(
                     system_prompt=self._get_simplified_system_prompt(),
                 )
                 
@@ -307,11 +336,30 @@ class TaskOrchestratorAgent:
 
                 # 检查是否有 Tool 调用
                 if not result.tool_calls:
+                    task_manager = getattr(self.tools_manager, "_task_list_manager", None)
+                    if task_manager and not task_manager.is_all_completed():
+                        stall_rounds += 1
+                        self._log(
+                            f"LLM 未调用工具且任务未完成，进入恢复引导 ({stall_rounds}/3)",
+                            "warning",
+                        )
+                        await self.message_manager.add_user_message(
+                            "任务尚未完成，必须继续调用工具。"
+                            "如果工具返回 recoverable 错误，请先按 required_next_actions 修复。"
+                            "若出现 MISSING_FUNCTION_IDENTIFIER，请按顺序调用："
+                            "resolve_function_identifier -> set_task_function_identifier -> execute_next_task(agent_type=\"vuln_analysis\")。"
+                        )
+                        if stall_rounds >= 3:
+                            forced_stop_reason = "LLM 连续 3 轮未调用工具且任务未完成，保护性终止。"
+                            errors.append(forced_stop_reason)
+                            break
+                        continue
                     # 如果没有 tool calls，说明 LLM 认为任务已完成
                     self._log("LLM 完成执行，结束", "success")
                     break
 
                 # 并发执行所有 Tool 调用
+                stall_rounds = 0
                 async def execute_single_tool(tool_call: Dict[str, Any]) -> ToolMessage:
                     """执行单个 tool call 并返回 ToolMessage"""
                     tool_name = tool_call.get("name", "")
@@ -327,14 +375,10 @@ class TaskOrchestratorAgent:
                             self._log(f"Tool 错误: {result_data['error']}", "warning")
                             errors.append(f"{tool_name}: {result_data['error']}")
 
-                        # Tool 返回字符串时直接传递，其他类型序列化为 JSON
-                        if isinstance(result_data, str):
-                            content = result_data
-                        else:
-                            content = json.dumps(result_data, ensure_ascii=False)
-
+                        content, summary = self._normalize_tool_output(result_data)
                         await self.message_manager.add_tool_message(
                             content=content,
+                            summary=summary,
                             tool_name=tool_name,
                             tool_call_id=tool_id,
                         )
@@ -372,12 +416,19 @@ class TaskOrchestratorAgent:
 
             # 最终结果报告
             self._log("任务执行完成", "success")
+            task_manager = getattr(self.tools_manager, "_task_list_manager", None)
+            tasks_completed = True
+            if task_manager:
+                tasks_completed = task_manager.is_all_completed()
+            success = tasks_completed and forced_stop_reason is None
+            if not success:
+                self._log("任务未全部完成，执行结束为失败状态", "warning")
 
             return OrchestratorResult(
-                success=True,
+                success=success,
                 vulnerabilities_found=len(self.tools_manager.vulnerabilities),
                 report="分析完成",
-                summary="分析完成",
+                summary="分析完成" if success else "执行结束，但任务未全部完成",
                 errors=errors,
             )
 
@@ -398,13 +449,17 @@ class TaskOrchestratorAgent:
         tool_map = {
             # 简化的任务编排工具（新设计）
             "plan_tasks": self.tools_manager.plan_tasks,
+            "append_tasks": self.tools_manager.append_tasks,
             "execute_next_task": self.tools_manager.execute_next_task,
+            "resolve_function_identifier": self.tools_manager.resolve_function_identifier,
+            "set_task_function_identifier": self.tools_manager.set_task_function_identifier,
             "get_task_status": self.tools_manager.get_task_status,
             "read_task_output": self.tools_manager.read_task_output,
             # 统一的 Agent 委托接口
             "delegate_task": self.tools_manager.delegate_task,
             # 数据访问工具
             "read_artifact": self.tools_manager.read_artifact,
+            "list_artifacts": self.tools_manager.list_artifacts,
 
         }
 
@@ -417,306 +472,16 @@ class TaskOrchestratorAgent:
     def _get_simplified_system_prompt(self) -> str:
 
         """获取简化版的 Orchestrator 系统提示词"""
-        return """# 角色定义
-
-你是一个任务编排 Agent，负责规划和执行漏洞挖掘任务。
-
-# 工作流程
-
-你的工作分为两个阶段：
-
-## 阶段 1: 规划阶段
-
-1. 阅读 Workflow 文档，理解分析目标和要求
-2. 调用 `plan_tasks(workflows)` 创建任务列表
-   - 将 Workflow 拆解为具体的、可执行的子任务
-   - 每个任务应该清晰、独立、可验证
-   - 为每个任务提供 agent_type（code_explorer / vuln_analysis）
-   - **vuln_analysis 任务必须显式提供 function_identifier**
-   - **若 vuln_analysis 的 function_identifier 未确定：必须先调用 `delegate_task(agent_type="code_explorer", ...)`，要求使用 `search_symbol` 查找并输出标准标识符；得到结果后再调用 `plan_tasks`**
-   - **function_identifier 必须原样复制 `search_symbol` 的输出，不得自行推断或改写**
-   - 支持单 workflow 和多 workflow 模式
-3. 你会看到完整的任务列表和状态
-
-### 单 Workflow 模式
-
-如果整个分析是一个连贯的流程，使用单 workflow：
-
-```json
-{
-    "workflows": [
-        {
-            "tasks": [
-                {
-                    "description": "任务1描述",
-                    "agent_type": "code_explorer"
-                },
-                {
-                    "description": "任务2描述",
-                    "agent_type": "vuln_analysis",
-                    "function_identifier": "Lcom/example/Target;->method(Ljava/lang/String;)V"
-                }
-            ]
-        }
-    ]
-}
-```
-
-### 多 Workflow 模式
-
-如果发现存在多个独立的分析流程，使用多 workflow：
-
-```json
-{
-    "workflows": [
-        {
-            "workflow_id": "wf_component_a",
-            "workflow_name": "组件A分析",
-            "workflow_description": "分析组件A的安全问题",
-            "tasks": [
-                {
-                    "description": "搜索组件A",
-                    "agent_type": "code_explorer"
-                },
-                {
-                    "description": "分析组件A的漏洞",
-                    "agent_type": "vuln_analysis",
-                    "function_identifier": "Lcom/example/A;->query(Ljava/lang/String;)Ljava/lang/String;"
-                }
-            ]
-        },
-        {
-            "workflow_id": "wf_component_b",
-            "workflow_name": "组件B分析",
-            "workflow_description": "分析组件B的安全问题",
-            "tasks": [
-                {
-                    "description": "搜索组件B",
-                    "agent_type": "code_explorer"
-                },
-                {
-                    "description": "分析组件B的漏洞",
-                    "agent_type": "vuln_analysis",
-                    "function_identifier": "Lcom/example/B;->doQuery()V"
-                }
-            ]
-        }
-    ]
-}
-```
-
-### 何时使用多 Workflow
-
-使用多 workflow 的场景：
-- 分析多个独立的组件（如 ContentProvider、BroadcastReceiver）
-- 分析多个独立的漏洞类型（如 SQL注入、命令注入）
-- 分析多个独立的攻击面（如网络接口、文件接口）
-
-关键判断标准：**这些分析流程是否可以完全独立执行，互不依赖**
-
-## 阶段 2: 执行阶段
-
-1. 循环调用 `execute_next_task()` 执行任务
-   - 先判断任务类型：
-     - 代码探索/信息收集/定位/汇总代码事实 → code_explorer
-     - 漏洞挖掘/风险评估/触发条件推导/证据链构建 → vuln_analysis
-   - **凡是漏洞挖掘相关任务，必须使用 vuln_analysis**，禁止用 code_explorer 输出漏洞结论
-   - 若需先收集信息再分析：先用 code_explorer 获取证据，再创建/继续 vuln_analysis 任务
-   - 提供必要的 additional_context
-2. 每次执行后，你会看到：
-   - 当前任务的执行结果
-   - 完整的任务列表和状态
-3. 根据任务列表判断是否继续执行
-4. 当所有任务完成时，总结结果并结束
-
-
-## 阶段 3: 完成阶段
-
-当所有任务完成时：
-1. 总结整体分析结果
-2. 汇总发现的漏洞
-3. 提供最终报告
-
-# 可用工具
-
-## 核心工具
-
-- `plan_tasks(workflows)`: 规划任务列表（原则上先调用；若需 function_identifier，先通过 delegate_task(code_explorer) 使用 search_symbol 获取）
-  - task 支持字符串或对象；对象字段包括 description / agent_type / function_identifier
-  - vuln_analysis 任务必须显式提供 function_identifier
-  - function_identifier 必须来自 search_symbol 的验证结果，保持原样
-- `execute_next_task(agent_type: str, additional_context: str = "")`: 执行下一个任务
-  - agent_type: "code_explorer" 或 "vuln_analysis"
-  - additional_context: 补充说明、约束条件等
-
-## 辅助工具
-
-- `get_task_status()`: 获取当前任务列表状态
-- `read_task_output(task_id: str)`: 读取指定任务的输出
-
-# 重要原则
-
-1. **漏洞挖掘优先使用 vuln_analysis**：凡是漏洞发现、风险评估、触发条件推导、证据链构建，都必须由 vuln_analysis 执行；code_explorer 仅用于检索/定位/汇总代码事实
-2. **任务拆解要合理**：每个任务应该独立、清晰、可执行
-3. **选择合适的 Agent**：
-   - code_explorer: 代码探索、搜索、定位与事实收集
-   - vuln_analysis: 漏洞挖掘、风险评估、证据链与触发条件分析
-4. **提供充分的上下文**：在 additional_context 中提供必要的背景信息
-5. **关注任务状态**：每次执行后检查任务列表，判断下一步行动
-6. **及时总结**：所有任务完成后，提供清晰的总结报告
-
-
-# 示例流程
-
-```
-1. 调用 plan_tasks() 规划任务
-   → 看到任务列表：2 个任务待执行
-
-2. 调用 execute_next_task(agent_type="code_explorer")
-   → 看到任务 1 完成，1 个任务待执行
-
-3. 调用 execute_next_task(agent_type="vuln_analysis", additional_context="重点关注缓冲区溢出")
-   → 看到任务 2 完成，所有任务完成
-
-4. 总结结果，结束执行
-```
-
-## 任务间信息传递
-
-### 读取前置任务输出
-
-- 执行任务后，输出可能包含 [ARTIFACT_REF:xxx] 引用
-- 使用 `read_task_output(task_id)` 读取前置任务的完整输出
-- 从输出中提取关键信息（如函数ID、上下文）传递给下一个任务
-
-### 传递信息的最佳实践
-
-当执行 vuln_analysis 任务时，**function_identifier 必须在 plan_tasks 阶段显式提供**。
-additional_context 中重点提供：
-
-1. **函数签名和位置**：帮助 Agent 定位和理解函数
-
-2. **前置条件和约束**：
-   - 参数来源（用户输入、外部数据等）
-   - 已知的验证逻辑
-   - 相关的安全约束
-
-3. **上下文引用**：如果需要详细信息，引用 artifact
-   - 格式：`详细上下文: [ARTIFACT_REF:abc123]`
-
-### 示例
-
-```
-# 执行代码探索任务
-execute_next_task(agent_type="code_explorer")
-
-# 输出示例：
-# ## 探索结果
-# 找到2个函数：
-# 1. 函数ID: `com.example.Parser.parse`
-#    签名: public void parse(String input)
-#    位置: Parser.java:45
-#    说明: 解析用户输入，未做验证
-# [ARTIFACT_REF:abc123]
-
-# 执行漏洞分析任务，传递提取的信息
-execute_next_task(
-    agent_type="vuln_analysis",
-    additional_context='''
-函数签名: public void parse(String input)
-位置: Parser.java:45
-
-前置条件：
-- 参数 input 来自用户输入
-- 未做长度验证
-
-详细上下文: [ARTIFACT_REF:abc123]
-    '''
-)
-```
-
-**关键原则**：
-- function_identifier 必须在 plan_tasks 中显式提供，保持原样，不要修改
-- 用自然语言清晰描述前置条件
-- 如果信息不完整，先读取 artifact 获取详细内容
-
-现在开始执行你的任务。
-"""
+        return build_execution_system_prompt()
 
     def _build_simplified_planning_prompt(self, target_path: str = None) -> str:
         """构建简化版的规划 Prompt"""
         if not self.workflow_context:
             return "No workflow context available."
-
-        # 确定目标路径
-        final_target = target_path or (
-            self.workflow_context.target.path 
-            if self.workflow_context.target and self.workflow_context.target.path 
-            else None
+        return build_planning_user_prompt(
+            workflow_context=self.workflow_context,
+            target_path=target_path,
         )
-
-        lines = [
-            "# Workflow 分析任务",
-            "",
-            f"## 名称",
-            f"{self.workflow_context.name}",
-            "",
-            f"## 描述",
-            f"{self.workflow_context.description}",
-            "",
-        ]
-
-        if final_target:
-            lines.extend([
-                f"## 目标",
-                f"{final_target}",
-                "",
-            ])
-
-        if self.workflow_context.scope:
-            lines.extend([
-                f"## 分析范围",
-                f"{self.workflow_context.scope.description}",
-                "",
-            ])
-
-        if self.workflow_context.vulnerability_focus:
-            lines.extend([
-                f"## 漏洞关注点",
-            ])
-            for vuln in self.workflow_context.vulnerability_focus:
-                lines.append(f"- {vuln}")
-            lines.append("")
-
-        if self.workflow_context.background_knowledge:
-            lines.extend([
-                f"## 背景知识",
-                f"{self.workflow_context.background_knowledge}",
-                "",
-            ])
-
-        if self.workflow_context.raw_markdown:
-            lines.extend([
-                f"## 完整 Workflow 文档",
-                f"```markdown",
-                f"{self.workflow_context.raw_markdown}",
-                f"```",
-                "",
-            ])
-
-        lines.extend([
-            "## 你的任务",
-            "",
-            "1. 理解上述 Workflow 的目标和要求",
-            "2. 若存在 vuln_analysis 但 function_identifier 未确定：先调用 `delegate_task(agent_type=\"code_explorer\")` 使用 `search_symbol` 查找并返回标准标识符",
-            "3. 调用 `plan_tasks()` 将 Workflow 拆解为具体的子任务",
-            "4. 然后循环调用 `execute_next_task()` 执行每个任务",
-            "5. 所有任务完成后，总结分析结果",
-            "",
-            "若需要 function_identifier，请先完成 search_symbol 验证；然后调用 `plan_tasks()` 规划任务列表。",
-        ])
-
-        return "\n".join(lines)
 
 # 便捷函数
 async def run_workflow(

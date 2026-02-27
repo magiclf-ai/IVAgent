@@ -859,6 +859,104 @@ body {
     color: var(--text-main);
 }
 
+.modal-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+#copy-include-metadata {
+    cursor: pointer;
+}
+
+.copy-meta-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-right: 0.25rem;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.copy-meta-toggle .form-check-label {
+    margin-left: 0.25rem;
+}
+
+#copy-log-data {
+    white-space: nowrap;
+}
+
+#copy-log-data.copied {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+/* ==================== 批量选择功能样式 ==================== */
+
+.batch-select-col {
+    text-align: center;
+    vertical-align: middle;
+}
+
+.batch-select-col .form-check-input {
+    margin: 0;
+    cursor: pointer;
+}
+
+.log-select-checkbox {
+    cursor: pointer;
+}
+
+#batch-actions-bar {
+    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+    border: 1px solid var(--border-color);
+}
+
+#batch-actions-bar .card-body {
+    padding: 0.75rem 1rem;
+}
+
+#toggle-batch-mode {
+    color: var(--text-secondary);
+    transition: all 0.2s ease;
+}
+
+#toggle-batch-mode:hover {
+    color: var(--primary);
+}
+
+#toggle-batch-mode.active {
+    color: var(--primary);
+    background-color: var(--primary-bg);
+    border-radius: var(--radius-sm);
+}
+
+#copy-selected-logs.copied {
+    background-color: var(--success);
+    border-color: var(--success);
+    color: white;
+}
+
+#selected-count {
+    font-weight: 500;
+    color: var(--primary);
+}
+
+/* 选中行的样式 */
+tr.selected {
+    background-color: rgba(99, 102, 241, 0.05);
+}
+
+/* 确保批量选择列在表格中正确显示 */
+#logs-table th.batch-select-col,
+#logs-table td.batch-select-col {
+    width: 40px;
+    min-width: 40px;
+    max-width: 40px;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+}
+
 .modal-body {
     padding: 1.5rem;
 }

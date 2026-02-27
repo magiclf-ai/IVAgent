@@ -3,7 +3,7 @@
 Orchestrator Module
 
 TaskOrchestratorAgent - LLM 驱动的任务规划 Agent
-WorkflowAgent - 自主的 Workflow 执行 Agent
+TaskExecutorAgent - 任务执行 Agent
 MasterOrchestrator - 多 Workflow 协调器
 
 负责解析 Workflow 文档，通过 Tools 暴露能力，由 LLM 自主决策执行流程。
@@ -15,9 +15,9 @@ from .orchestrator_agent import (
     OrchestratorResult,
     run_workflow,
 )
-from .workflow_agent import (
-    WorkflowAgent,
-    WorkflowResult,
+from .task_executor_agent import (
+    TaskExecutorAgent,
+    TaskExecutorResult,
 )
 from .master_orchestrator import (
     MasterOrchestrator,
@@ -34,9 +34,9 @@ __all__ = [
     'TaskOrchestratorAgent',
     'OrchestratorResult',
     'run_workflow',
-    # Workflow Agent (New)
-    'WorkflowAgent',
-    'WorkflowResult',
+    # Task Executor Agent
+    'TaskExecutorAgent',
+    'TaskExecutorResult',
     # Master Orchestrator (Multi-Workflow)
     'MasterOrchestrator',
     'MasterOrchestratorResult',

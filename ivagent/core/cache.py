@@ -49,6 +49,35 @@ class RedisCache:
         self.socket_timeout = socket_timeout
         self.max_connections = max_connections
         self._redis = None
+        self._available_checked = False
+        self._available = False
+        self._availability_error_logged = False
+        self._last_unavailable_message = ""
+
+    def ensure_available(self) -> None:
+        """确保 Redis 可用，不可用时给出一次性友好提示并抛错"""
+        if self._available_checked and self._available:
+            return
+        if self._available_checked and not self._available:
+            raise RuntimeError(self._last_unavailable_message)
+        try:
+            client = self._get_redis()
+            client.ping()
+            self._available_checked = True
+            self._available = True
+        except Exception as e:
+            self._available_checked = True
+            self._available = False
+            message = (
+                f"Redis 未就绪，无法连接 {self.host}:{self.port}。"
+                "请先启动 Redis 服务后再运行。"
+            )
+            detailed = f"{message} 原因: {e}"
+            self._last_unavailable_message = detailed
+            if not self._availability_error_logged:
+                print(f"[RedisCache] {detailed}")
+                self._availability_error_logged = True
+            raise RuntimeError(detailed)
     
     def _make_key(self, key: str) -> str:
         """生成带命名空间的键"""
@@ -71,6 +100,7 @@ class RedisCache:
     
     def get(self, key: str) -> Optional[Any]:
         """获取缓存值"""
+        self.ensure_available()
         try:
             full_key = self._make_key(key)
             data = self._get_redis().get(full_key)
@@ -83,6 +113,7 @@ class RedisCache:
     
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
         """设置缓存值"""
+        self.ensure_available()
         try:
             full_key = self._make_key(key)
             data = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
@@ -95,6 +126,7 @@ class RedisCache:
     
     def expire(self, key: str, ttl: Optional[int] = None) -> bool:
         """刷新缓存的 TTL"""
+        self.ensure_available()
         try:
             full_key = self._make_key(key)
             expire = ttl if ttl is not None else self.ttl
@@ -106,6 +138,7 @@ class RedisCache:
     
     def delete(self, key: str) -> bool:
         """删除缓存值"""
+        self.ensure_available()
         try:
             full_key = self._make_key(key)
             self._get_redis().delete(full_key)
@@ -116,6 +149,7 @@ class RedisCache:
     
     def exists(self, key: str) -> bool:
         """检查键是否存在"""
+        self.ensure_available()
         try:
             full_key = self._make_key(key)
             return self._get_redis().exists(full_key) > 0
@@ -125,6 +159,7 @@ class RedisCache:
     
     def clear(self) -> bool:
         """清空命名空间下的所有缓存"""
+        self.ensure_available()
         try:
             pattern = f"{self.namespace}:*"
             redis_client = self._get_redis()
@@ -203,6 +238,7 @@ class FunctionSummaryCache:
     
     def _get_status(self, status_key: str) -> Optional[AnalysisState]:
         """获取分析状态"""
+        self.cache.ensure_available()
         status = self.cache._get_redis().get(status_key)
         if status:
             return AnalysisState(status.decode() if isinstance(status, bytes) else status)
@@ -215,6 +251,7 @@ class FunctionSummaryCache:
             nx: 只有当 key 不存在时才设置（用于避免覆盖其他进程的状态）
         """
         try:
+            self.cache.ensure_available()
             expire = ttl if ttl is not None else self.lock_timeout + 60
             redis_client = self.cache._get_redis()
             if nx:
@@ -231,6 +268,7 @@ class FunctionSummaryCache:
     def _delete_status(self, status_key: str) -> bool:
         """删除分析状态"""
         try:
+            self.cache.ensure_available()
             self.cache._get_redis().delete(status_key)
             return True
         except Exception as e:
@@ -240,6 +278,7 @@ class FunctionSummaryCache:
     def _acquire_lock(self, lock_key: str):
         """获取分布式锁，返回锁对象或 None"""
         try:
+            self.cache.ensure_available()
             lock = self.cache._get_redis().lock(
                 lock_key,
                 timeout=self.lock_timeout,

@@ -3,7 +3,7 @@
 MasterOrchestrator - 多 Workflow 协调器
 
 负责将复杂的漏洞挖掘 workflow 拆分为多个独立的子 workflow，
-并协调多个 TaskOrchestratorAgent 的执行（串行/并行）。
+并协调多个 TaskExecutorAgent 的执行（串行/并行）。
 """
 
 from typing import Any, List, Optional, Dict
@@ -20,6 +20,11 @@ from ..models.workflow import WorkflowContext
 from ..engines import create_engine, BaseStaticAnalysisEngine
 from ..core import ToolBasedLLMClient
 from .workflow_parser import WorkflowParser
+from .planning_prompts import (
+    build_planning_user_prompt,
+    build_master_planning_system_prompt,
+)
+from .task_list_manager import TaskListManager, TaskStatus
 
 
 @dataclass
@@ -28,7 +33,7 @@ class SubWorkflowInfo:
     id: str
     name: str
     description: str
-    tasks: List[str]
+    tasks: List[Dict[str, Any]]
 
 
 @dataclass
@@ -108,6 +113,21 @@ class MasterOrchestrator:
                 print(f"[+] {prefix} {message}")
             else:
                 print(f"[*] {prefix} {message}")
+
+    def _normalize_tool_output(self, result_data: Any) -> tuple[str, Optional[str]]:
+        """
+        规范化工具输出，支持 content/summary 双轨返回。
+
+        返回:
+            (content, summary) 其中 summary 可能为 None
+        """
+        if isinstance(result_data, dict) and ("content" in result_data or "summary" in result_data):
+            content = str(result_data.get("content") or "")
+            summary = (result_data.get("summary") or "").strip()
+            return content, summary or None
+        if isinstance(result_data, str):
+            return result_data, None
+        return json.dumps(result_data, ensure_ascii=False), None
     
     async def _guide_planning(
         self,
@@ -129,10 +149,33 @@ class MasterOrchestrator:
         # 3. 组装上下文并调用 LLM（允许先调用工具获取 function_identifier）
         max_rounds = 5
         planned = False
-        allowed_tools = {"plan_tasks", "delegate_task", "read_artifact", "get_task_status", "read_task_output"}
+        last_recoverable_error: Optional[Dict[str, Any]] = None
+        allowed_tools = {
+            "plan_tasks",
+            "delegate_task",
+            "read_artifact",
+            "get_task_status",
+            "read_task_output",
+            "resolve_function_identifier",
+            "set_task_function_identifier",
+        }
+
+        def _extract_recoverable_error(content: str) -> Optional[Dict[str, Any]]:
+            if not content or "```json" not in content:
+                return None
+            try:
+                start = content.index("```json") + len("```json")
+                end = content.index("```", start)
+                raw = content[start:end].strip()
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and payload.get("recoverable") is True:
+                    return payload
+            except Exception:
+                return None
+            return None
 
         for round_id in range(1, max_rounds + 1):
-            assembled_messages = orchestrator.context_assembler.build_messages(
+            assembled_messages = await orchestrator.context_assembler.build_messages(
                 system_prompt=self._get_planning_system_prompt(),
             )
 
@@ -148,6 +191,14 @@ class MasterOrchestrator:
             )
 
             if not result.tool_calls:
+                if last_recoverable_error:
+                    self._log("LLM 未按要求修复可恢复错误，继续引导", "warning")
+                    error_code = last_recoverable_error.get("error_code", "")
+                    await orchestrator.message_manager.add_user_message(
+                        "上轮工具返回可恢复错误，必须按 required_next_actions 修复后再继续规划。"
+                        f"错误码: {error_code}。"
+                    )
+                    continue
                 self._log("LLM 未调用 plan_tasks，使用默认规划", "warning")
                 break
 
@@ -160,14 +211,23 @@ class MasterOrchestrator:
                     self._log(f"执行 Tool: {tool_name}")
                     try:
                         result_data = await orchestrator._execute_tool(tool_name, tool_args)
-                        content = result_data if isinstance(result_data, str) else json.dumps(result_data, ensure_ascii=False)
+                        content, summary = self._normalize_tool_output(result_data)
                         await orchestrator.message_manager.add_tool_message(
                             content=content,
+                            summary=summary,
                             tool_name=tool_name,
                             tool_call_id=tool_id,
                         )
-                        self._log("规划完成", "success")
-                        planned = True
+                        last_recoverable_error = _extract_recoverable_error(content)
+                        planned_workflows = None
+                        if getattr(orchestrator, "tools_manager", None):
+                            planned_workflows = orchestrator.tools_manager.get_planned_workflows()
+                        if planned_workflows:
+                            self._log("规划完成", "success")
+                            planned = True
+                            last_recoverable_error = None
+                        else:
+                            self._log("规划未完成，等待修复后重试", "warning")
                     except Exception as e:
                         error_msg = f"规划失败: {str(e)}"
                         self._log(error_msg, "error")
@@ -205,12 +265,16 @@ class MasterOrchestrator:
                 self._log(f"执行 Tool: {tool_name}")
                 try:
                     result_data = await orchestrator._execute_tool(tool_name, tool_args)
-                    content = result_data if isinstance(result_data, str) else json.dumps(result_data, ensure_ascii=False)
+                    content, summary = self._normalize_tool_output(result_data)
                     await orchestrator.message_manager.add_tool_message(
                         content=content,
+                        summary=summary,
                         tool_name=tool_name,
                         tool_call_id=tool_id,
                     )
+                    recoverable = _extract_recoverable_error(content)
+                    if recoverable:
+                        last_recoverable_error = recoverable
                 except Exception as e:
                     error_msg = f"规划阶段工具调用失败: {str(e)}"
                     self._log(error_msg, "error")
@@ -226,11 +290,340 @@ class MasterOrchestrator:
 
         if not planned:
             self._log("LLM 未完成 plan_tasks 规划，使用默认规划", "warning")
+
+    def _load_task_list_manager(self) -> TaskListManager:
+        """加载任务列表管理器（从 session/tasks.md 读取）"""
+        tasks_file = self.session_dir / "tasks.md"
+        return TaskListManager(tasks_file=tasks_file)
+
+    def _needs_post_execution_review(self, task_manager: TaskListManager) -> bool:
+        """判断是否需要执行后回顾（未执行过 vuln_analysis 即触发）"""
+        tasks = task_manager.get_all_tasks()
+        if not tasks:
+            return False
+        vuln_tasks = [t for t in tasks if t.agent_type == "vuln_analysis"]
+        completed_vuln = [t for t in vuln_tasks if t.status == TaskStatus.COMPLETED]
+        return len(completed_vuln) == 0
+
+    def _collect_completed_code_explorer_summaries(
+        self,
+        tasks: List[Any],
+        max_items: int = 3,
+    ) -> List[str]:
+        """收集已完成 code_explorer 任务摘要，供回顾阶段复用。"""
+        summaries: List[str] = []
+        artifacts_dir = self.session_dir / "artifacts"
+        if not artifacts_dir.exists():
+            return summaries
+
+        completed_code = [
+            t for t in tasks
+            if t.agent_type == "code_explorer" and t.status == TaskStatus.COMPLETED
+        ]
+        for task in completed_code[:max_items]:
+            summary_path = artifacts_dir / f"{task.id}_output.summary.md"
+            if not summary_path.exists():
+                continue
+            try:
+                summary_text = summary_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if not summary_text:
+                continue
+            summaries.append(
+                "\n".join([
+                    f"### {task.id}",
+                    summary_text,
+                ])
+            )
+        return summaries
+
+    def _build_post_execution_review_prompt(
+        self,
+        tasks: List[Any],
+        workflows: List[Dict[str, Any]],
+    ) -> str:
+        """构建执行后回顾提示词（追加规划）"""
+        status_map = {
+            TaskStatus.PENDING: "待执行",
+            TaskStatus.IN_PROGRESS: "执行中",
+            TaskStatus.COMPLETED: "已完成",
+            TaskStatus.FAILED: "失败",
+        }
+
+        vuln_tasks = [t for t in tasks if t.agent_type == "vuln_analysis"]
+        code_tasks = [t for t in tasks if t.agent_type == "code_explorer"]
+        completed_vuln = [t for t in vuln_tasks if t.status == TaskStatus.COMPLETED]
+        completed_code = [t for t in code_tasks if t.status == TaskStatus.COMPLETED]
+
+        lines = [
+            "# 执行后回顾",
+            "",
+            "请评估是否需要追加漏洞挖掘任务。",
+            "若未执行过漏洞挖掘任务，必须追加 `vuln_analysis` 任务。",
+            "",
+            "## 任务统计",
+            "",
+            f"- 总任务数: {len(tasks)}",
+            f"- vuln_analysis 任务数: {len(vuln_tasks)}",
+            f"- 已完成 vuln_analysis: {len(completed_vuln)}",
+            f"- code_explorer 任务数: {len(code_tasks)}",
+            f"- 已完成 code_explorer: {len(completed_code)}",
+            "",
+            "## Workflow 列表",
+            "",
+        ]
+
+        for idx, wf in enumerate(workflows, 1):
+            lines.append(f"{idx}. {wf.get('workflow_name', 'Workflow')} (workflow_id={wf.get('workflow_id', '')})")
+
+        lines.extend([
+            "",
+            "## 任务列表",
+            "",
+        ])
+
+        for task in tasks:
+            status = status_map.get(task.status, task.status.value if hasattr(task.status, "value") else str(task.status))
+            lines.append(
+                f"- {task.id} | {task.agent_type or 'unknown'} | {status} | {task.description}"
+            )
+
+        code_summaries = self._collect_completed_code_explorer_summaries(tasks)
+        if code_summaries:
+            lines.extend([
+                "",
+                "## 已完成 code_explorer 摘要（优先复用）",
+                "",
+                "以下摘要来自已完成任务，请先据此追加 `vuln_analysis`，仅在函数标识符缺失时再调用 `delegate_task(code_explorer)`。",
+                "",
+            ])
+            for item in code_summaries:
+                lines.append(item)
+                lines.append("")
+
+        lines.extend([
+            "",
+            "## 追加规划要求",
+            "",
+            "1. 仅能使用 `append_tasks(workflows)` 追加任务，不能调用 `plan_tasks`。",
+            "2. 先复用已完成 `code_explorer` 输出；仅在缺少 function_identifier 时再使用 `delegate_task(agent_type=\"code_explorer\")` 获取标准标识符。",
+            "3. `vuln_analysis` 任务必须提供 `function_identifier` 与 `analysis_context`。",
+            "4. `analysis_context` 必须包含固定章节：目标函数、攻击者可控性、输入与边界约束、全局/状态/认证约束、风险操作与漏洞假设、可利用性前提、证据锚点、未知项与待验证。",
+            "5. 若 `analysis_context` 缺少可控性/边界约束/证据锚点，先补工具调用取证再追加任务。",
+            "6. 追加任务必须指定正确的 `workflow_id`（即 task_group）。",
+            "7. 只输出工具调用，不输出其他文本。",
+        ])
+
+        return "\n".join(lines)
+
+    def _get_post_execution_review_system_prompt(self) -> str:
+        """执行后回顾阶段系统提示词"""
+        return """# 角色定义
+
+你是一个执行后回顾规划器，目标是补齐漏洞挖掘闭环任务。
+你可以在内部思考，但不要输出思考过程。
+最终输出必须是工具调用。
+
+# 约束
+
+- 只允许追加任务：使用 `append_tasks(workflows)`。
+- 优先复用现有已完成 `code_explorer` 输出；仅在缺少 function_identifier 时才调用 `delegate_task(agent_type="code_explorer")`。
+- 追加的 `vuln_analysis` 必须提供 `function_identifier` 与 `analysis_context`。
+- `analysis_context` 必须包含以下章节（标题不可省略）：
+  - `## 目标函数`
+  - `## 攻击者可控性`
+  - `## 输入与边界约束`
+  - `## 全局/状态/认证约束`
+  - `## 风险操作与漏洞假设`
+  - `## 可利用性前提`
+  - `## 证据锚点`
+  - `## 未知项与待验证`
+- 质量门禁：若缺少可控性、边界约束或证据锚点，不得追加 `vuln_analysis`，应先补工具调用取证。
+- 禁止调用 `plan_tasks`。
+"""
+
+    async def _guide_post_execution_review(
+        self,
+        orchestrator: Any,
+        workflows: List[Dict[str, Any]],
+    ) -> bool:
+        """执行后回顾并尝试追加任务，返回是否追加成功"""
+        task_manager = self._load_task_list_manager()
+        tasks = task_manager.get_all_tasks()
+        if not tasks:
+            return False
+
+        prompt = self._build_post_execution_review_prompt(tasks, workflows)
+        await orchestrator.message_manager.add_user_message(prompt)
+
+        allowed_tools = {
+            "append_tasks",
+            "delegate_task",
+            "read_artifact",
+            "get_task_status",
+            "read_task_output",
+            "resolve_function_identifier",
+            "set_task_function_identifier",
+        }
+
+        def _extract_recoverable_error(content: str) -> Optional[Dict[str, Any]]:
+            if not content or "```json" not in content:
+                return None
+            try:
+                start = content.index("```json") + len("```json")
+                end = content.index("```", start)
+                raw = content[start:end].strip()
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and payload.get("recoverable") is True:
+                    return payload
+            except Exception:
+                return None
+            return None
+
+        max_rounds = 5
+        appended = False
+        last_recoverable_error: Optional[Dict[str, Any]] = None
+        total_before = len(tasks)
+
+        for _ in range(max_rounds):
+            assembled_messages = await orchestrator.context_assembler.build_messages(
+                system_prompt=self._get_post_execution_review_system_prompt(),
+            )
+
+            result = await orchestrator.llm_client_wrapper.atool_call(
+                messages=assembled_messages,
+                tools=orchestrator.tools,
+                system_prompt=None,
+            )
+
+            await orchestrator.message_manager.add_ai_message(
+                result.content or "",
+                tool_calls=result.tool_calls,
+            )
+
+            if not result.tool_calls:
+                if last_recoverable_error:
+                    await orchestrator.message_manager.add_user_message(
+                        "上轮工具返回可恢复错误，必须按 required_next_actions 修复后再继续追加。"
+                    )
+                    continue
+                break
+
+            for tool_call in result.tool_calls:
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                tool_id = tool_call.get("id", "")
+
+                if tool_name not in allowed_tools:
+                    error_msg = f"回顾阶段不支持调用 {tool_name}"
+                    error_content = json.dumps({"error": error_msg}, ensure_ascii=False)
+                    await orchestrator.message_manager.add_tool_message(
+                        content=error_content,
+                        tool_name=tool_name,
+                        tool_call_id=tool_id,
+                    )
+                    continue
+
+                if tool_name == "delegate_task" and tool_args.get("agent_type") != "code_explorer":
+                    error_msg = "回顾阶段仅允许 delegate_task(agent_type=\"code_explorer\")"
+                    error_content = json.dumps({"error": error_msg}, ensure_ascii=False)
+                    await orchestrator.message_manager.add_tool_message(
+                        content=error_content,
+                        tool_name=tool_name,
+                        tool_call_id=tool_id,
+                    )
+                    continue
+
+                try:
+                    result_data = await orchestrator._execute_tool(tool_name, tool_args)
+                    content, summary = self._normalize_tool_output(result_data)
+                    await orchestrator.message_manager.add_tool_message(
+                        content=content,
+                        summary=summary,
+                        tool_name=tool_name,
+                        tool_call_id=tool_id,
+                    )
+                    recoverable = _extract_recoverable_error(content)
+                    if recoverable:
+                        last_recoverable_error = recoverable
+                    if tool_name == "append_tasks":
+                        task_manager = self._load_task_list_manager()
+                        total_after = task_manager.get_statistics().get("total", 0)
+                        if total_after > total_before:
+                            appended = True
+                            total_before = total_after
+                except Exception as e:
+                    error_msg = f"回顾阶段工具调用失败: {str(e)}"
+                    error_content = json.dumps({"error": error_msg}, ensure_ascii=False)
+                    await orchestrator.message_manager.add_tool_message(
+                        content=error_content,
+                        tool_name=tool_name,
+                        tool_call_id=tool_id,
+                    )
+
+            if appended:
+                break
+
+        return appended
+
+    def _filter_workflows_with_pending_tasks(
+        self,
+        workflows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """筛选仍有待执行任务的 workflow 列表，并附加 pending 摘要。"""
+        task_manager = self._load_task_list_manager()
+        all_tasks = task_manager.get_all_tasks()
+        pending_by_group: Dict[str, List[Any]] = {}
+        for task in all_tasks:
+            if not task.task_group:
+                continue
+            if task.status not in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS):
+                continue
+            pending_by_group.setdefault(task.task_group, []).append(task)
+
+        if not pending_by_group:
+            return []
+
+        filtered: List[Dict[str, Any]] = []
+        for wf in workflows:
+            workflow_id = wf.get("workflow_id")
+            pending_tasks = pending_by_group.get(workflow_id, [])
+            if not pending_tasks:
+                continue
+            pending_preview = [t.description for t in pending_tasks[:3]]
+            pending_count = len(pending_tasks)
+            wf_copy = dict(wf)
+            wf_copy["_execution_phase"] = "post_review_append"
+            wf_copy["_pending_task_count"] = pending_count
+            wf_copy["_pending_task_preview"] = pending_preview
+            if pending_preview:
+                preview_text = "；".join(pending_preview)
+                wf_copy["_workflow_run_goal"] = (
+                    f"执行回顾阶段追加任务（待执行 {pending_count} 项）：{preview_text}"
+                )
+            else:
+                wf_copy["_workflow_run_goal"] = f"执行回顾阶段追加任务（待执行 {pending_count} 项）"
+            filtered.append(wf_copy)
+        return filtered
+
+    @staticmethod
+    def _merge_workflow_results(
+        base_results: List[Dict[str, Any]],
+        extra_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """合并 workflow 执行结果（以 workflow_id 为键覆盖）"""
+        merged = {item.get("workflow_id"): item for item in base_results if isinstance(item, dict)}
+        for item in extra_results:
+            if isinstance(item, dict):
+                merged[item.get("workflow_id")] = item
+        return list(merged.values())
     async def _execute_multi_workflows(
         self,
         workflows: List[Dict[str, Any]],
         engine: BaseStaticAnalysisEngine,
-        workflow_context: WorkflowContext
+        workflow_context: WorkflowContext,
+        execution_phase: str = "base",
     ) -> MasterOrchestratorResult:
         """执行多个独立的 workflow
 
@@ -246,40 +639,47 @@ class MasterOrchestrator:
         errors = []
 
         try:
-            # 1. 为每个 workflow 创建独立的 WorkflowAgent
-            self._log(f"创建 {len(workflows)} 个 WorkflowAgent...")
+            phase_label = "追加任务执行" if execution_phase == "post_review_append" else "常规执行"
+            # 1. 为每个 workflow 创建独立的 TaskExecutorAgent
+            self._log(f"[{phase_label}] 创建 {len(workflows)} 个 TaskExecutorAgent...")
             workflow_agents = []
 
             for wf in workflows:
-                # 创建独立的 WorkflowAgent
-                from .workflow_agent import WorkflowAgent
+                # 创建独立的 TaskExecutorAgent
+                from .task_executor_agent import TaskExecutorAgent
 
-                agent = WorkflowAgent(
-                    workflow_id=wf['workflow_id'],
+                agent = TaskExecutorAgent(
+                    task_group=wf['workflow_id'],
                     workflow_name=wf['workflow_name'],
-                    goal=wf.get('workflow_description', wf['workflow_name']),
-                    tasks=wf['tasks'],
+                    goal=wf.get("_workflow_run_goal", wf.get('workflow_description', wf['workflow_name'])),
                     llm_client=self.llm_client,
                     engine=engine,
                     session_dir=self.session_dir,
                     source_root=self.source_root,
                     verbose=self.verbose,
                     enable_logging=self.enable_logging,
+                    execution_phase=wf.get("_execution_phase", execution_phase),
                 )
 
                 workflow_agents.append((wf, agent))
-
-                self._log(f"  - 创建 WorkflowAgent: {wf['workflow_name']} (ID: {wf['workflow_id']})")
+                pending_count = wf.get("_pending_task_count")
+                if pending_count is not None:
+                    self._log(
+                        f"  - 创建 TaskExecutorAgent: {wf['workflow_name']} "
+                        f"(task_group: {wf['workflow_id']}, pending={pending_count})"
+                    )
+                else:
+                    self._log(f"  - 创建 TaskExecutorAgent: {wf['workflow_name']} (task_group: {wf['workflow_id']})")
 
             # 2. 根据执行模式执行
             execution_mode = workflows[0].get("execution_mode", "sequential") if workflows else "sequential"
-            self._log(f"执行模式: {execution_mode}")
+            self._log(f"[{phase_label}] 执行模式: {execution_mode}")
 
             if execution_mode == "parallel":
                 # 并行执行
-                self._log("并行执行所有 WorkflowAgent...")
+                self._log(f"[{phase_label}] 并行执行所有 TaskExecutorAgent...")
                 tasks = [
-                    agent.run()  # 调用 WorkflowAgent.run()
+                    agent.run()  # 调用 TaskExecutorAgent.run()
                     for wf, agent in workflow_agents
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -308,7 +708,7 @@ class MasterOrchestrator:
                     else:
                         # 将 WorkflowResult 转换为字典
                         workflow_results.append({
-                            "workflow_id": result.workflow_id,
+                            "workflow_id": result.task_group,
                             "workflow_name": result.workflow_name,
                             "success": result.success,
                             "completed_tasks": result.completed_tasks,
@@ -320,16 +720,23 @@ class MasterOrchestrator:
                         })
             else:
                 # 串行执行
-                self._log("串行执行所有 WorkflowAgent...")
+                self._log(f"[{phase_label}] 串行执行所有 TaskExecutorAgent...")
                 workflow_results = []
                 for wf, agent in workflow_agents:
-                    self._log(f"执行 Workflow: {wf['workflow_name']}")
+                    pending_count = wf.get("_pending_task_count")
+                    if pending_count is not None:
+                        self._log(
+                            f"[{phase_label}] 执行 Workflow: {wf['workflow_name']} "
+                            f"(task_group={wf.get('workflow_id')}, pending={pending_count})"
+                        )
+                    else:
+                        self._log(f"[{phase_label}] 执行 Workflow: {wf['workflow_name']}")
                     try:
-                        result = await agent.run()  # 调用 WorkflowAgent.run()
+                        result = await agent.run()  # 调用 TaskExecutorAgent.run()
                         
                         # 将 WorkflowResult 转换为字典
                         workflow_results.append({
-                            "workflow_id": result.workflow_id,
+                            "workflow_id": result.task_group,
                             "workflow_name": result.workflow_name,
                             "success": result.success,
                             "completed_tasks": result.completed_tasks,
@@ -380,7 +787,7 @@ class MasterOrchestrator:
             summary_file = self.session_dir / "multi_workflow_summary.md"
             summary_file.write_text(summary, encoding="utf-8")
 
-            self._log("所有 workflow 执行完成", "success")
+            self._log(f"[{phase_label}] 所有 workflow 执行完成", "success")
 
             return MasterOrchestratorResult(
                 success=completed_workflows == len(workflows),
@@ -440,7 +847,15 @@ class MasterOrchestrator:
                 "",
             ])
             for i, task in enumerate(workflow_info["tasks"], 1):
-                lines.append(f"{i}. {task}")
+                if isinstance(task, dict):
+                    desc = task.get("description", "")
+                    agent_type = task.get("agent_type")
+                    if agent_type:
+                        lines.append(f"{i}. [{agent_type}] {desc}")
+                    else:
+                        lines.append(f"{i}. {desc}")
+                else:
+                    lines.append(f"{i}. {task}")
             lines.append("")
         
         raw_markdown = "\n".join(lines)
@@ -492,7 +907,7 @@ class MasterOrchestrator:
                     break
 
                 # 组装上下文并调用 LLM
-                assembled_messages = orchestrator.context_assembler.build_messages(
+                assembled_messages = await orchestrator.context_assembler.build_messages(
                     system_prompt=orchestrator._get_simplified_system_prompt(),
                 )
 
@@ -529,14 +944,11 @@ class MasterOrchestrator:
                             self._log(f"Tool 错误: {result_data['error']}", "warning")
                             errors.append(f"{tool_name}: {result_data['error']}")
 
-                        # Tool 返回字符串时直接传递，其他类型序列化为 JSON
-                        if isinstance(result_data, str):
-                            content = result_data
-                        else:
-                            content = json.dumps(result_data, ensure_ascii=False)
+                        content, summary = self._normalize_tool_output(result_data)
 
                         await orchestrator.message_manager.add_tool_message(
                             content=content,
+                            summary=summary,
                             tool_name=tool_name,
                             tool_call_id=tool_id,
                         )
@@ -687,7 +1099,7 @@ class MasterOrchestrator:
                     break
                 
                 # 组装上下文并调用 LLM
-                assembled_messages = agent.context_assembler.build_messages(
+                assembled_messages = await agent.context_assembler.build_messages(
                     system_prompt=agent._get_simplified_system_prompt(),
                 )
                 
@@ -721,14 +1133,11 @@ class MasterOrchestrator:
                         if isinstance(result_data, dict) and result_data.get("error"):
                             errors.append(f"{tool_name}: {result_data['error']}")
                         
-                        # Tool 返回字符串时直接传递，其他类型序列化为 JSON
-                        if isinstance(result_data, str):
-                            content = result_data
-                        else:
-                            content = json.dumps(result_data, ensure_ascii=False)
+                        content, summary = self._normalize_tool_output(result_data)
                         
                         await agent.message_manager.add_tool_message(
                             content=content,
+                            summary=summary,
                             tool_name=tool_name,
                             tool_call_id=tool_id,
                         )
@@ -823,7 +1232,7 @@ class MasterOrchestrator:
                         break
 
                     # 组装上下文并调用 LLM
-                    assembled_messages = orchestrator.context_assembler.build_messages(
+                    assembled_messages = await orchestrator.context_assembler.build_messages(
                         system_prompt=orchestrator._get_simplified_system_prompt(),
                     )
 
@@ -860,14 +1269,11 @@ class MasterOrchestrator:
                                 self._log(f"Tool 错误: {result_data['error']}", "warning")
                                 errors.append(f"{tool_name}: {result_data['error']}")
 
-                            # Tool 返回字符串时直接传递，其他类型序列化为 JSON
-                            if isinstance(result_data, str):
-                                content = result_data
-                            else:
-                                content = json.dumps(result_data, ensure_ascii=False)
+                            content, summary = self._normalize_tool_output(result_data)
 
                             await orchestrator.message_manager.add_tool_message(
                                 content=content,
+                                summary=summary,
                                 tool_name=tool_name,
                                 tool_call_id=tool_id,
                             )
@@ -1028,7 +1434,7 @@ class MasterOrchestrator:
             else:
                 success = result.success
                 workflow_name = result.workflow_name
-                workflow_id = result.workflow_id
+                workflow_id = result.task_group
                 completed = result.completed_tasks
                 total = result.total_tasks
                 vulns = result.vulnerabilities_found
@@ -1057,114 +1463,7 @@ class MasterOrchestrator:
         Returns:
             规划 prompt 字符串
         """
-        lines = [
-            "# Workflow 规划任务",
-            "",
-            f"## 名称",
-            f"{workflow_context.name}",
-            "",
-            f"## 描述",
-            f"{workflow_context.description}",
-            "",
-        ]
-
-        if workflow_context.target and workflow_context.target.path:
-            lines.extend([
-                f"## 目标",
-                f"{workflow_context.target.path}",
-                "",
-            ])
-
-        if workflow_context.scope:
-            lines.extend([
-                f"## 分析范围",
-                f"{workflow_context.scope.description}",
-                "",
-            ])
-
-        if workflow_context.vulnerability_focus:
-            lines.extend([
-                f"## 漏洞关注点",
-                f"{workflow_context.vulnerability_focus}",
-                "",
-            ])
-
-        if workflow_context.background_knowledge:
-            lines.extend([
-                f"## 背景知识",
-                f"{workflow_context.background_knowledge}",
-                "",
-            ])
-
-        if workflow_context.raw_markdown:
-            lines.extend([
-                f"## 完整 Workflow 文档",
-                f"```markdown",
-                f"{workflow_context.raw_markdown}",
-                f"```",
-                "",
-            ])
-
-        lines.extend([
-            "## 你的任务",
-            "",
-            "分析上述 Workflow 文档，判断是否需要拆分为多个独立的子 workflow。",
-            "",
-            "### 判断标准",
-            "",
-            "使用**单 workflow 模式**的场景：",
-            "- 整个分析是一个连贯的流程",
-            "- 任务之间有明确的依赖关系",
-            "- 需要共享分析上下文",
-            "",
-            "使用**多 workflow 模式**的场景：",
-            "- 存在多个独立的分析目标（如多个组件、多个漏洞类型）",
-            "- 各个分析流程可以完全独立执行",
-            "- 可以并行执行以提高效率",
-            "",
-            "### 输出要求",
-            "",
-            "调用 `plan_tasks(workflows)` 工具进行规划。",
-            "若存在 vuln_analysis 且 function_identifier 未明确：先调用 `delegate_task(agent_type=\"code_explorer\")` 使用 `search_symbol` 获取标准标识符，再调用 `plan_tasks`。",
-            "",
-            "**单 workflow 示例**：",
-            "```json",
-            "{",
-            '    "workflows": [',
-            "        {",
-            '            "tasks": [',
-            '                "任务1描述",',
-            '                "任务2描述"',
-            "            ]",
-            "        }",
-            "    ]",
-            "}",
-            "```",
-            "",
-            "**多 workflow 示例**：",
-            "```json",
-            "{",
-            '    "workflows": [',
-            "        {",
-            '            "workflow_id": "wf_component_a",',
-            '            "workflow_name": "组件A分析",',
-            '            "workflow_description": "分析组件A的安全问题",',
-            '            "tasks": ["搜索组件A", "分析组件A的漏洞"]',
-            "        },",
-            "        {",
-            '            "workflow_id": "wf_component_b",',
-            '            "workflow_name": "组件B分析",',
-            '            "workflow_description": "分析组件B的安全问题",',
-            '            "tasks": ["搜索组件B", "分析组件B的漏洞"]',
-            "        }",
-            "    ]",
-            "}",
-            "```",
-            "",
-            "现在开始规划。",
-        ])
-
-        return "\n".join(lines)
+        return build_planning_user_prompt(workflow_context)
     
     def _get_planning_system_prompt(self) -> str:
         """获取规划阶段的 system prompt
@@ -1172,143 +1471,7 @@ class MasterOrchestrator:
         Returns:
             System prompt 字符串
         """
-        return """# 角色定义
-
-你是一个 Workflow 规划专家，负责分析漏洞挖掘 workflow 并决定执行策略。
-
-# 工作职责
-
-1. 分析 Workflow 文档，理解分析目标和要求
-2. 识别独立的分析目标（如不同的组件、不同的漏洞类型、不同的攻击面）
-3. 根据分析目标的独立性，决定是否拆分为多个 workflow
-4. 调用 `plan_tasks(workflows)` 工具进行规划
-5. **若存在 vuln_analysis 但 function_identifier 未明确：必须先调用 `delegate_task(agent_type="code_explorer", ...)`，要求使用 `search_symbol` 查找并返回标准标识符，然后再调用 `plan_tasks`**
-
-# 关于任务描述中的 Agent 类型标识
-
-任务描述可能包含 Agent 类型标识，格式为：`任务X（agent_type）：任务内容`
-
-常见的 Agent 类型：
-- `code_explorer`：代码搜索和探索任务
-- `vuln_analysis`：漏洞分析任务  
-- `function_summary`：函数摘要任务
-
-**重要**：Agent 类型标识只是说明该任务由哪个 agent 执行，**不是拆分 workflow 的依据**。
-
-一个完整的漏洞挖掘流程通常包含：
-1. 搜索阶段（code_explorer）：定位目标代码
-2. 分析阶段（vuln_analysis）：分析安全风险
-
-这两个阶段应该在同一个 workflow 中，因为它们针对同一个分析目标。
-
-# 判断标准
-
-## 单 Workflow 模式
-
-当满足以下条件时，使用单 workflow：
-- 整个分析针对单一的目标或漏洞类型
-- 任务之间有明确的依赖关系
-- 需要共享分析上下文
-- 分析流程是连贯的
-
-## 多 Workflow 模式
-
-当满足以下条件时，使用多 workflow：
-- 存在多个独立的分析目标（如多个组件、多个漏洞类型、多个攻击面）
-- 各个分析流程可以完全独立执行，互不依赖
-- 可以并行执行以提高效率
-- 每个子 workflow 有明确的边界
-
-# 拆分策略
-
-## 识别独立的分析目标
-
-通过分析任务内容，识别不同的分析目标。例如：
-- 任务1-3 都针对"组件A"的漏洞 → 分析目标1
-- 任务4-6 都针对"组件B"的漏洞 → 分析目标2
-- 任务7-9 都针对"漏洞类型X" → 分析目标3
-
-## 分组原则
-
-1. **按分析目标分组**：将针对同一分析目标的任务分到同一个 workflow
-2. **保持完整流程**：每个 workflow 应包含完整的"搜索 → 分析"流程
-3. **保持任务顺序**：同一 workflow 内的任务保持原有顺序
-4. **清理任务描述**：从任务描述中移除 Agent 类型标识，只保留任务内容
-
-## 示例
-
-### 输入任务列表：
-```
-任务1（code_explorer）：搜索所有网络请求处理函数
-任务2（vuln_analysis）：分析网络请求中的命令注入风险
-任务3（code_explorer）：搜索所有文件操作相关函数
-任务4（vuln_analysis）：分析文件操作中的路径遍历风险
-任务5（code_explorer）：搜索所有加密算法使用位置
-任务6（vuln_analysis）：分析加密实现的安全性
-```
-
-### 分析过程：
-- 任务1-2：针对"网络请求"的漏洞挖掘（搜索 + 分析）
-- 任务3-4：针对"文件操作"的漏洞挖掘（搜索 + 分析）
-- 任务5-6：针对"加密算法"的安全分析（搜索 + 分析）
-
-这是 3 个独立的分析目标，应该拆分为 3 个 workflow。
-
-### 输出（多 Workflow 模式）：
-```json
-{
-  "workflows": [
-    {
-      "workflow_id": "workflow_1",
-      "workflow_name": "网络请求安全分析",
-      "workflow_description": "分析网络请求处理中的命令注入风险",
-      "tasks": [
-        "搜索所有网络请求处理函数",
-        "分析网络请求中的命令注入风险"
-      ]
-    },
-    {
-      "workflow_id": "workflow_2",
-      "workflow_name": "文件操作安全分析",
-      "workflow_description": "分析文件操作中的路径遍历风险",
-      "tasks": [
-        "搜索所有文件操作相关函数",
-        "分析文件操作中的路径遍历风险"
-      ]
-    },
-    {
-      "workflow_id": "workflow_3",
-      "workflow_name": "加密算法安全分析",
-      "workflow_description": "分析加密实现的安全性",
-      "tasks": [
-        "搜索所有加密算法使用位置",
-        "分析加密实现的安全性"
-      ]
-    }
-  ]
-}
-```
-
-注意：
-- 每个 workflow 包含完整的"搜索 + 分析"流程
-- 任务描述中的 Agent 类型标识已被移除
-- 每个 workflow 有明确的分析目标
-
-# 规划原则
-
-1. **分析目标优先**：优先根据分析目标的独立性拆分 workflow
-2. **保持流程完整**：每个 workflow 应包含完整的分析流程
-3. **合理粒度**：每个子 workflow 应该有明确的目标和边界
-4. **任务清晰**：每个任务描述应该具体、可执行，移除 Agent 类型标识
-5. **避免过度拆分**：不要为了拆分而拆分，保持合理的粒度
-
-# 输出要求
-
-必须调用 `plan_tasks(workflows)` 工具，不要输出其他内容。
-若需要 function_identifier，可先调用 `delegate_task(agent_type="code_explorer")` 使用 `search_symbol` 验证获取，再在 plan_tasks 中原样填写。
-
-现在开始你的工作。
-"""
+        return build_master_planning_system_prompt()
 
     
     async def execute_workflow(self, workflow_path: str, target_path: str = None) -> MasterOrchestratorResult:
@@ -1396,16 +1559,61 @@ class MasterOrchestrator:
             self._log("引导 LLM 规划任务...")
             await self._guide_planning(orchestrator, self.workflow_context)
             
-            # 5. 检查规划结果，决定执行模式
-            if orchestrator.tools_manager.is_multi_workflow():
-                # 多 workflow 模式
-                workflows = orchestrator.tools_manager.get_planned_workflows()
-                self._log(f"检测到多 workflow 模式，共 {len(workflows)} 个 workflow")
-                return await self._execute_multi_workflows(workflows, self.engine, self.workflow_context)
-            else:
-                # 单 workflow 模式
-                self._log("检测到单 workflow 模式")
-                return await self._execute_single_workflow(orchestrator)
+            # 5. 获取规划结果并执行
+            workflows = orchestrator.tools_manager.get_planned_workflows()
+            if not workflows:
+                raise ValueError("未获取到 workflow 规划结果，无法执行。")
+
+            self._log(f"检测到 {len(workflows)} 个 workflow")
+            base_result = await self._execute_multi_workflows(workflows, self.engine, self.workflow_context)
+
+            # 执行后回顾（仅一次）：未执行过 vuln_analysis 则尝试追加任务
+            task_manager = self._load_task_list_manager()
+            if self._needs_post_execution_review(task_manager):
+                self._log("执行后回顾：未执行过漏洞挖掘任务，尝试追加规划", "warning")
+                appended = await self._guide_post_execution_review(orchestrator, workflows)
+                if appended:
+                    updated_workflows = orchestrator.tools_manager.get_planned_workflows() or workflows
+                    pending_workflows = self._filter_workflows_with_pending_tasks(updated_workflows)
+                    if pending_workflows:
+                        group_labels = [
+                            f"{wf.get('workflow_id')}({wf.get('_pending_task_count', 0)})"
+                            for wf in pending_workflows
+                        ]
+                        self._log(
+                            "执行后回顾追加任务：仅执行仍有待处理任务的 workflow -> "
+                            + ", ".join(group_labels)
+                        )
+                        followup_result = await self._execute_multi_workflows(
+                            pending_workflows,
+                            self.engine,
+                            self.workflow_context,
+                            execution_phase="post_review_append",
+                        )
+                        combined_results = self._merge_workflow_results(
+                            base_result.workflow_results,
+                            followup_result.workflow_results,
+                        )
+                        total_vulns = sum(r.get("vulnerabilities_found", 0) for r in combined_results)
+                        completed_workflows = sum(1 for r in combined_results if r.get("success", False))
+                        total_workflows = len(combined_results)
+                        combined_summary = self._generate_multi_workflow_summary(
+                            workflows=updated_workflows,
+                            workflow_results=combined_results,
+                            execution_time=base_result.execution_time + followup_result.execution_time,
+                        )
+                        return MasterOrchestratorResult(
+                            success=completed_workflows == total_workflows,
+                            total_workflows=total_workflows,
+                            completed_workflows=completed_workflows,
+                            total_vulnerabilities=total_vulns,
+                            execution_time=base_result.execution_time + followup_result.execution_time,
+                            summary=combined_summary,
+                            workflow_results=combined_results,
+                            errors=base_result.errors + followup_result.errors,
+                        )
+
+            return base_result
         
         except Exception as e:
             error_msg = f"执行失败: {str(e)}"
@@ -1425,6 +1633,7 @@ class MasterOrchestrator:
                 workflow_results=[],
                 errors=errors,
             )
+
     
     async def _identify_sub_workflows(self) -> List[SubWorkflowInfo]:
         """调用 LLM 识别子 workflow"""
@@ -1524,7 +1733,7 @@ class MasterOrchestrator:
     
     def _generate_master_summary(
         self,
-        workflow_results: List[WorkflowAgentResult],
+        workflow_results: List[Any],
         execution_time: float,
     ) -> str:
         """生成总体执行摘要"""
@@ -1548,7 +1757,7 @@ class MasterOrchestrator:
             lines.extend([
                 f"### {i}. {result.workflow_name} {status}",
                 "",
-                f"- Workflow ID: {result.workflow_id}",
+                f"- Task Group: {result.task_group}",
                 f"- 完成任务: {result.completed_tasks}/{result.total_tasks}",
                 "",
             ])

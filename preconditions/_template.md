@@ -1,7 +1,7 @@
 ---
 name: 配置名称
 description: 配置的简短描述
-target: 目标类型标识（如android_entry）
+target: 目标类型标识（如 gsp_message_handler, android_entry）
 version: "1.0"
 author: 配置作者
 taint_sources: []

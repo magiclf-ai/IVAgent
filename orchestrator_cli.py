@@ -14,6 +14,37 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import os
+
+
+def disable_system_proxy():
+    """
+    彻底禁用系统代理（清除所有相关环境变量）
+    覆盖大小写形式，适配不同操作系统的命名习惯
+    """
+    # 所有可能的代理环境变量（包含大小写，覆盖Windows/Linux/macOS）
+    proxy_env_vars = [
+        'HTTP_PROXY', 'HTTPS_PROXY', 'FTP_PROXY', 'SOCKS_PROXY',
+        'http_proxy', 'https_proxy', 'ftp_proxy', 'socks_proxy',
+        'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'
+    ]
+
+    # 逐个删除环境变量
+    for var in proxy_env_vars:
+        if var in os.environ:
+            del os.environ[var]
+            print(f"已清除系统代理环境变量: {var}")
+
+    # 验证是否清理干净
+    remaining_proxy_vars = [var for var in proxy_env_vars if var in os.environ]
+    if not remaining_proxy_vars:
+        print("✅ 所有系统代理环境变量已清除，系统代理已禁用")
+    else:
+        print(f"⚠️ 仍有未清除的代理变量: {remaining_proxy_vars}")
+
+
+disable_system_proxy()
+
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -50,6 +81,8 @@ def create_llm_client() -> ChatOpenAI:
         kwargs["api_key"] = api_key
     if base_url:
         kwargs["base_url"] = base_url
+
+    kwargs['default_headers'] = {"User-Agent": "Zed/0.211.6 (macos; x86_64)"}
 
     return ChatOpenAI(**kwargs)
 
@@ -102,6 +135,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 使用 Workflow 文档执行扫描（目标路径在 workflow 中指定）
+  python -m ivagent.orchestrator_cli --workflow workflows/nvidia_gsp_analysis.md
+  
+  # 通过参数指定引擎和目标路径
+  python -m ivagent.orchestrator_cli --workflow workflows/nvidia_gsp_analysis.md \\
+      --engine ida --target /path/to/target.sys
   
   # 源码分析模式
   python -m ivagent.orchestrator_cli --workflow workflows/android_sql_injection.md \\

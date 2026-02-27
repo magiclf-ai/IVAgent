@@ -20,7 +20,7 @@ class Precondition:
     """
     name: str                           # 条件名称/标识
     description: str                    # 条件描述
-    target: str = "generic"             # 适用目标类型
+    target: str = "generic"             # 适用目标类型，如 "ioctl_handler"
     
     # 文本化前置条件（直接追加到提示词）
     text_content: Optional[str] = None
@@ -102,9 +102,11 @@ class CallStackFrame:
     # 参数信息（调用时传递的参数）
     arguments: List[str] = field(default_factory=list)  # 参数表达式列表
     
-    # 参数约束信息（调用时的详细约束，纯文本格式）
-    # 格式: ["ptr != NULL", "0 < size <= 1024"]
-    argument_constraints: List[str] = field(default_factory=list)
+    # 参数约束信息（调用时的详细约束，纯文本格式，Markdown 列表）
+    argument_constraints: str = ""
+
+    # 全局/类变量约束（调用时新增的约束，纯文本格式，Markdown 列表）
+    global_constraints: str = ""
     
     # 额外元数据
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -119,6 +121,7 @@ class CallStackFrame:
             "caller_function": self.caller_function,
             "arguments": self.arguments,
             "argument_constraints": self.argument_constraints,
+            "global_constraints": self.global_constraints,
             "metadata": self.metadata,
         }
     
@@ -153,9 +156,11 @@ class FunctionContext:
     function_identifier: str            # 函数唯一标识符
     function_name: Optional[str] = None # 函数名
     
-    # 父函数传递的约束（纯文本格式）
-    # 格式: ["ptr != NULL", "0 < size <= 1024"]
-    parent_constraints: List[str] = field(default_factory=list)
+    # 父函数传递的约束（纯文本格式，Markdown 列表）
+    parent_constraints: str = ""
+
+    # 全局/类变量约束（纯文本格式，Markdown 列表，累加传递）
+    global_constraints: str = ""
     
     # 调用链 - 简单版本（函数签名列表）
     call_stack: List[str] = field(default_factory=list)
@@ -179,6 +184,7 @@ class FunctionContext:
             "function_identifier": self.function_identifier,
             "function_name": self.function_name,
             "parent_constraints": self.parent_constraints,
+            "global_constraints": self.global_constraints,
             "call_stack": self.call_stack,
             "call_stack_detailed": [frame.to_dict() for frame in self.call_stack_detailed],
             "depth": self.depth,

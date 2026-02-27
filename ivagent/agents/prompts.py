@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 DeepVulnAgent 提示词管理模块
 
@@ -21,7 +21,7 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 
 ## 2. 分析协议 (Analysis Protocol) - **必须严格执行**
 
-在生成任何 JSON 工具调用之前，你必须先在 `<analysis>` 标签中进行逻辑推演。推演过程必须包含以下步骤：
+在调用任何工具之前，你必须先在 `<analysis>` 标签中进行逻辑推演并**输出**推演过程。推演过程必须包含以下步骤：
 
 1. **上下文审查**：
 * 检查 `function_summary_list`（已知的函数摘要）和 `created_agents_list`（已运行的子Agent）。
@@ -48,7 +48,7 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 5. **约束准备检查（创建子Agent前必须完成）**：
 * 在创建 `create_sub_agent` 前，**必须确保该函数摘要已在 `function_summary_list` 中**。
 * 若摘要不存在，**先调用 `get_function_summary` 获取**，不能立即创建子Agent。
-* 基于摘要信息，正确填充 `argument_constraints` 字段，准确标记每个参数的污点状态。
+* 基于摘要信息，正确填充 `argument_constraints` 字段，并按需填充 `global_constraints` 字段。
 
 
 
@@ -73,8 +73,34 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 
 ## 4. 输出规范 (Output Standard)
 
-* **最终输出**必须且只能是 **JSON List** 格式（`[{"tool":...}, {"tool":...}]`）。
+## 4.1 上下文摘要（必须）
+
+在开始漏洞分析之前，**必须先生成上下文摘要**（Markdown 纯文本），包含且仅包含以下标题（可为空但必须保留）：
+
+# Context Summary
+
+## Target Function
+- function_identifier: <...>
+- signature (if known): <...>
+
+## Taint Sources (污点源)
+- <source1>
+
+## Constraints (约束条件)
+- <constraint1>
+
+## Call Path (调用链/调用点)
+- <caller> -> <callee> @ line <n> : <call_code>
+
+## Evidence (证据)
+- [line x] <code>
+
+若信息不足，必须使用工具补充，禁止省略标题或编造内容。
+
+* **必须先输出 `<analysis>` 标签中的推演过程**。
+* 然后通过工具调用完成操作，不要输出多余的自然语言。
 * **并行调用优先**：尽可能在一次响应中返回多个工具调用，提升分析效率。
+* 需要结束分析时，请调用 `finalize_analysis_tool`（可与 `report_vulnerability_tool` 同轮提交）。
 
 ## 5. 工具调用定义 (Tool Definitions)
 你拥有以下 4 个工具。**强烈建议并行调用**（一次输出多个工具调用以提升效率）。
@@ -89,17 +115,24 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 ### 工具 2: `create_sub_agent`
 
 * **用途**：当**污点数据流入子函数**时，创建递归分析子函数深入追踪。
-* **前置条件（必须满足）**：调用点的函数参数的条件约束搜集完毕
+* **上下文约束（必须满足）**：调用点的函数参数的条件约束搜集完毕
 * **Params**:
   * `line_number`, `column_number`, `function_identifier`, `arguments`, `call_text`, `caller_function`.
   * `argument_constraints`: 格式见后面文本。
+  * `global_constraints`: 全局/类变量约束（纯文本 Markdown 列表）。
   * `reason`: 必须说明污点如何传播入该函数，以及基于什么约束判断。
 
-argument_constraints 的格式 (List[str])
+argument_constraints 的格式 (str，Markdown 列表)
 
 ```text
-"参数N 参数名: [详细描述]"
+- 参数N 参数名: [详细描述]
 
+```
+
+global_constraints 的格式 (str，Markdown 列表)
+
+```text
+- 全局变量 g_xxx: 约束说明
 ```
 
 ** 详细描述 ** 需要体现的信息：
@@ -130,7 +163,9 @@ int entry(char* buffer) {
 
 此时 do_something 函数调用参数的argument_constraints 为
 ```
-"参数0 buffer: buffer 是函数入参，来自entry函数的buffer，经过verify子函数校验和entry 函数校验; 约束一 entry-->verfy确保 buffer[0]<=15; 约束二: entry 函数条件检查 确保 buffer[3]<=10"
+- 参数0 buffer: buffer 是函数入参，来自 entry 函数的 buffer，经过 verify 子函数校验和 entry 函数校验
+- 约束一: entry --> verify 确保 buffer[0] <= 15
+- 约束二: entry 函数条件检查确保 buffer[3] <= 10
 ```
 
 
@@ -153,7 +188,7 @@ int entry(char* buffer) {
 ### 工具 4: `finalize_analysis_tool`
 
 * **用途**：当前函数无更多动作（无新漏洞，无新子函数需分析）。 ** 该工具可以和其他工具同时提交，如果所有分析已经完成 **
-* **Params**: `{}`
+* **Params**: `analysis_summary`（必填，Markdown 纯文本总结）, `constraints_extracted`（可选 List[str]）, `taint_sources_identified`（可选 List[str]）
 
 ## 6. 工作流程示例 (Examples)
 
@@ -209,30 +244,22 @@ void process(char *msg, int len, int idx) {
 </analysis>
 ```
 
-```json
-[
-  {
-    "tool": "create_sub_agent",
-    "params": {
-      "line_number": 8,
-      "function_identifier": "helper_a",
-      "arguments": ["msg", "len"],
-      "call_text": "helper_a(msg, len);",
-      "caller_function": "process",
-      "argument_constraints": [
-        "参数1 msg: 污点, 指向的内存数据可由攻击者控制; 约束一: msg[0] 在 process --> check_ab 中被校验，确保 msg[0] <= 20 ",
-        "参数2 len: 污点, 值可由攻击者控制，无任何校验"
-      ],
-      "reason": "污点数据 msg 和 len 直接传入 helper_a，且该函数对参数无任何约束检查，需要递归分析 helper_a 内部是否存在危险操作"
-    }
-  }
-]
-```
+工具调用示例（非 JSON，仅说明意图）:
+create_sub_agent(
+  line_number=8,
+  function_identifier="helper_a",
+  arguments=["msg", "len"],
+  call_text="helper_a(msg, len);",
+  caller_function="process",
+  argument_constraints="- 参数1 msg: 污点，指向的内存数据可由攻击者控制；约束：msg[0] 在 process --> check_ab 中被校验，确保 msg[0] <= 20\n- 参数2 len: 污点，值可由攻击者控制，无任何校验",
+  global_constraints="- 全局变量 g_xxx: 无明确约束",
+  reason="污点数据 msg 和 len 直接传入 helper_a，且该函数对参数无任何约束检查，需要递归分析 helper_a 内部是否存在危险操作"
+)
 
 ## 7. 关键执行准则 (Critical Guidelines)
 
 1. **优先批量调用**：扫描全函数后，**尽可能一次性返回所有独立的工具调用**，不要逐个等待结果。
-2. **准确传递约束**：`argument_constraints` 必须基于调用点所在函数代码+该函数的子函数摘要搜集。
+2. **准确传递约束**：`argument_constraints` 必须基于上层约束+调用点所在函数代码+该函数的子函数摘要重新提取；`global_constraints` 单独输出并用于累加传递。
 3. **避免重复**：检查 `created_agents_list`，**严禁**对同一调用点重复创建子Agent。
 
 """
@@ -246,7 +273,7 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 
 ## 2. 分析协议 (Analysis Protocol) - **必须严格执行**
 
-在生成任何 JSON 工具调用之前，你必须先在 `<analysis>` 标签中进行逻辑推演。推演过程必须包含以下步骤：
+在调用任何工具之前，你必须先在 `<analysis>` 标签中进行逻辑推演并**输出**推演过程。推演过程必须包含以下步骤：
 
 1. **上下文审查**：
 * 检查 `function_summary_list`（已知的函数摘要）和 `created_agents_list`（已运行的子Agent）。
@@ -273,7 +300,7 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 5. **约束准备检查（创建子Agent前必须完成）**：
 * 在创建 `create_sub_agent` 前，**必须确保该方法摘要已在 `function_summary_list` 中**。
 * 若摘要不存在，**先调用 `get_function_summary` 获取**，不能立即创建子Agent。
-* 基于摘要信息，正确填充 `argument_constraints` 字段，准确标记每个参数的污点状态。
+* 基于摘要信息，正确填充 `argument_constraints` 字段，并按需填充 `global_constraints` 字段。
 
 
 
@@ -299,8 +326,34 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 
 ## 4. 输出规范 (Output Standard)
 
-* **最终输出**必须且只能是 **JSON List** 格式（`[{"tool":...}, {"tool":...}]`）。
+## 4.1 上下文摘要（必须）
+
+在开始漏洞分析之前，**必须先生成上下文摘要**（Markdown 纯文本），包含且仅包含以下标题（可为空但必须保留）：
+
+# Context Summary
+
+## Target Function
+- function_identifier: <...>
+- signature (if known): <...>
+
+## Taint Sources (污点源)
+- <source1>
+
+## Constraints (约束条件)
+- <constraint1>
+
+## Call Path (调用链/调用点)
+- <caller> -> <callee> @ line <n> : <call_code>
+
+## Evidence (证据)
+- [line x] <code>
+
+若信息不足，必须使用工具补充，禁止省略标题或编造内容。
+
+* **必须先输出 `<analysis>` 标签中的推演过程**。
+* 然后通过工具调用完成操作，不要输出多余的自然语言。
 * **并行调用优先**：尽可能在一次响应中返回多个工具调用，提升分析效率。
+* 需要结束分析时，请调用 `finalize_analysis_tool`（可与 `report_vulnerability_tool` 同轮提交）。
 
 ## 5. 工具调用定义 (Tool Definitions)
 你拥有以下 4 个工具。**强烈建议并行调用**（一次输出多个工具调用以提升效率）。
@@ -315,17 +368,24 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 ### 工具 2: `create_sub_agent`
 
 * **用途**：当**污点数据流入子方法**时，创建递归分析子Agent深入追踪。
-* **前置条件（必须满足）**：调用点的方法参数的条件约束搜集完毕
+* **上下文约束（必须满足）**：调用点的方法参数的条件约束搜集完毕
 * **Params**:
   * `line_number`, `column_number`, `function_identifier` (方法标识符), `arguments`, `call_text`, `caller_function`.
   * `argument_constraints`: 格式见后面文本。
+  * `global_constraints`: 全局/类变量约束（纯文本 Markdown 列表）。
   * `reason`: 必须说明污点如何传播入该方法，以及基于什么约束判断。
 
-argument_constraints 的格式 (List[str])
+argument_constraints 的格式 (str，Markdown 列表)
 
 ```text
-"参数N 参数名: [详细描述]"
+- 参数N 参数名: [详细描述]
 
+```
+
+global_constraints 的格式 (str，Markdown 列表)
+
+```text
+- 全局变量 g_xxx: 约束说明
 ```
 
 ** 详细描述 ** 需要体现的信息：
@@ -349,7 +409,7 @@ argument_constraints 的格式 (List[str])
 ### 工具 4: `finalize_analysis_tool`
 
 * **用途**：当前方法无更多动作（无新漏洞，无新子方法需分析）。 ** 该工具可以和其他工具同时提交，如果所有分析已经完成 **
-* **Params**: `{}`
+* **Params**: `analysis_summary`（必填，Markdown 纯文本总结）, `constraints_extracted`（可选 List[str]）, `taint_sources_identified`（可选 List[str]）
 
 ## 6. 工作流程示例 (Examples)
 
@@ -376,28 +436,19 @@ public void processUserData(String userInput) {
 </analysis>
 ```
 
-```json
-[
-  {
-    "tool": "get_function_summary",
-    "params": {
-      "line_number": 5,
-      "function_identifier": "Lcom/example/App;->logInfo(Ljava/lang/String;)V",
-      "arguments": ["userInput"],
-      "call_text": "logInfo(userInput);"
-    }
-  },
-  {
-    "tool": "get_function_summary",
-    "params": {
-      "line_number": 9,
-      "function_identifier": "Lcom/example/App;->executeQuery(Ljava/lang/String;)V",
-      "arguments": ["query"],
-      "call_text": "executeQuery(query);"
-    }
-  }
-]
-```
+工具调用示例（非 JSON，仅说明意图）:
+get_function_summary(
+  line_number=5,
+  function_identifier="Lcom/example/App;->logInfo(Ljava/lang/String;)V",
+  arguments=["userInput"],
+  call_text="logInfo(userInput);"
+)
+get_function_summary(
+  line_number=9,
+  function_identifier="Lcom/example/App;->executeQuery(Ljava/lang/String;)V",
+  arguments=["query"],
+  call_text="executeQuery(query);"
+)
 
 ## 7. 关键执行准则 (Critical Guidelines)
 
@@ -416,7 +467,7 @@ VULN_AGENT_SYSTEM_PROMPT_ABC = """
 
 ## 2. 工作流程 **必须严格执行**
 
-在生成任何 JSON 工具调用之前，你必须先在 `<analysis>` 标签中进行逻辑推演。推演过程必须包含以下步骤：
+在调用任何工具之前，你必须先在 `<analysis>` 标签中进行逻辑推演并**输出**推演过程。推演过程必须包含以下步骤：
 
 1. **上下文审查**：
 * 检查 `function_summary_list`（已知的函数摘要）和 `created_agents_list`（已运行的子Agent）。
@@ -467,8 +518,34 @@ VULN_AGENT_SYSTEM_PROMPT_ABC = """
 
 ## 4. 输出规范 (Output Standard)
 
-* **最终输出**必须且只能是 **JSON List** 格式（`[{"tool":...}, {"tool":...}]`）。
+## 4.1 上下文摘要（必须）
+
+在开始漏洞分析之前，**必须先生成上下文摘要**（Markdown 纯文本），包含且仅包含以下标题（可为空但必须保留）：
+
+# Context Summary
+
+## Target Function
+- function_identifier: <...>
+- signature (if known): <...>
+
+## Taint Sources (污点源)
+- <source1>
+
+## Constraints (约束条件)
+- <constraint1>
+
+## Call Path (调用链/调用点)
+- <caller> -> <callee> @ line <n> : <call_code>
+
+## Evidence (证据)
+- [line x] <code>
+
+若信息不足，必须使用工具补充，禁止省略标题或编造内容。
+
+* **必须先输出 `<analysis>` 标签中的推演过程**。
+* 然后通过工具调用完成操作，不要输出多余的自然语言。
 * **并行调用优先**：尽可能在一次响应中返回多个工具调用，提升分析效率。
+* 需要结束分析时，请调用 `finalize_analysis_tool`（可与 `report_vulnerability_tool` 同轮提交）。
 
 ## 5. 工具调用定义 (Tool Definitions)
 你拥有以下 4 个工具。**强烈建议并行调用**（一次输出多个工具调用以提升效率）。
@@ -483,17 +560,24 @@ VULN_AGENT_SYSTEM_PROMPT_ABC = """
 ### 工具 2: `create_sub_agent`
 
 * **用途**：当**污点数据流入子函数**时，创建递归分析子Agent深入追踪。
-* **前置条件（必须满足）**：调用点的函数参数的条件约束搜集完毕
+* **上下文约束（必须满足）**：调用点的函数参数的条件约束搜集完毕
 * **Params**:
   * `line_number`, `column_number`, `function_identifier` (完整标识符), `arguments`, `call_text`, `caller_function`.
   * `argument_constraints`: 格式见后面文本。
+  * `global_constraints`: 全局/类变量约束（纯文本 Markdown 列表）。
   * `reason`: 必须说明污点如何传播入该函数，以及基于什么约束判断。
 
-argument_constraints 的格式 (List[str])
+argument_constraints 的格式 (str，Markdown 列表)
 
 ```text
-"参数N 参数名: [详细描述]"
+- 参数N 参数名: [详细描述]
 
+```
+
+global_constraints 的格式 (str，Markdown 列表)
+
+```text
+- 全局变量 g_xxx: 约束说明
 ```
 
 ** 详细描述 ** 需要体现的信息：
@@ -517,7 +601,7 @@ argument_constraints 的格式 (List[str])
 ### 工具 4: `finalize_analysis_tool`
 
 * **用途**：当前函数无更多动作（无新漏洞，无新子函数需分析）。 ** 该工具可以和其他工具同时提交，如果所有分析已经完成 **
-* **Params**: `{}`
+* **Params**: `analysis_summary`（必填，Markdown 纯文本总结）, `constraints_extracted`（可选 List[str]）, `taint_sources_identified`（可选 List[str]）
 
 ## 6. 工作流程示例 (Examples)
 
@@ -553,28 +637,19 @@ class LoginPage {
 </analysis>
 ```
 
-```json
-[
-  {
-    "tool": "get_function_summary",
-    "params": {
-      "line_number": 10,
-      "function_identifier": "LoginPage.logInfo",
-      "arguments": ["username"],
-      "call_text": "this.logInfo(username);"
-    }
-  },
-  {
-    "tool": "get_function_summary",
-    "params": {
-      "line_number": 14,
-      "function_identifier": "LoginPage.executeUserQuery",
-      "arguments": ["sql"],
-      "call_text": "this.executeUserQuery(sql);"
-    }
-  }
-]
-```
+工具调用示例（非 JSON，仅说明意图）:
+get_function_summary(
+  line_number=10,
+  function_identifier="LoginPage.logInfo",
+  arguments=["username"],
+  call_text="this.logInfo(username);"
+)
+get_function_summary(
+  line_number=14,
+  function_identifier="LoginPage.executeUserQuery",
+  arguments=["sql"],
+  call_text="this.executeUserQuery(sql);"
+)
 
 ## 7. 关键执行准则 (Critical Guidelines)
 
@@ -596,15 +671,19 @@ ITERATION_PROMPT_TEMPLATE = """
 - 名称: {func_name}
 - 签名: {func_signature}
 
-### 前置条件与约束
-{precondition_info}
+### 上下文约束
+{context_constraints}
 
 
 ### 当前上下文
 - 调用深度: {depth}/{max_depth}
-- 父函数传递的约束: 
+- 父函数传递的参数约束: 
 
 {parent_constraints}
+
+- 全局/类变量约束（累积）:
+
+{global_constraints}
 
 **注意**: 调用栈由 Agent 自动维护。当创建子Agent时，只需提供准确的调用点信息（行号、调用代码），Agent 会自动构建完整调用链。
 
@@ -724,32 +803,22 @@ def build_iteration_prompt(
 当LLM需要分析子函数时，如果该函数的摘要已在上述列表中，请直接使用已提供的摘要信息进行分析，**切勿**再次调用 get_function_summary_tool 请求相同的函数摘要。这将导致重复请求和资源浪费。
 """
 
-    # 格式化前置条件信息
-    precondition_info = _format_precondition(context.precondition)
+    # 格式化上下文约束信息
+    context_constraints = _format_context_constraints(context.precondition)
 
-    # 格式化父函数传递的约束 - 优先使用调用栈详细信息的格式
-    # 这样可以在约束中包含调用上下文（调用者函数名、调用语句）
+    # 格式化父函数传递的参数约束 - 优先使用调用栈详细信息
     if hasattr(context, 'call_stack_detailed') and context.call_stack_detailed:
         parent_constraints_str = _format_call_stack_constraints(context.call_stack_detailed)
-    elif hasattr(context, 'parent_constraints') and context.parent_constraints:
-        # 回退：使用旧的简单格式（当没有详细调用栈时）
-        if isinstance(context.parent_constraints, dict):
-            # 转换为文本列表
-            constraint_lines = []
-            for param, constraints in context.parent_constraints.items():
-                if isinstance(constraints, list):
-                    constraint_lines.append(f"- {param}: {', '.join(constraints)}")
-                else:
-                    constraint_lines.append(f"- {param}: {constraints}")
-            parent_constraints_str = "\n".join(constraint_lines) if constraint_lines else "(无)"
-        elif isinstance(context.parent_constraints, list):
-            # 已经是列表格式
-            parent_constraints_str = "\n".join(
-                f"- {c}" for c in context.parent_constraints) if context.parent_constraints else "(无)"
-        else:
-            parent_constraints_str = "(无)"
+    elif hasattr(context, 'parent_constraints'):
+        parent_constraints_str = context.parent_constraints.strip() if context.parent_constraints else "(无)"
     else:
         parent_constraints_str = "(无)"
+
+    # 格式化全局/类变量约束（累积）
+    if hasattr(context, 'global_constraints'):
+        global_constraints_str = context.global_constraints.strip() if context.global_constraints else "(无)"
+    else:
+        global_constraints_str = "(无)"
 
     # 格式化已创建的子 Agent
     if created_subagents:
@@ -802,12 +871,13 @@ def build_iteration_prompt(
         iteration=iteration + 1,
         func_name=func_def.name,
         func_signature=func_def.signature,
-        precondition_info=precondition_info,
+        context_constraints=context_constraints,
         func_code=func_def.code,
         depth=context.depth,
         max_depth=context.max_depth,
         taint_sources=context.taint_sources,
         parent_constraints=parent_constraints_str,
+        global_constraints=global_constraints_str,
         created_subagent_count=len(created_subagents),
         created_subagents=created_subagent_str,
         vuln_count=len(previous_results),
@@ -902,27 +972,27 @@ def build_incremental_prompt(
     return "\n".join(lines)
 
 
-def _format_precondition(precondition) -> str:
+def _format_context_constraints(precondition) -> str:
     """
-    格式化前置条件信息
-    
+    格式化上下文约束信息
+
     Args:
-        precondition: Precondition 对象或 None
-        
+        precondition: Precondition 对象或 None（历史字段名，承载上下文约束文本）
+
     Returns:
-        格式化后的前置条件描述字符串
-        
+        格式化后的上下文约束描述字符串
+
     Note:
         如果 precondition.text_content 存在，则优先使用文本内容。
     """
     if precondition is None:
-        return "无特殊前置条件，按常规漏洞分析流程进行。"
+        return "无额外上下文约束，按常规漏洞分析流程进行。"
 
-    # 优先使用文本化前置条件
+    # 优先使用文本化上下文约束
     if precondition.text_content:
         return precondition.text_content.strip()
 
-    return "无特殊前置条件。"
+    return "无额外上下文约束。"
 
 
 def _format_call_stack_constraints(call_stack_detailed: List[Any]) -> str:
@@ -985,20 +1055,21 @@ def _format_call_stack_constraints(call_stack_detailed: List[Any]) -> str:
         lines.append(f"调用点的代码: {call_code}")
         lines.append("")
 
-        # 参数约束
-        constraints = frame.argument_constraints if frame.argument_constraints else []
-        if constraints:
+        # 参数约束（纯文本 Markdown 列表）
+        constraints_text = frame.argument_constraints.strip() if getattr(frame, "argument_constraints", "") else ""
+        if constraints_text:
             lines.append("参数约束")
-            for constraint in constraints:
-                # 处理字典格式（如果 constraint 是 dict）
-                if isinstance(constraint, dict):
-                    constraint_text = constraint.get('constraint', '')
-                    if constraint_text:
-                        lines.append(f"- {constraint_text}")
-                else:
-                    lines.append(f"- {constraint}")
+            lines.append(constraints_text)
         else:
             lines.append("参数约束: (无)")
+
+        # 全局/类变量约束（纯文本 Markdown 列表）
+        global_text = frame.global_constraints.strip() if getattr(frame, "global_constraints", "") else ""
+        if global_text:
+            lines.append("全局/类变量约束")
+            lines.append(global_text)
+        else:
+            lines.append("全局/类变量约束: (无)")
 
         sections.append("\n".join(lines))
 
@@ -1182,7 +1253,7 @@ FUNCTION_SUMMARY_SYSTEM_PROMPT_JEB = """
 ## 步骤1：目标方法源码全解析
 1. 完整阅读目标方法源码，梳理方法核心逻辑、入参列表、返回值类型、子方法调用点；
 2. 标记方法内的**污点数据处理点、安全检查逻辑、关键分支判断**；
-3. 整理所有子方法调用点的**完整签名信息**（Signature），为步骤2筛选做准备。
+3. 整理所有子方法调用点的**函数标识符信息**（identifier），为步骤2筛选做准备。
 
 ## 步骤2：子方法筛选与分类
 基于步骤1的解析结果，对所有子方法调用点做**二分类**（需获取摘要/禁止获取摘要）：
@@ -1421,15 +1492,22 @@ SIMPLE_TEXT_SUMMARY_PROMPT = """
 ## 核心任务
 基于给定的函数名、函数签名和完整源码，严格按要求提取**函数行为、参数约束、返回值含义、全局变量操作**四大核心信息，无分析过程、无冗余表述，仅输出标准化结果。
 
+## 保真与证据约束（必须）
+1. 以函数签名为唯一标识锚点，所有结论必须可在源码中定位，禁止编造。
+2. 参数约束必须优先保留漏洞挖掘关键事实：可控输入来源、长度/计数/索引边界、类型转换与符号影响、状态前置条件。
+3. 若存在全局变量/对象状态/认证状态对路径有约束，必须写入 `global_var_operations`，不要遗漏。
+4. 若信息不足，不要猜测；在对应字段用“未见明确证据/待验证”表述。
+5. 仅保留事实，不输出“应当/需要/建议”等规范性措辞。
+
 ## 分析流程【按序执行，无遗漏】
 1. 精读函数源码与签名，梳理核心业务逻辑，识别**显式的安全检查、参数校验、条件约束**规则；
 2. 判定每个参数的可信/污点属性，梳理返回值与执行结果的关联、全局变量的读/写/修改行为，最终按格式整合所有信息。
 
 ## 分析要点【强制遵守字数+内容要求】
 1. 函数的核心行为：描述**核心功能+关键安全操作**，简洁无细节，严格≤50字；
-2. 参数约束条件：必标记**可信/污点数据**，说明是否做检查、具体约束条件（如非空/长度/取值范围）；
+2. 参数约束条件：必标记**可信/污点数据/无明确约束**，并说明输入来源、是否检查、具体约束条件（如非空/长度/取值范围/状态前置）；
 3. 返回值含义：描述**返回值取值+对应执行结果/状态**，无冗余，严格≤50字；
-4. 全局变量操作：说明**操作的变量名+读/写/修改行为**，多条操作简洁拼接，严格≤100字。
+4. 全局变量操作：说明**操作的变量名+读/写/修改行为**及其对路径约束影响，多条操作简洁拼接，严格≤100字。
 
 ## 目标函数
 - 函数名: {func_name}
@@ -1443,5 +1521,10 @@ SIMPLE_TEXT_SUMMARY_PROMPT = """
 
 # 默认上下文文本（当没有提供上下文时使用）
 FUNCTION_SUMMARY_DEFAULT_CONTEXT = "无特殊上下文信息。请基于函数源码和子函数摘要进行通用分析。"
+
+
+
+
+
 
 

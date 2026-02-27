@@ -1,0 +1,12 @@
+aiohttp
+fastapi
+flask
+langchain-core
+langchain-openai
+langgraph
+mcp
+pydantic
+redis
+requests
+uvicorn
+PyYAML

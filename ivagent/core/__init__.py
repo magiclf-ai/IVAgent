@@ -30,12 +30,16 @@ from .agent_logger import (
     AgentLogStorage,
 )
 
+from .summary_service import SummaryService
+
 from .context import (
     ArtifactStore,
     ArtifactReference,
     MessageManager,
     AgentMessage,
     ContextAssembler,
+    ContextCompressor,
+    ReadArtifactPruner,
 )
 
 __all__ = [
@@ -58,11 +62,14 @@ __all__ = [
     'AgentTaskLog',
     'AgentStatus',
     'AgentLogStorage',
+    'SummaryService',
     # 上下文管理
     'ArtifactStore',
     'ArtifactReference',
     'MessageManager',
     'AgentMessage',
     'ContextAssembler',
+    'ContextCompressor',
+    'ReadArtifactPruner',
 ]
 
