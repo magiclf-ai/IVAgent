@@ -29,6 +29,7 @@ from langchain_openai import ChatOpenAI
 from ..engines.base_langgraph_engine import LangGraphEngine, EngineConfig, AgentState
 from ..models.function import SimpleFunctionSummary
 from ..models.constraints import FunctionContext
+from ..core.cli_logger import CLILogger
 from .function_summary_agent import FunctionSummaryAgent
 
 
@@ -111,6 +112,7 @@ class ProgramAnalyzer:
         self.llm_client: ChatOpenAI = llm_client
         self.max_llm_retries = max_llm_retries
         self.verbose = verbose
+        self._logger = CLILogger(component=self.__class__.__name__, verbose=verbose)
 
         # 异步缓存
         self._summary_cache: Dict[str, SimpleFunctionSummary] = {}
@@ -121,8 +123,9 @@ class ProgramAnalyzer:
 
     def log(self, message: str, level: str = "INFO"):
         """打印日志"""
-        if self.verbose:
-            print(f"[{level}] {self.__class__.__name__}: {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="program_analyzer.event", message=message)
 
     def build_workflow(self):
         pass

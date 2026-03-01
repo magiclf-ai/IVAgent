@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 from flask import Flask, request, jsonify
 
 from ivagent.backends.ida.rpc.protocol import Request, Response, ErrorCode
+from ivagent.core.cli_logger import CLILogger
 
 # 复用 backends/ida/api 的能力
 from ivagent.backends.ida.api import (
@@ -55,6 +56,8 @@ class IDARPCServer:
         self._app = Flask(__name__)
         self._running = False
         self._idb_loaded = False
+        self._debug = False
+        self._logger = CLILogger(component="IDARPCServer", verbose=True)
 
         # 方法注册表
         self._methods: Dict[str, Callable] = {}
@@ -62,6 +65,13 @@ class IDARPCServer:
 
         # 注册路由
         self._setup_routes()
+
+    def _log_exception(self, event: str, exc: Exception) -> None:
+        self._logger.error(event, str(exc), error_type=type(exc).__name__)
+        if self._debug:
+            for line in traceback.format_exc().splitlines():
+                if line.strip():
+                    self._logger.debug("ida.rpc.traceback", line)
 
     def _setup_routes(self):
         """设置 Flask 路由"""
@@ -112,7 +122,7 @@ class IDARPCServer:
                 return jsonify(response.to_dict())
 
             except Exception as e:
-                traceback.print_exc()
+                self._log_exception("ida.rpc.endpoint_failed", e)
                 return jsonify(Response.error(
                     None, ErrorCode.INTERNAL_ERROR, str(e)
                 ).to_dict()), 500
@@ -133,7 +143,7 @@ class IDARPCServer:
                 return jsonify({"result": result})
 
             except Exception as e:
-                traceback.print_exc()
+                self._log_exception("ida.api.endpoint_failed", e)
                 return jsonify({"error": str(e)}), 500
 
     def _register_methods(self):
@@ -181,7 +191,7 @@ class IDARPCServer:
             result = method(**params)
             return Response.success(req_id, result)
         except Exception as e:
-            traceback.print_exc()
+            self._log_exception("ida.rpc.handle_request_failed", e)
             return Response.error(req_id, ErrorCode.INTERNAL_ERROR, str(e))
 
     def _load_idb(self) -> bool:
@@ -200,18 +210,17 @@ class IDARPCServer:
         try:
             idb_file = Path(self.idb_path)
             if not idb_file.exists():
-                print(f"[!] IDB file not found: {self.idb_path}")
+                self._logger.error("ida.rpc.idb_not_found", "IDB 文件不存在", path=self.idb_path)
                 return False
 
-            print(f"[*] Opening database: {self.idb_path}")
+            self._logger.info("ida.rpc.open_db", "打开数据库", path=self.idb_path)
             idapro.open_database(str(idb_file), run_auto_analysis=True)
             self._idb_loaded = True
-            print("[*] Database opened successfully")
+            self._logger.success("ida.rpc.db_opened", "数据库打开成功")
             return True
 
         except Exception as e:
-            print(f"[!] Failed to open database: {e}")
-            traceback.print_exc()
+            self._log_exception("ida.rpc.open_db_failed", e)
             return False
 
     def start(self, debug: bool = False) -> bool:
@@ -224,21 +233,17 @@ class IDARPCServer:
         返回:
             是否成功启动（实际阻塞直到服务器停止）
         """
+        self._debug = debug
         # 先加载 IDB（如果指定了）
         if self.idb_path and not self._load_idb():
-            print("[!] Failed to load IDB, server not started")
+            self._logger.error("ida.rpc.start_failed", "加载 IDB 失败，服务器未启动")
             return False
 
         try:
             self._running = True
-            print(f"[*] IDA RPC Server starting on http://{self.host}:{self.port}")
-            print(f"[*] Endpoints:")
-            print(f"    - GET  /           : Service info")
-            print(f"    - GET  /health     : Health check")
-            print(f"    - GET  /methods    : List available methods")
-            print(f"    - POST /rpc        : JSON-RPC endpoint")
-            print(f"    - POST /api/<name> : RESTful API endpoint")
-            print(f"[*] Press Ctrl+C to stop")
+            self._logger.success("ida.rpc.starting", "IDA RPC Server 启动", url=f"http://{self.host}:{self.port}")
+            self._logger.info("ida.rpc.endpoints", "可用端点", endpoints="/,/health,/methods,/rpc,/api/<name>")
+            self._logger.info("ida.rpc.stop_hint", "使用 Ctrl+C 停止服务")
 
             # 在主线程中运行 Flask（阻塞）
             self._app.run(
@@ -252,12 +257,11 @@ class IDARPCServer:
             return True
 
         except KeyboardInterrupt:
-            print("\n[*] Server stopped by user")
+            self._logger.info("ida.rpc.stopped_by_user", "用户中断，服务停止")
             self._running = False
             return True
         except Exception as e:
-            print(f"[!] Failed to start server: {e}")
-            traceback.print_exc()
+            self._log_exception("ida.rpc.start_exception", e)
             return False
 
     def stop(self):
@@ -268,8 +272,8 @@ class IDARPCServer:
         通常通过 Ctrl+C 在主线程中中断
         """
         self._running = False
-        print("[*] IDA RPC Server stop requested")
-        print("[*] Note: Use Ctrl+C to stop the server cleanly")
+        self._logger.info("ida.rpc.stop_requested", "收到停止请求")
+        self._logger.info("ida.rpc.stop_note", "请使用 Ctrl+C 进行干净停止")
 
     # ============ RPC 方法实现 ============
     # 所有方法都复用 backends.ida.api 的能力

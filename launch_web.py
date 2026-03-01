@@ -9,31 +9,29 @@ import sys
 import subprocess
 from pathlib import Path
 
+from ivagent.core.cli_logger import CLILogger
 
-def check_dependencies():
+
+def check_dependencies(logger: CLILogger):
     """检查必要的依赖"""
     try:
         import fastapi
         import uvicorn
         import pydantic
-        print("✓ 依赖检查通过")
+        logger.success("deps.ok", "依赖检查通过")
         return True
     except ImportError as e:
-        print(f"✗ 缺少依赖: {e}")
-        print("\n请安装依赖:")
-        print("  pip install fastapi uvicorn pydantic")
+        logger.error("deps.missing", "缺少依赖", error=str(e))
+        logger.info("deps.install", "请安装依赖: pip install fastapi uvicorn pydantic")
         return False
 
 
 def main():
-    print("""
-╔══════════════════════════════════════════════════════════════╗
-║          IVAgent 智能漏洞挖掘系统                            ║
-╚══════════════════════════════════════════════════════════════╝
-""")
+    logger = CLILogger(component="launch_web", verbose=True)
+    logger.info("startup.banner", "IVAgent 智能漏洞挖掘系统")
     
     # 检查依赖
-    if not check_dependencies():
+    if not check_dependencies(logger):
         return 1
     
     # 获取 web 目录
@@ -41,11 +39,11 @@ def main():
     server_script = web_dir / "server.py"
     
     if not server_script.exists():
-        print(f"✗ 找不到服务器脚本: {server_script}")
+        logger.error("startup.missing_server", "找不到服务器脚本", path=server_script)
         return 1
     
     # 启动服务器
-    print("\n启动服务器...\n")
+    logger.info("startup.server", "启动服务器", script=server_script)
     args = [sys.executable, str(server_script)] + sys.argv[1:]
     return subprocess.call(args)
 

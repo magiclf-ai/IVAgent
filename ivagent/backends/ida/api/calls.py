@@ -11,6 +11,9 @@ import idautils
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
+from ivagent.core.cli_logger import CLILogger
+
+_logger = CLILogger(component="ida.api.calls", verbose=True)
 
 @dataclass
 class CallDetail:
@@ -83,7 +86,7 @@ def get_callees(function_identifier: str) -> List[CalleeInfo]:
                 ))
             return callees
     except Exception as e:
-        print(f"Decompilation failed: {e}")
+        _logger.warning("ida.api.decompile_failed", str(e))
         return []
 
 

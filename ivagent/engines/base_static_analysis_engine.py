@@ -13,6 +13,7 @@ from enum import Enum
 import asyncio
 
 from ..models.callsite import CallsiteInfo, ResolvedCallsite
+from ..core.cli_logger import CLILogger
 
 
 class TargetType(Enum):
@@ -26,7 +27,8 @@ class TargetType(Enum):
 @dataclass
 class FunctionDef:
     """函数定义信息"""
-    signature: str                          # 函数签名
+    function_identifier: str                # 函数唯一标识符（跨语言唯一锚点）
+    signature: str                          # 函数可读签名（用于展示）
     name: str                               # 函数名
     code: str                               # 函数代码/伪代码
     file_path: Optional[str] = None         # 文件路径
@@ -39,6 +41,7 @@ class FunctionDef:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
+            "function_identifier": self.function_identifier,
             "signature": self.signature,
             "name": self.name,
             "code": self.code,
@@ -152,7 +155,7 @@ class SymbolType(Enum):
 class SearchResult:
     """符号搜索结果"""
     name: str                               # 符号名
-    signature: str                          # 符号签名
+    identifier: str                         # 符号唯一标识符
     symbol_type: SymbolType                 # 符号类型
     file_path: Optional[str] = None         # 文件路径
     line: int = 0                           # 行号
@@ -163,7 +166,7 @@ class SearchResult:
         """转换为字典"""
         return {
             "name": self.name,
-            "signature": self.signature,
+            "function_identifier": self.identifier,
             "symbol_type": self.symbol_type.value,
             "file_path": self.file_path,
             "line": self.line,
@@ -186,6 +189,7 @@ class BaseStaticAnalysisEngine(ABC):
         max_concurrency: int = 10,
         source_root: Optional[str] = None,
         llm_client: Optional[Any] = None,
+        logger: Optional[CLILogger] = None,
     ):
         """
         初始化引擎
@@ -202,6 +206,11 @@ class BaseStaticAnalysisEngine(ABC):
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._llm_client = llm_client
         self._source_root = source_root
+        self._logger = logger or CLILogger(component=self.__class__.__name__)
+
+    def _log(self, message: str, level: str = "info", event: str = "engine.event", **fields: Any) -> None:
+        """统一引擎日志入口。"""
+        self._logger.log(level=level, event=event, message=message, **fields)
 
     @abstractmethod
     async def get_function_def(
@@ -391,7 +400,7 @@ class BaseStaticAnalysisEngine(ABC):
             self._initialized = True
             return True
         except Exception as e:
-            print(f"[-] Engine initialization failed: {e}")
+            self._log(str(e), "error", event="engine.initialize_failed")
             return False
     
     async def resolve_function_by_callsite(
@@ -401,10 +410,10 @@ class BaseStaticAnalysisEngine(ABC):
         caller_code: Optional[str] = None,
     ) -> Optional[str]:
         """
-        根据调用点信息解析函数签名
+        根据调用点信息解析函数标识符
         
         LLM 提供 callsite 信息（行号、列号、函数名等），引擎根据这些信息
-        定位到具体的函数调用点，并返回被调用函数的完整签名。
+        定位到具体的函数调用点，并返回被调用函数的唯一标识符。
         
         实现策略（Template Method）：
         1. 调用 _resolve_static_callsite 进行引擎特定的静态分析
@@ -416,12 +425,12 @@ class BaseStaticAnalysisEngine(ABC):
             caller_code: 调用者源代码（可选，用于 CallsiteAgent）
         
         返回:
-            被调用函数的完整签名，解析失败返回 None
+            被调用函数的唯一标识符，解析失败返回 None
         """
         # 1. 优先尝试静态分析
-        signature = await self._resolve_static_callsite(callsite, caller_identifier)
-        if signature:
-            return signature
+        function_identifier = await self._resolve_static_callsite(callsite, caller_identifier)
+        if function_identifier:
+            return function_identifier
 
         # 2. 如果静态分析失败，尝试使用 CallsiteAgent (如果已配置)
         if self._source_root and self._llm_client and caller_code:
@@ -457,7 +466,7 @@ class BaseStaticAnalysisEngine(ABC):
                     
             except Exception as e:
                 # 记录错误但不抛出，保持静默失败
-                print(f"[!] CallsiteAgent fallback failed: {e}")
+                self._log(str(e), "warning", event="engine.callsite_fallback_failed")
                 
         return None
 
@@ -468,14 +477,14 @@ class BaseStaticAnalysisEngine(ABC):
             caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
-        [子类实现] 静态分析：根据调用点信息解析函数签名
+        [子类实现] 静态分析：根据调用点信息解析函数标识符
         
         参数:
             callsite: 调用点信息
             caller_identifier: 调用者函数标识符
             
         返回:
-            解析后的函数签名，失败返回 None
+            解析后的函数标识符，失败返回 None
         """
         pass
     

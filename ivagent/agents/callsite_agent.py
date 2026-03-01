@@ -1,7 +1,6 @@
 import os
 import json
 import fnmatch
-import logging
 import subprocess
 import uuid
 from typing import List, Dict, Any, Optional, Union
@@ -12,8 +11,6 @@ from ivagent.agents.base import BaseAgent
 from ivagent.core.tool_llm_client import ToolBasedLLMClient
 from ivagent.core.agent_logger import get_agent_log_manager, AgentStatus
 from ivagent.models.callsite import CallsiteInfo, ResolvedCallsite
-
-logger = logging.getLogger(__name__)
 
 
 class CallsiteAgent(BaseAgent):
@@ -251,7 +248,7 @@ class CallsiteAgent(BaseAgent):
                 Call this when you have identified the candidates or determined it's impossible.
                 
                 Args:
-                    found_candidates: List of potential function signatures or names.
+                    found_candidates: List of potential function identifiers.
                     analysis_reasoning: Explanation of how you reached this conclusion.
                 """
                 nonlocal candidates, reasoning, resolved
@@ -273,7 +270,7 @@ class CallsiteAgent(BaseAgent):
                 break
 
             if not result.success:
-                logger.error(f"LLM call failed: {result.error}")
+                self.log(f"LLM call failed: {result.error}", "ERROR")
                 # 记录执行失败
                 self._agent_logger.log_execution_end(
                     agent_id=self.agent_id,
@@ -388,7 +385,7 @@ Read a specific range of lines from a file.
 
 ### 3. `finish_analysis(found_candidates: List[str], analysis_reasoning: str)`
 Complete the analysis by reporting results.
-- **found_candidates**: List of potential function signatures or names
+- **found_candidates**: List of potential function identifiers
 - **analysis_reasoning**: Explanation of how you reached this conclusion
 
 **Usage Guidelines:**
@@ -419,7 +416,7 @@ Complete the analysis by reporting results.
 
 ## Output Format
 When using `finish_analysis`:
-- `found_candidates`: List of fully qualified function signatures (e.g., `ClassName.methodName`, `namespace::functionName`)
+- `found_candidates`: List of fully qualified function identifiers (e.g., `ClassName.methodName`, `namespace::functionName`, `_Z...`, `Lpkg/Cls;->m(Args)Ret`)
 - `analysis_reasoning`: Step-by-step explanation of your analysis process
 
 ## Example Analysis (ArkTS)

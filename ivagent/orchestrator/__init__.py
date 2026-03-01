@@ -22,7 +22,6 @@ from .task_executor_agent import (
 from .master_orchestrator import (
     MasterOrchestrator,
     MasterOrchestratorResult,
-    SubWorkflowInfo,
     run_master_workflow,
 )
 
@@ -40,7 +39,6 @@ __all__ = [
     # Master Orchestrator (Multi-Workflow)
     'MasterOrchestrator',
     'MasterOrchestratorResult',
-    'SubWorkflowInfo',
     'run_master_workflow',
 ]
 

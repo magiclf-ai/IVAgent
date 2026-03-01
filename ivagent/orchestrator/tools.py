@@ -17,6 +17,7 @@ from pathlib import Path
 import uuid
 import json
 import asyncio
+import re
 
 from .agent_delegate import AgentDelegate
 from ..models.workflow import WorkflowContext
@@ -28,6 +29,7 @@ from ..agents.prompts import get_vuln_agent_system_prompt
 from ..core.context import ArtifactStore
 from ..core import SummaryService
 from ..core.tool_llm_client import ToolBasedLLMClient
+from ..core.cli_logger import CLILogger
 from langchain_core.messages import HumanMessage
 
 
@@ -74,6 +76,8 @@ class OrchestratorTools:
             max_vuln_concurrency: int = 3,
             summary_service: Optional[SummaryService] = None,
             tool_output_summary_threshold: int = 4000,
+            verbose: bool = True,
+            logger: Optional[CLILogger] = None,
     ):
 
         self.llm_client = llm_client
@@ -105,11 +109,14 @@ class OrchestratorTools:
         # 新设计的组件（简化的任务编排）
         self._session_id = session_id
         self._task_list_manager: Optional[Any] = None
-        self._file_manager: Optional[Any] = None
         self._agent_delegate: Optional[AgentDelegate] = None
+        self._message_manager: Optional[Any] = None
         self._verified_function_identifiers: Dict[str, set[str]] = {}
         self.max_vuln_concurrency = max(1, int(max_vuln_concurrency))
         self._recovery_lock_task_id: Optional[str] = None
+        self._claimant_id = f"claimant_{uuid.uuid4().hex[:8]}"
+        self.verbose = verbose
+        self._logger = logger or CLILogger(component="OrchestratorTools", verbose=verbose)
 
     def _set_recovery_lock(self, task_id: str) -> None:
         """锁定需要恢复的任务，避免执行阶段跳到其他任务。"""
@@ -130,25 +137,18 @@ class OrchestratorTools:
         task_group: Optional[str] = None,
     ) -> str:
         """生成恢复锁定态的错误提示。"""
-        group_hint = f", task_group=\"{task_group}\"" if task_group else ""
-        return (
-            self._format_recoverable_error(
-                error_code="RECOVERY_LOCK_ACTIVE",
-                message=f"存在未恢复的任务锁定：{task_id}，请先完成该任务的 function_identifier 绑定。",
-                payload={
-                    "task_id": task_id,
-                    "task_description": description,
-                    "required_next_actions": [
-                        "调用 resolve_function_identifier 获取由 search_symbol 验证的候选标识符",
-                        "调用 set_task_function_identifier 回填任务参数",
-                        "重新调用 execute_next_task(agent_type='vuln_analysis', task_group=...)",
-                    ],
-                },
-            )
-            + "\n\n请严格按以下步骤恢复：\n"
-            + f"1. resolve_function_identifier(task_id=\"{task_id}\", query_hint=\"{description}\")\n"
-            + f"2. set_task_function_identifier(task_id=\"{task_id}\", function_identifier=\"<从上一步候选中选择>\", source=\"search_symbol\")\n"
-            + f"3. execute_next_task(agent_type=\"vuln_analysis\"{group_hint})"
+        return self._format_recoverable_error(
+            error_code="RECOVERY_LOCK_ACTIVE",
+            message=f"存在未恢复的任务锁定：{task_id}，请先完成该任务的 function_identifier 绑定。",
+            payload={
+                "task_id": task_id,
+                "task_description": description,
+                "task_group": task_group or "",
+                "required_next_actions": [
+                    "先为锁定任务补齐并验证 function_identifier",
+                    "恢复后重试执行工具",
+                ],
+            },
         )
 
     # ==================== 内部方法 ====================
@@ -166,6 +166,13 @@ class OrchestratorTools:
                 continue
         return max_num + 1
 
+    def _build_artifact_summary(self, text: str, max_chars: int = 220) -> str:
+        """生成简短摘要，供 Artifact 元数据使用。"""
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max_chars - 3] + "..."
+
     def _externalize_analysis_context(
         self,
         flat_tasks: List[Dict[str, Any]],
@@ -176,9 +183,9 @@ class OrchestratorTools:
 
         说明：
             - 仅当 analysis_context 非空时生效
-            - 需要 FileManager 才能落盘
+            - 使用 ArtifactStore 统一落盘
         """
-        if not self._file_manager:
+        if not self.artifact_store:
             return
         for offset, task in enumerate(flat_tasks):
             raw_context = task.get("analysis_context")
@@ -188,12 +195,20 @@ class OrchestratorTools:
             if not context_text:
                 continue
             task_id = f"task_{start_index + offset}"
-            file_path = self._file_manager.get_artifact_path(
+            artifact = self.artifact_store.put_text(
+                content=context_text,
+                kind="analysis_context",
+                summary=self._build_artifact_summary(context_text),
                 task_id=task_id,
-                artifact_name="analysis_context",
+                workflow_id=str(task.get("task_group") or ""),
+                producer="plan_tasks",
+                metadata={
+                    "kind": "analysis_context",
+                    "task_id": task_id,
+                    "task_group": str(task.get("task_group") or ""),
+                },
             )
-            self._file_manager.write_artifact(file_path, context_text)
-            task["analysis_context"] = file_path.name
+            task["analysis_context"] = artifact.artifact_id
 
     def _resolve_task_analysis_context(self, task: Any) -> str:
         """
@@ -205,11 +220,8 @@ class OrchestratorTools:
         value = getattr(task, "analysis_context", None)
         if not value:
             return ""
-        if not self._file_manager:
-            return str(value)
-        candidate = self._file_manager.artifacts_dir / str(value)
-        if candidate.exists():
-            return self._file_manager.read_artifact(candidate)
+        if self.artifact_store and self.artifact_store.exists(str(value)):
+            return self.artifact_store.read(str(value))
         return str(value)
 
     def _build_task_context(self, task: Any, additional_context: str) -> str:
@@ -222,23 +234,182 @@ class OrchestratorTools:
             return f"{analysis_context}\n\n{extra}"
         return analysis_context or extra
 
+    def _extract_artifact_id(self, ref: str) -> str:
+        """
+        解析 artifact 引用字符串，兼容 `[ARTIFACT_REF:xxx]` 与 `xxx`。
+        """
+        value = str(ref or "").strip()
+        if not value:
+            return ""
+        match = re.match(r"^\[ARTIFACT_REF:([A-Za-z0-9_\-]+)\]$", value)
+        if match:
+            return match.group(1)
+        return value
+
+    def _read_context_ref_text(self, context_ref: str) -> str:
+        """
+        读取上下文引用内容。
+
+        支持：
+        - ArtifactStore 的 artifact_id 或 `[ARTIFACT_REF:artifact_id]`
+        """
+        ref = self._extract_artifact_id(context_ref)
+        if not ref:
+            return ""
+
+        if self.artifact_store and self.artifact_store.exists(ref):
+            return self.artifact_store.read(ref)
+
+        return ""
+
+    def _merge_task_context(
+        self,
+        task: Any,
+        additional_context: str,
+        context_ref: str = "",
+    ) -> str:
+        """
+        合并任务上下文（analysis_context + context_ref + additional_context）。
+        """
+        base = self._build_task_context(task, additional_context)
+        from_ref = self._read_context_ref_text(context_ref).strip()
+        if from_ref and base:
+            return f"{from_ref}\n\n{base}"
+        return from_ref or base
+
+    def _resolve_selected_input_files(
+        self,
+        current_task_id: str,
+        task_group: Optional[str],
+        selected_file_ids: Optional[List[str]],
+    ) -> Tuple[List[str], List[str]]:
+        """
+        将 selected_file_ids 解析为实际输入 artifact_ref。
+        """
+        selected = []
+        seen: Set[str] = set()
+        for file_id in selected_file_ids or []:
+            normalized = str(file_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            selected.append(normalized)
+
+        if not selected:
+            return [], []
+
+        if not self.artifact_store:
+            return [], selected
+
+        resolved: List[str] = []
+        unresolved: List[str] = []
+
+        candidates = self._get_previous_task_outputs(current_task_id, task_group=task_group)
+        candidate_set = set(candidates)
+
+        for file_id in selected:
+            if file_id in candidate_set and self.artifact_store.exists(file_id):
+                resolved.append(file_id)
+                continue
+            if self.artifact_store.exists(file_id):
+                resolved.append(file_id)
+                continue
+            unresolved.append(file_id)
+
+        return resolved, unresolved
+
+    def _resolve_artifact_refs(
+        self,
+        artifact_refs: List[str],
+    ) -> Tuple[List[Dict[str, str]], List[str]]:
+        """
+        解析 artifact_refs，返回可读取条目与失败条目。
+        """
+        resolved: List[Dict[str, str]] = []
+        unresolved: List[str] = []
+
+        for raw_ref in artifact_refs or []:
+            ref = str(raw_ref or "").strip()
+            if not ref:
+                continue
+            artifact_id = self._extract_artifact_id(ref)
+            if not artifact_id:
+                unresolved.append(ref)
+                continue
+
+            if self.artifact_store and self.artifact_store.exists(artifact_id):
+                content = self.artifact_store.read(artifact_id)
+                resolved.append(
+                    {
+                        "ref": ref,
+                        "source": "artifact_store",
+                        "id": artifact_id,
+                        "content": content,
+                    }
+                )
+                continue
+
+            unresolved.append(ref)
+
+        return resolved, unresolved
+
+    def _ensure_agent_delegate(self) -> Optional[str]:
+        """
+        确保 AgentDelegate 可用，失败时返回错误文本。
+        """
+        if self._agent_delegate:
+            return None
+        if not self.engine:
+            return "[错误] 引擎未初始化，无法创建 AgentDelegate。请先初始化引擎并重新初始化 Orchestrator。"
+        if not self.llm_client:
+            return "[错误] LLM 客户端未初始化，无法创建 AgentDelegate。"
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化，无法创建 AgentDelegate。"
+        from .agent_delegate import AgentDelegate
+        self._agent_delegate = AgentDelegate(
+            engine=self.engine,
+            llm_client=self.llm_client,
+            artifact_store=self.artifact_store,
+            verbose=self.verbose,
+        )
+        return None
+
     def _format_recoverable_error(
         self,
         error_code: str,
         message: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """统一生成可恢复错误响应，方便 LLM 按步骤自愈。"""
-        body = {"error_code": error_code, "recoverable": True}
+        """统一生成可恢复错误响应（纯文本 Markdown）。"""
+        lines = [f"[错误] {error_code}: {message}"]
         if payload:
-            body.update(payload)
-        pretty_json = json.dumps(body, ensure_ascii=False, indent=2)
-        return (
-            f"[错误] {message}\n\n"
-            "```json\n"
-            f"{pretty_json}\n"
-            "```"
-        )
+            task_id = str(payload.get("task_id", "") or "").strip()
+            if task_id:
+                lines.append(f"- task_id: `{task_id}`")
+            task_group = str(payload.get("task_group", "") or "").strip()
+            if task_group:
+                lines.append(f"- task_group: `{task_group}`")
+            task_description = str(payload.get("task_description", "") or "").strip()
+            if task_description:
+                lines.append(f"- task_description: {task_description}")
+            task_status = str(payload.get("task_status", "") or "").strip()
+            if task_status:
+                lines.append(f"- task_status: `{task_status}`")
+            artifact_ref = str(payload.get("artifact_ref", "") or "").strip()
+            if artifact_ref:
+                lines.append(f"- artifact_ref: `{artifact_ref}`")
+            task_groups = payload.get("task_groups")
+            if isinstance(task_groups, list) and task_groups:
+                lines.append(f"- task_groups: {', '.join(str(x) for x in task_groups)}")
+            missing_sections = payload.get("missing_sections")
+            if isinstance(missing_sections, list) and missing_sections:
+                lines.append(f"- missing_sections: {', '.join(str(x) for x in missing_sections)}")
+
+            actions = payload.get("required_next_actions")
+            if isinstance(actions, list) and actions:
+                lines.extend(["", "建议操作："])
+                lines.extend([f"- {str(action)}" for action in actions[:5]])
+        return "\n".join(lines)
 
     def _get_summary_service(self) -> Optional[SummaryService]:
         """获取用于工具输出摘要的 SummaryService（必要时惰性创建）。"""
@@ -266,13 +437,13 @@ class OrchestratorTools:
 
         说明:
             - 仅在输出超长时摘要
-            - 对可恢复错误输出保持原文，避免丢失修复步骤
+            - 对错误输出保持原文，避免丢失关键信息
         """
         if not content:
             return False
         if self.tool_output_summary_threshold <= 0:
             return False
-        if '"recoverable": true' in content or '"recoverable":true' in content:
+        if content.lstrip().startswith("[错误]"):
             return False
         return len(content) > self.tool_output_summary_threshold
 
@@ -296,6 +467,15 @@ class OrchestratorTools:
         if not summary:
             return content
         return {"content": content, "summary": summary}
+
+    @staticmethod
+    def _build_neutral_vuln_task_description(function_identifier: str, fallback: str = "") -> str:
+        """构造中性的 vuln_analysis 任务描述，避免预设具体漏洞类型。"""
+        fid = str(function_identifier or "").strip()
+        if fid:
+            return f"挖掘 {fid} 中的漏洞"
+        normalized_fallback = str(fallback or "").strip()
+        return normalized_fallback or "执行漏洞挖掘任务"
 
     async def _validate_and_normalize_workflows(
         self,
@@ -403,6 +583,10 @@ class OrchestratorTools:
                         analysis_context = str(analysis_context)
 
                     if agent_type == "vuln_analysis":
+                        description = self._build_neutral_vuln_task_description(
+                            function_identifier=function_identifier,
+                            fallback=description,
+                        )
                         if verify_function_identifier:
                             if not self.engine:
                                 return None, self._format_recoverable_error(
@@ -460,8 +644,38 @@ class OrchestratorTools:
                                     "task_index": j,
                                     "task_description": description,
                                     "required_next_actions": [
-                                        "调用 delegate_task(agent_type='code_explorer') 获取目标函数的入参约束/全局约束/风险点",
+                                        "调用 delegate_task(agent_type='code_explorer') 获取参数级入参约束（来源/可控性/污点/边界/校验）与全局变量约束/证据锚点",
                                         "将上述信息写入该 vuln_analysis 任务的 analysis_context（纯文本）",
+                                        "重新调用 plan_tasks(workflows)",
+                                    ],
+                                },
+                            ), verified
+                        required_sections = [
+                            "## 目标函数",
+                            "## 入参约束",
+                            "## 全局变量约束",
+                            "## 证据锚点",
+                        ]
+                        missing_sections = [
+                            section for section in required_sections
+                            if section not in analysis_context
+                        ]
+                        if missing_sections:
+                            missing_text = "、".join(missing_sections)
+                            return None, self._format_recoverable_error(
+                                error_code="MISSING_ANALYSIS_CONTEXT_SECTIONS_IN_PLAN",
+                                message=(
+                                    f"workflow[{i}] 的 tasks[{j}] analysis_context 缺少必需章节："
+                                    f"{missing_text}"
+                                ),
+                                payload={
+                                    "workflow_index": i,
+                                    "task_index": j,
+                                    "task_description": description,
+                                    "missing_sections": missing_sections,
+                                    "required_next_actions": [
+                                        "调用 delegate_task(agent_type='code_explorer') 重新抽取目标函数参数级约束",
+                                        "按固定章节写入 analysis_context：目标函数/入参约束（逐参数：来源/可控性/污点/边界/校验/证据）/全局变量约束/证据锚点",
                                         "重新调用 plan_tasks(workflows)",
                                     ],
                                 },
@@ -493,9 +707,9 @@ class OrchestratorTools:
             return False
 
         for item in results or []:
-            signature = (getattr(item, "signature", "") or "").strip()
+            function_identifier = (getattr(item, "identifier", "") or "").strip()
             name = (getattr(item, "name", "") or "").strip()
-            if signature == normalized or name == normalized:
+            if function_identifier == normalized or name == normalized:
                 return True
         return False
 
@@ -526,7 +740,8 @@ class OrchestratorTools:
                 target_path=target,
                 source_root=src_root,
                 max_concurrency=10,
-                llm_client=self.llm_client
+                llm_client=self.llm_client,
+                logger=self._logger,
             )
 
             # 异步初始化
@@ -550,6 +765,10 @@ class OrchestratorTools:
         """设置 ArtifactStore（用于 read_artifact 工具）"""
         self.artifact_store = artifact_store
 
+    def set_message_manager(self, message_manager: Any) -> None:
+        """设置 MessageManager（用于上下文压缩投影裁切）。"""
+        self._message_manager = message_manager
+
     def initialize_orchestrator_components(self, session_dir: Path) -> None:
         """初始化简化的任务编排组件（幂等）
         
@@ -557,13 +776,8 @@ class OrchestratorTools:
             session_dir: Session 目录路径（如 .ivagent/sessions/{session_id}）
         """
         from .task_list_manager import TaskListManager
-        from .file_manager import FileManager
         from .agent_delegate import AgentDelegate
-        
-        # 初始化 FileManager（幂等）
-        if not self._file_manager:
-            self._file_manager = FileManager(session_dir=session_dir)
-        
+
         # 初始化 TaskListManager（幂等）
         if not self._task_list_manager:
             tasks_file = session_dir / "tasks.md"
@@ -574,7 +788,8 @@ class OrchestratorTools:
             self._agent_delegate = AgentDelegate(
                 engine=self.engine,
                 llm_client=self.llm_client,
-                file_manager=self._file_manager,
+                artifact_store=self.artifact_store,
+                verbose=self.verbose,
             )
 
     # ==================== Tool 定义 ====================
@@ -601,6 +816,56 @@ class OrchestratorTools:
         content = self.artifact_store.read(artifact_id, offset=offset, limit=limit)
         return await self._maybe_pack_tool_output("read_artifact", content)
 
+    async def mark_compression_projection(
+            self,
+            remove_message_ids: Optional[List[str]] = None,
+            fold_message_ids: Optional[List[str]] = None,
+            reason: str = "",
+    ) -> str:
+        """
+        提交上下文压缩前裁切清单（按 message_id，支持删除与折叠）。
+
+        参数:
+            remove_message_ids: 待删除消息 ID 列表（Message_xxx 或内部 message_id）
+            fold_message_ids: 待折叠消息 ID 列表（保留消息与 tool_call 链，仅替换正文为折叠占位）
+            reason: 裁切依据说明（Markdown 纯文本）
+
+        返回:
+            Markdown 纯文本确认信息。
+        """
+        if not self._message_manager:
+            return "[错误] MessageManager 未初始化，无法提交压缩裁切清单。"
+
+        payload = self._message_manager.mark_compression_projection(
+            remove_message_ids=remove_message_ids,
+            fold_message_ids=fold_message_ids,
+            reason=reason,
+        )
+        accepted_remove = payload.get("accepted_remove_message_ids") or []
+        accepted_remove = [str(mid) for mid in accepted_remove if str(mid or "").strip()]
+        accepted_fold = payload.get("accepted_fold_message_ids") or []
+        accepted_fold = [str(mid) for mid in accepted_fold if str(mid or "").strip()]
+        reason_text = str(payload.get("reason") or "").strip()
+
+        lines = [
+            "## Compression Projection Marked",
+            f"- remove_message_ids_count: {len(accepted_remove)}",
+            f"- fold_message_ids_count: {len(accepted_fold)}",
+            f"- reason: {reason_text or '无'}",
+        ]
+        if accepted_remove:
+            lines.append("- remove_message_ids:")
+            lines.extend([f"  - `{mid}`" for mid in accepted_remove])
+        else:
+            lines.append("- remove_message_ids: 无")
+        if accepted_fold:
+            lines.append("- fold_message_ids:")
+            lines.extend([f"  - `{mid}`" for mid in accepted_fold])
+        else:
+            lines.append("- fold_message_ids: 无")
+        lines.append("- 说明: 将在下一轮上下文压缩前应用该裁切清单（删除为精确删除；折叠会保留消息链路并替换为占位文本）。")
+        return "\n".join(lines)
+
     async def delegate_task(
             self,
             agent_type: str,
@@ -622,12 +887,12 @@ class OrchestratorTools:
             
             query: 任务描述（自然语言）
                 - 对于 code_explorer: "找到所有处理用户输入的函数"
-                - 对于 vuln_analysis: "分析 parse_request 函数的缓冲区溢出风险"
+                - 对于 vuln_analysis: "挖掘 parse_request 函数中的漏洞"
             
             context: 可选的上下文信息
                 - 约束、背景知识等
-                - 建议包含“上下文摘要”三部分：入参约束 / 全局约束 / 风险点
-                - 必须描述攻击者可控性与约束（输入来源、可控字段/指针、长度/计数约束、状态机/校验约束）
+                - 建议包含“上下文摘要”三部分：参数级入参约束 / 全局变量约束 / 证据锚点
+                - 规划阶段仅提供函数事实与约束，不做漏洞判定
             
             function_identifier: 函数唯一标识符（仅 vuln_analysis 使用）
                 - 如果提供，直接使用此标识符，不从 query 中提取
@@ -679,6 +944,9 @@ class OrchestratorTools:
                     if error:
                         return error
                     output = result.get("output", "") or ""
+                    summary = (result.get("summary") or "").strip()
+                    if summary:
+                        return {"content": output, "summary": summary}
                     return await self._maybe_pack_tool_output("delegate_task", output)
 
                 return await self._maybe_pack_tool_output("delegate_task", result or "")
@@ -699,9 +967,9 @@ class OrchestratorTools:
   # 从结果中获取: com.example.auth.PasswordProvider.query
   delegate_task(
       agent_type="vuln_analysis",
-      query="分析SQL注入漏洞",
+      query="挖掘该函数中的漏洞",
       function_identifier="com.example.auth.PasswordProvider.query",
-      context="参数来自用户输入，未验证"
+      context="参数与边界约束来自上游探索结果"
   )
 """
 
@@ -720,8 +988,9 @@ class OrchestratorTools:
                     llm_client=self.llm_client,
                     max_iterations=max_iterations,
                     max_depth=max_depth,
-                    verbose=True,
+                    verbose=self.verbose,
                     system_prompt=base_prompt,
+                    progress_logger=self._build_progress_logger(target_function_id),
                 )
 
                 agent_id = str(uuid.uuid4())[:8]
@@ -765,18 +1034,56 @@ class OrchestratorTools:
 
         except Exception as e:
             return f"[错误] Agent 执行失败: {str(e)}"
+
+    async def delegate_code_explorer(
+            self,
+            query: str,
+            context: Optional[str] = None,
+            max_iterations: int = 15,
+    ) -> Any:
+        """受限委托：仅允许调用 code_explorer 执行探索与取证。
+
+        说明：
+            - 该工具固定委托给 `code_explorer`，不允许指定其他 agent_type；
+            - 适用于执行阶段遇阻时补充事实证据；
+            - 返回保持为 Markdown 纯文本（必要时由摘要包装器返回 content/summary）。
+
+        参数:
+            query: 探索任务描述（自然语言）
+            context: 可选补充上下文（建议基于已获得证据）
+            max_iterations: 最大迭代次数
+
+        返回:
+            code_explorer 的执行结果
+        """
+        return await self.delegate_task(
+            agent_type="code_explorer",
+            query=query,
+            context=context,
+            max_iterations=max_iterations,
+        )
     
     def _log(self, message: str, level: str = "info"):
         """打印日志"""
-        prefix = "[OrchestratorTools]"
-        if level == "error":
-            print(f"  [X] {prefix} {message}")
-        elif level == "warning":
-            print(f"  [!] {prefix} {message}")
-        elif level == "success":
-            print(f"  [+] {prefix} {message}")
-        else:
-            print(f"  [*] {prefix} {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="tools.event", message=message)
+
+    def _build_progress_logger(self, function_identifier: str):
+        """构建 DeepVulnAgent 进度日志回调。"""
+        def _progress_logger(message: str, level: str = "info", kind: str = "trace", **extra_fields: Any):
+            if not self.verbose:
+                return
+            self._logger.log(
+                level=level,
+                event="tools.agent_progress",
+                message=message,
+                kind=kind,
+                function=function_identifier,
+                **extra_fields,
+            )
+
+        return _progress_logger
 
     def _format_vuln_result(
             self,
@@ -851,7 +1158,7 @@ class OrchestratorTools:
             analysis_context: 上下文约束描述，应包含：
                 - 函数标识符和参数信息
                 - 污点参数说明（哪些参数是受外部输入影响的）
-                - 目标漏洞类型（如缓冲区溢出、命令注入等）
+                - 外部输入到关键操作的约束与证据锚点
                 - 相关组件/模块背景
                 - 历史分析经验或前期发现的关键信息
             max_depth: 最大调用深度，默认 10
@@ -875,8 +1182,9 @@ class OrchestratorTools:
                 llm_client=self.llm_client,
                 max_iterations=10,
                 max_depth=max_depth,
-                verbose=True,
+                verbose=self.verbose,
                 system_prompt=base_prompt,
+                progress_logger=self._build_progress_logger(function_identifier),
             )
 
             agent_id = str(uuid.uuid4())[:8]
@@ -970,7 +1278,9 @@ class OrchestratorTools:
           - agent_type 为 vuln_analysis 时必须提供 function_identifier
           - function_identifier 必须来自 search_symbol 的验证结果，保持原样
           - function_identifier 必须是单个字符串，不允许列表/拼接；多函数分析需拆分任务
-          - analysis_context 为漏洞挖掘前置信息（纯文本）
+          - analysis_context 为漏洞挖掘前置信息（Markdown 纯文本）
+          - analysis_context 必须包含固定章节：目标函数 / 入参约束 / 全局变量约束 / 证据锚点
+          - `入参约束` 需要按参数逐条给出来源/可控性/污点/边界/校验/证据
 
         Args:
             workflows: Workflow 配置列表，缺失时返回可恢复错误提示
@@ -988,7 +1298,7 @@ class OrchestratorTools:
                     "  \"workflows\": [\n"
                     "    {\n"
                     "      \"workflow_id\": \"analysis_1\",\n"
-                    "      \"workflow_name\": \"SQL 注入分析\",\n"
+                    "      \"workflow_name\": \"RPC 处理链分析\",\n"
                     "      \"tasks\": [\n"
                     "        {\n"
                     "          \"description\": \"定位用户输入到数据库查询的路径\",\n"
@@ -1016,17 +1326,29 @@ class OrchestratorTools:
             self._is_multi_workflow = True
 
             # 4. 创建任务列表（多 workflow 展开为统一任务序列）
-            if not hasattr(self, '_task_list_manager') or not hasattr(self, '_file_manager'):
-                return "[错误] TaskListManager 或 FileManager 未初始化。请先初始化 Orchestrator。"
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。请先初始化 Orchestrator。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。请先初始化 Orchestrator。"
 
             flat_tasks = self._flatten_workflow_tasks(normalized)
             self._externalize_analysis_context(flat_tasks, start_index=1)
             self._clear_recovery_lock()
             self._verified_function_identifiers = {}
-            self._task_list_manager.create_tasks(flat_tasks)
+            create_stats = self._task_list_manager.create_tasks(flat_tasks)
 
             # 5. 返回多 workflow 摘要
-            return self._format_multi_workflow_summary(normalized)
+            summary = self._format_multi_workflow_summary(normalized)
+            added = int((create_stats or {}).get("added", len(flat_tasks)))
+            skipped = int((create_stats or {}).get("skipped_duplicates", 0))
+            return "\n".join([
+                summary,
+                "",
+                "## 入队统计",
+                "",
+                f"- 新增任务: {added}",
+                f"- 跳过重复: {skipped}",
+            ])
 
         except Exception as e:
             return f"[错误] 规划任务失败: {str(e)}"
@@ -1069,22 +1391,34 @@ class OrchestratorTools:
 
             self._planned_workflows = merged
 
-            if not hasattr(self, '_task_list_manager') or not hasattr(self, '_file_manager'):
-                return "[错误] TaskListManager 或 FileManager 未初始化。请先初始化 Orchestrator。"
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。请先初始化 Orchestrator。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。请先初始化 Orchestrator。"
 
             flat_tasks = self._flatten_workflow_tasks(normalized)
             start_index = self._get_next_task_index()
             self._externalize_analysis_context(flat_tasks, start_index=start_index)
-            self._task_list_manager.append_tasks(flat_tasks)
-
-            total_added = len(flat_tasks)
-            return "\n".join([
+            append_stats = self._task_list_manager.append_tasks(flat_tasks)
+            total_added = int((append_stats or {}).get("added", 0))
+            skipped = int((append_stats or {}).get("skipped_duplicates", 0))
+            content = "\n".join([
                 "# 任务追加完成",
                 "",
                 f"**追加任务数**: {total_added}",
+                f"**跳过重复**: {skipped}",
                 "",
-                "✅ 任务已追加到统一任务看板。",
+                "✅ 任务已按幂等语义追加到统一任务看板。",
             ])
+            return {
+                "content": content,
+                "summary": f"append_tasks: added={total_added}, skipped_duplicates={skipped}",
+                "meta": {
+                    "added_tasks": total_added,
+                    "skipped_duplicates": skipped,
+                    "deduplicated": True,
+                },
+            }
         except Exception as e:
             return f"[错误] 追加任务失败: {str(e)}"
 
@@ -1124,17 +1458,17 @@ class OrchestratorTools:
             results = await self.engine.search_symbol(query=query, options=options)
 
             candidate_rows = []
-            signatures: List[str] = []
+            function_identifiers: List[str] = []
             for item in results or []:
-                signature = (getattr(item, "signature", "") or "").strip()
+                function_identifier = (getattr(item, "identifier", "") or "").strip()
                 symbol_type = str(getattr(getattr(item, "symbol_type", None), "value", getattr(item, "symbol_type", "unknown")))
                 if symbol_type not in {"function", "method", "unknown"}:
                     continue
-                if not signature:
+                if not function_identifier:
                     continue
-                signatures.append(signature)
+                function_identifiers.append(function_identifier)
                 candidate_rows.append({
-                    "signature": signature,
+                    "function_identifier": function_identifier,
                     "name": getattr(item, "name", ""),
                     "type": symbol_type,
                     "file_path": getattr(item, "file_path", "") or "",
@@ -1142,22 +1476,22 @@ class OrchestratorTools:
                     "score": getattr(item, "match_score", 0.0),
                 })
 
-            dedup_signatures = list(dict.fromkeys(signatures))
-            self._verified_function_identifiers[task_id] = set(dedup_signatures)
+            dedup_function_identifiers = list(dict.fromkeys(function_identifiers))
+            self._verified_function_identifiers[task_id] = set(dedup_function_identifiers)
 
-            if not dedup_signatures:
+            if not dedup_function_identifiers:
                 return (
                     f"[错误] 未通过 search_symbol 找到可用函数标识符（task_id={task_id}, query={query}）。\n"
                     "请调整 query_hint 后重试 resolve_function_identifier。"
                 )
 
-            recommended = dedup_signatures[0]
+            recommended = dedup_function_identifiers[0]
             lines = [
                 "# function_identifier 解析结果",
                 "",
                 f"- 任务: `{task_id}`",
                 f"- 查询: `{query}`",
-                f"- 候选数量: {len(dedup_signatures)}",
+                f"- 候选数量: {len(dedup_function_identifiers)}",
                 f"- 推荐: `{recommended}`",
                 "",
                 "## 候选列表（来自 search_symbol）",
@@ -1165,7 +1499,7 @@ class OrchestratorTools:
             ]
             for idx, row in enumerate(candidate_rows[:10], 1):
                 lines.extend([
-                    f"{idx}. `{row['signature']}`",
+                    f"{idx}. `{row['function_identifier']}`",
                     f"   - type: {row['type']}, score: {row['score']}",
                     f"   - location: {row['file_path']}:{row['line']}",
                 ])
@@ -1174,7 +1508,7 @@ class OrchestratorTools:
                 "",
                 "## 下一步",
                 "",
-                "调用 `set_task_function_identifier` 写回任务参数，然后重试 `execute_next_task`。",
+                "调用 `set_task_function_identifier` 写回任务参数，然后重试执行工具。",
                 f"示例: set_task_function_identifier(task_id=\"{task_id}\", function_identifier=\"{recommended}\", source=\"search_symbol\")",
             ])
             content = "\n".join(lines)
@@ -1239,240 +1573,601 @@ class OrchestratorTools:
                 f"- function_identifier: `{normalized}`",
                 "- source: `search_symbol`",
                 "",
-                "请继续调用 `execute_next_task(agent_type=\"vuln_analysis\", task_group=...)`。",
+                "可直接重试 `execute_task`。",
+                "若执行提示上下文不足，再按需调用 `compose_task_context`。",
             ])
         except Exception as e:
             return f"[错误] set_task_function_identifier 失败: {str(e)}"
 
-    async def execute_next_task(
+    async def list_runnable_tasks(
         self,
-        agent_type: str,
-        additional_context: str = "",
         task_group: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ) -> Any:
-        """执行下一个待执行任务（自动处理所有细节）
-        
-        自动获取下一个待执行任务，读取前置任务的输出文件，生成输出文件路径，
-        调用 AgentDelegate 执行任务，更新任务状态，返回执行结果和完整任务列表。
-        
-        Args:
-            agent_type: Agent 类型，支持 code_explorer 用于代码探索和分析，或 vuln_analysis 用于漏洞挖掘分析
-            additional_context: 额外的上下文信息，如补充说明或约束条件
-            task_group: 任务分组标识（可选，建议显式提供）
-        
-        重要要求：
-            - 如果 agent_type 为 vuln_analysis，当前任务必须在 plan_tasks 阶段显式提供 function_identifier
-            - 所有任务必须显式提供 agent_type，否则执行阶段会返回可恢复错误
-
-        自动处理：
-            - 自动获取下一个待执行任务
-            - 自动读取前置任务的输出文件（如果有）
-            - 自动生成输出文件路径
-            - 自动更新任务状态
-            - 自动传递上下文给子 Agent
-        
-        Returns:
-            执行结果 + 完整任务列表状态；若输出超长，返回 {"content": "...", "summary": "..."}。
-            例如：
-            '''
-            ## 执行结果
-            
-            任务: task_1 - 分析攻击面
-            状态: 已完成
-            输出文件: artifacts/task_1_output.md
-            
-            关键发现:
-            - 找到 5 个对外暴露的函数
-            - 主要入口点: handle_request, process_input
-            
-            ---
-            
-            ## 当前任务列表
-            
-            - [x] task_1: 分析攻击面，找到所有对外暴露的函数
-            - [ ] task_2: 对攻击面函数进行漏洞挖掘
-            
-            总计: 2 个任务
-            已完成: 1 个
-            待执行: 1 个
-            '''
+        """
+        列出当前可执行任务及阻塞原因（Markdown 纯文本）。
         """
         try:
-            # 检查是否已初始化
-            if not self._task_list_manager or not self._file_manager:
-                return "[错误] TaskListManager 或 FileManager 未初始化。请先初始化 Orchestrator。"
-            
-            # 1. 确定 task_group（若存在多个分组则要求显式提供）
-            all_tasks = self._task_list_manager.get_all_tasks()
-            if task_group is None:
-                groups = {t.task_group for t in all_tasks if t.task_group}
-                if len(groups) > 1:
-                    return self._format_recoverable_error(
-                        error_code="MISSING_TASK_GROUP",
-                        message="存在多个 task_group，必须显式指定 task_group 才能执行任务。",
-                        payload={
-                            "task_groups": sorted(groups),
-                            "required_next_actions": [
-                                "调用 get_task_status(task_group=...) 查看对应任务列表",
-                                "在 execute_next_task 中显式传入 task_group",
-                            ],
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。"
+
+            items = self._task_list_manager.list_tasks_with_runnable(
+                task_group=task_group,
+                agent_type=agent_type,
+            )
+            if not items:
+                group_info = f"(task_group={task_group})" if task_group else ""
+                return f"# Runnable 任务列表\n\n（无任务{group_info}）"
+
+            runnable_count = sum(1 for item in items if item.get("runnable"))
+            blocked_count = len(items) - runnable_count
+
+            lines = [
+                "# Runnable 任务列表",
+                "",
+                f"- task_group: `{task_group}`" if task_group else "- task_group: `<default>`",
+                f"- agent_type_filter: `{agent_type}`" if agent_type else "- agent_type_filter: `<none>`",
+                f"- runnable: {runnable_count}",
+                f"- blocked: {blocked_count}",
+                "",
+                "## 任务明细",
+                "",
+            ]
+
+            for idx, item in enumerate(items, 1):
+                task = item["task"]
+                runnable = bool(item.get("runnable"))
+                reason = str(item.get("reason") or "")
+                state = str(getattr(getattr(task, "status", None), "value", getattr(task, "status", "")))
+                prefix = "✅" if runnable else "⛔"
+                lines.extend(
+                    [
+                        f"{idx}. {prefix} `{task.id}` ({task.agent_type or 'unknown'})",
+                        f"   - status: {state}",
+                        f"   - description: {task.description}",
+                        f"   - reason: {reason}",
+                        f"   - function_identifier: `{(task.function_identifier or '').strip() or 'N/A'}`",
+                    ]
+                )
+            return await self._maybe_pack_tool_output("list_runnable_tasks", "\n".join(lines))
+        except Exception as e:
+            return f"[错误] list_runnable_tasks 失败: {str(e)}"
+
+    async def compose_task_context(
+        self,
+        analysis_target: str = "",
+        task_id: str = "",
+        artifact_refs: Optional[List[str]] = None,
+        conversation_context: str = "",
+        extra_context: str = "",
+        required_sections: Optional[List[str]] = None,
+        mode: str = "minimal",
+        task_group: Optional[str] = None,
+        store_artifact: bool = True,
+    ) -> Any:
+        """
+        组装任务上下文（通用工具）。
+
+        输入可来自：任务目标、artifact 引用、会话背景文本、补充上下文。
+        输出 Markdown 纯文本上下文，并返回推荐 selected_file_ids。
+        """
+        try:
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。"
+
+            mode_value = (mode or "minimal").strip().lower()
+            if mode_value not in {"minimal", "full"}:
+                return "[错误] mode 仅支持 minimal/full。"
+
+            task = None
+            task_desc = ""
+            task_context = ""
+            resolved_group = task_group
+            if task_id:
+                task = self._task_list_manager.get_task(task_id)
+                if not task:
+                    return f"[错误] 任务不存在: {task_id}"
+                if task_group and (task.task_group or "") != task_group:
+                    return (
+                        f"[错误] task_group 不匹配: task_id={task_id}, "
+                        f"task.task_group={task.task_group or ''}, provided={task_group}"
+                    )
+                resolved_group = task.task_group or task_group
+                task_desc = task.description or ""
+                task_context = self._resolve_task_analysis_context(task).strip()
+
+            final_target = (analysis_target or "").strip() or task_desc
+            if not final_target:
+                return "[错误] analysis_target 不能为空（或提供 task_id 以回退任务描述）。"
+
+            artifact_refs = artifact_refs or []
+            resolved_artifacts, unresolved_artifacts = self._resolve_artifact_refs(artifact_refs)
+
+            candidate_files: List[str] = []
+            if task_id:
+                candidate_files = self._get_previous_task_outputs(task_id, task_group=resolved_group)
+
+            candidate_blocks: List[str] = []
+            candidate_ids: List[str] = []
+            for idx, file_id in enumerate(candidate_files, 1):
+                candidate_ids.append(file_id)
+                summary_text = ""
+                meta = self.artifact_store.read_metadata(file_id)
+                summary_text = str(meta.get("summary") or "").strip()
+                if not summary_text:
+                    raw_text = self.artifact_store.read(file_id)
+                    summary_text = raw_text
+                    if len(raw_text) > 3000 and self.summary_service:
+                        generated = await self.summary_service.summarize_message_large(
+                            content=raw_text,
+                            metadata={"tool_name": "compose_task_context"},
+                            agent_type="context_composer",
+                            target_function=final_target,
+                            session_id=self._session_id,
+                        )
+                        if generated:
+                            summary_text = generated
+                candidate_blocks.append(
+                    "\n".join(
+                        [
+                            f"### 候选 {idx}: `{file_id}`",
+                            f"- artifact_ref: `{file_id}`",
+                            f"- kind: {meta.get('kind', 'unknown')}",
+                            "- 摘要:",
+                            summary_text or "（无）",
+                            "",
+                        ]
+                    )
+                )
+
+            artifact_blocks: List[str] = []
+            for idx, item in enumerate(resolved_artifacts, 1):
+                artifact_blocks.append(
+                    "\n".join(
+                        [
+                            f"### 引用 {idx}: `{item['ref']}`",
+                            f"- source: {item['source']}",
+                            f"- id: {item['id']}",
+                            "- 内容:",
+                            item["content"] or "（无）",
+                            "",
+                        ]
+                    )
+                )
+
+            required_sections = required_sections or [
+                "分析目标",
+                "任务相关背景事实",
+                "前置约束",
+                "证据锚点",
+                "缺失信息",
+                "推荐输入文件（selected_file_ids）",
+            ]
+
+            def finish_compose_task_context(
+                context_markdown: str,
+                selected_file_ids: List[str],
+                missing_info: str = "",
+            ):
+                """
+                Return composed task context in Markdown plain text.
+
+                Args:
+                    context_markdown: 任务上下文 Markdown 纯文本
+                    selected_file_ids: 推荐注入的 artifact_ref 列表
+                    missing_info: 缺失信息简述
+                """
+                pass
+
+            default_context_lines = [
+                "## 分析目标",
+                final_target,
+                "",
+                "## 任务相关背景事实",
+                conversation_context.strip() or "无",
+                "",
+                "## 前置约束",
+                task_context or "无",
+                "",
+                "## 证据锚点（含 artifact 引用）",
+                "无",
+                "",
+                "## 缺失信息",
+                "无",
+                "",
+                "## 推荐输入文件（selected_file_ids）",
+                "- (none)",
+            ]
+            fallback_context = "\n".join(default_context_lines)
+            selected_ids: List[str] = []
+            missing_info = ""
+
+            if self.llm_client:
+                system_prompt = (
+                    "你是任务上下文组装器。"
+                    "你的目标是围绕 analysis_target 生成“最小但充分”的任务上下文。"
+                    "必须基于输入事实，禁止编造。"
+                    "输出必须是 Markdown 纯文本。"
+                    "selected_file_ids 只能从候选 artifact_ref 中选择。"
+                    "必须调用 finish_compose_task_context 工具返回。"
+                )
+                user_prompt = (
+                    "请生成任务上下文。\n\n"
+                    "## analysis_target\n"
+                    f"{final_target}\n\n"
+                    "## task_id\n"
+                    f"{task_id or 'N/A'}\n\n"
+                    "## task_group\n"
+                    f"{resolved_group or 'N/A'}\n\n"
+                    "## mode\n"
+                    f"{mode_value}\n\n"
+                    "## required_sections\n"
+                    + "\n".join(f"- {s}" for s in required_sections)
+                    + "\n\n## task.analysis_context\n"
+                    + (task_context or "无")
+                    + "\n\n## conversation_context\n"
+                    + (conversation_context.strip() or "无")
+                    + "\n\n## extra_context\n"
+                    + (extra_context.strip() or "无")
+                    + "\n\n## 引用 artifact 内容\n"
+                    + ("\n".join(artifact_blocks) if artifact_blocks else "无")
+                    + "\n\n## 候选输入文件摘要\n"
+                    + ("\n".join(candidate_blocks) if candidate_blocks else "无")
+                    + "\n\n约束：\n"
+                    "- 输出 context_markdown 必须包含 required_sections。\n"
+                    "- selected_file_ids 仅允许候选 artifact_ref。\n"
+                    "- 若证据不足，missing_info 写明缺口。\n"
+                )
+                try:
+                    session_tag = self._session_id or "default"
+                    tool_client = ToolBasedLLMClient(
+                        llm=self.llm_client,
+                        max_retries=2,
+                        retry_delay=1.0,
+                        verbose=False,
+                        enable_logging=True,
+                        session_id=self._session_id,
+                        agent_id=f"context_composer_{session_tag}",
+                        log_metadata={
+                            "agent_type": "context_composer",
+                            "target_function": final_target,
                         },
                     )
-                if len(groups) == 1:
-                    task_group = next(iter(groups))
+                    result = await tool_client.atool_call(
+                        messages=[HumanMessage(content=user_prompt)],
+                        tools=[finish_compose_task_context],
+                        system_prompt=system_prompt,
+                    )
+                    if result and result.tool_calls:
+                        args = result.tool_calls[0].get("args", {}) or {}
+                        context_markdown = str(args.get("context_markdown") or "").strip()
+                        raw_ids = args.get("selected_file_ids") or []
+                        missing_info = str(args.get("missing_info") or "").strip()
+                        allowed_id_set = set(candidate_ids)
+                        selected_ids = [
+                            str(fid).strip()
+                            for fid in raw_ids
+                            if str(fid).strip() and str(fid).strip() in allowed_id_set
+                        ]
+                        selected_ids = list(dict.fromkeys(selected_ids))
+                        if context_markdown:
+                            fallback_context = context_markdown
+                except Exception:
+                    pass
 
-            # 2. 获取下一个待执行任务
-            current_task = self._task_list_manager.get_current_task(task_group=task_group)
-            
-            if not current_task:
-                # 检查任务列表是否为空
-                all_tasks = self._task_list_manager.get_all_tasks(task_group=task_group)
-                if not all_tasks:
-                    group_info = f"(task_group={task_group})" if task_group else ""
-                    return f"[错误] 任务列表为空{group_info}。请先使用 plan_tasks 工具规划任务。"
-                
-                # 检查是否所有任务已完成
-                if self._task_list_manager.is_all_completed(task_group=task_group):
-                    stats = self._task_list_manager.get_statistics(task_group=task_group)
-                    return self._format_all_completed_message(stats, task_group=task_group)
-                else:
-                    return "[错误] 没有待执行的任务，但任务列表不为空且未全部完成。这可能是一个异常状态。"
+            context_body = fallback_context
+            if missing_info and "## 缺失信息" not in context_body:
+                context_body = "\n\n".join(
+                    [
+                        context_body,
+                        "## 缺失信息",
+                        missing_info,
+                    ]
+                )
 
-            # 2. 任务类型必须显式指定
-            expected_type = getattr(current_task, "agent_type", None)
-            if not expected_type:
-                return self._format_recoverable_error(
-                    error_code="MISSING_AGENT_TYPE",
-                    message="当前任务缺少 agent_type，无法执行。",
-                    payload={
-                        "task_id": current_task.id,
-                        "task_description": current_task.description,
-                        "required_next_actions": [
-                            "在 plan_tasks 中为每个任务显式提供 agent_type",
-                            "重新调用 plan_tasks(workflows)",
-                            "再调用 execute_next_task(agent_type=..., task_group=...) 执行任务",
-                        ],
+            context_ref = ""
+            if store_artifact:
+                artifact = self.artifact_store.put_text(
+                    content=context_body,
+                    kind="task_context",
+                    summary=self._build_artifact_summary(context_body),
+                    task_id=task_id,
+                    workflow_id=str(resolved_group or ""),
+                    producer="compose_task_context",
+                    metadata={
+                        "kind": "task_context",
+                        "task_id": task_id,
+                        "task_group": str(resolved_group or ""),
+                        "analysis_target": final_target,
                     },
                 )
+                context_ref = artifact.artifact_id
+                if task_id and self._task_list_manager:
+                    self._task_list_manager.set_task_artifact(task_id, "context", context_ref)
 
-            if expected_type != agent_type:
+            lines = [
+                "# Task Context Compose Result",
+                "",
+                f"- task_id: `{task_id or 'N/A'}`",
+                f"- task_group: `{resolved_group or 'N/A'}`",
+                f"- mode: `{mode_value}`",
+                f"- context_ref: `{context_ref or 'N/A'}`",
+                f"- selected_file_ids: {', '.join(selected_ids) if selected_ids else '(none)'}",
+            ]
+            if unresolved_artifacts:
+                lines.append(f"- unresolved_artifact_refs: {', '.join(unresolved_artifacts)}")
+            lines.extend(
+                [
+                    "",
+                    "## Context Markdown",
+                    "",
+                    context_body,
+                ]
+            )
+            return await self._maybe_pack_tool_output("compose_task_context", "\n".join(lines))
+        except Exception as e:
+            return f"[错误] compose_task_context 失败: {str(e)}"
+
+    async def execute_task(
+        self,
+        task_id: str,
+        task_group: Optional[str] = None,
+        additional_context: str = "",
+        selected_file_ids: Optional[List[str]] = None,
+        context_ref: str = "",
+    ) -> Any:
+        """
+        执行指定任务（按 task_id 精确执行）。
+        """
+        try:
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。"
+            delegate_error = self._ensure_agent_delegate()
+            if delegate_error:
+                return delegate_error
+
+            task = self._task_list_manager.get_task(task_id)
+            if not task:
+                return f"[错误] 任务不存在: {task_id}"
+            if task_group and (task.task_group or "") != task_group:
                 return (
-                    f"[错误] 当前待执行任务要求 agent_type={expected_type}，"
-                    f"但收到 agent_type={agent_type}。请使用正确的 agent_type 调用 execute_next_task。"
+                    f"[错误] task_group 不匹配: task_id={task_id}, "
+                    f"task.task_group={task.task_group or ''}, provided={task_group}"
                 )
+            resolved_group = task.task_group or task_group
 
-            # 3. 恢复锁检查（仅允许恢复同一任务）
-            if self._recovery_lock_task_id and current_task.id != self._recovery_lock_task_id:
+            if self._recovery_lock_task_id and task_id != self._recovery_lock_task_id:
                 locked_task = self._task_list_manager.get_task(self._recovery_lock_task_id)
                 description = locked_task.description if locked_task else ""
                 task_group_locked = locked_task.task_group if locked_task else None
-                return self._format_recovery_lock_error(self._recovery_lock_task_id, description, task_group=task_group_locked)
+                return self._format_recovery_lock_error(
+                    self._recovery_lock_task_id,
+                    description,
+                    task_group=task_group_locked,
+                )
 
-            # 4. vuln_analysis 必须具备 function_identifier
-            if agent_type == "vuln_analysis":
-                function_identifier = getattr(current_task, "function_identifier", None)
-                if not function_identifier:
-                    self._set_recovery_lock(current_task.id)
-                    group_hint = f", task_group=\"{task_group}\"" if task_group else ""
-                    return (
-                        self._format_recoverable_error(
-                            error_code="MISSING_FUNCTION_IDENTIFIER",
-                            message="当前任务缺少 function_identifier（vuln_analysis 必需）。",
-                            payload={
-                                "task_id": current_task.id,
-                                "task_description": current_task.description,
-                                "required_next_actions": [
-                                    "调用 resolve_function_identifier 获取由 search_symbol 验证的候选标识符",
-                                    "调用 set_task_function_identifier 回填任务参数",
-                                    "重新调用 execute_next_task(agent_type='vuln_analysis', task_group=...)",
-                                ],
-                            },
-                        )
-                        + "\n\n请严格按以下步骤恢复：\n"
-                        + f"1. resolve_function_identifier(task_id=\"{current_task.id}\", query_hint=\"{current_task.description}\")\n"
-                        + f"2. set_task_function_identifier(task_id=\"{current_task.id}\", function_identifier=\"<从上一步候选中选择>\", source=\"search_symbol\")\n"
-                        + f"3. execute_next_task(agent_type=\"vuln_analysis\"{group_hint})"
-                    )
-                self._clear_recovery_lock(current_task.id)
+            task_status = str(getattr(getattr(task, "status", None), "value", getattr(task, "status", "")))
+            if task_status != "pending":
+                return f"[错误] 任务 {task_id} 当前状态为 {task_status}，仅支持执行 pending 任务。"
 
-            # 5. 选择可执行任务批次（并发控制）
-            batch_tasks = self._select_batch_tasks(
-                agent_type=agent_type,
-                require_function_identifier=agent_type == "vuln_analysis",
-                task_group=task_group,
+            agent_type = (task.agent_type or "").strip()
+            if not agent_type:
+                return self._format_recoverable_error(
+                    error_code="MISSING_AGENT_TYPE",
+                    message=f"任务 {task_id} 缺少 agent_type，无法执行。",
+                    payload={"task_id": task_id, "task_group": resolved_group or ""},
+                )
+            if agent_type == "vuln_analysis" and not (task.function_identifier or "").strip():
+                self._set_recovery_lock(task_id)
+                return self._format_recoverable_error(
+                    error_code="MISSING_FUNCTION_IDENTIFIER",
+                    message=f"任务 {task_id} 缺少 function_identifier（vuln_analysis 必需）。",
+                    payload={
+                        "task_id": task_id,
+                        "task_group": resolved_group or "",
+                        "required_next_actions": [
+                            "调用 resolve_function_identifier 获取候选标识符",
+                            "调用 set_task_function_identifier 写回后重试 execute_task",
+                        ],
+                    },
+                )
+            self._clear_recovery_lock(task_id)
+
+            claimed = self._task_list_manager.claim_task_by_id(
+                task_id=task_id,
+                claimant=self._claimant_id,
+                lease_seconds=1200,
+                task_group=resolved_group,
+                expected_agent_type=agent_type,
+                require_function_identifier=(agent_type == "vuln_analysis"),
             )
-            if not batch_tasks:
-                return "[错误] 未找到可执行的任务批次，请检查任务状态。"
+            if not claimed:
+                return f"[错误] 任务 {task_id} 认领失败（可能已被执行、状态变化或前置条件不满足）。"
 
-            # 6. 初始化 AgentDelegate（仅在真正执行任务前）
-            if not self._agent_delegate:
-                if not self.engine:
-                    return "[错误] 引擎未初始化，无法创建 AgentDelegate。请先初始化引擎并重新初始化 Orchestrator。"
-                if not self.llm_client:
-                    return "[错误] LLM 客户端未初始化，无法创建 AgentDelegate。"
-                if not self._file_manager:
-                    return "[错误] FileManager 未初始化，无法创建 AgentDelegate。"
-                from .agent_delegate import AgentDelegate
-                self._agent_delegate = AgentDelegate(
-                    engine=self.engine,
-                    llm_client=self.llm_client,
-                    file_manager=self._file_manager,
-                )
+            input_override, unresolved_ids = self._resolve_selected_input_files(
+                current_task_id=task_id,
+                task_group=resolved_group,
+                selected_file_ids=selected_file_ids,
+            )
 
-            # 5. 执行任务（支持并发）
-            if len(batch_tasks) == 1:
-                task = batch_tasks[0]
-                task_context = self._build_task_context(task, additional_context) if agent_type == "vuln_analysis" else additional_context
-                input_override = None
-                candidate_files = input_override or self._get_previous_task_outputs(task.id, task_group=task_group)
-                selected_files = await self._select_context_files(
-                    task_description=task.description,
-                    additional_context=additional_context,
-                    input_files=candidate_files,
+            merged_context = self._merge_task_context(
+                task=claimed,
+                additional_context=additional_context,
+                context_ref=context_ref,
+            )
+
+            task_obj, result, output_ref = await self._execute_single_task(
+                task=claimed,
+                agent_type=agent_type,
+                additional_context=merged_context,
+                input_files_override=input_override,
+                task_group=resolved_group,
+            )
+            base = self._format_execution_result(
+                task=task_obj,
+                result=result,
+                output_ref=output_ref,
+                task_group=resolved_group,
+            )
+            lines = [
+                "# Execute Task",
+                "",
+                f"- task_id: `{task_id}`",
+                f"- task_group: `{resolved_group or 'N/A'}`",
+                f"- agent_type: `{agent_type}`",
+                f"- context_ref: `{context_ref or 'N/A'}`",
+                f"- selected_file_ids: {', '.join(selected_file_ids or []) if (selected_file_ids or []) else '(none)'}",
+            ]
+            if unresolved_ids:
+                lines.append(f"- unresolved_selected_file_ids: {', '.join(unresolved_ids)}")
+            lines.extend(
+                [
+                    "",
+                    base,
+                ]
+            )
+            return await self._maybe_pack_tool_output("execute_task", "\n".join(lines))
+        except Exception as e:
+            return f"[错误] execute_task 失败: {str(e)}"
+
+    async def execute_tasks(
+        self,
+        task_ids: List[str],
+        task_group: Optional[str] = None,
+        additional_context: str = "",
+        task_context_map: Optional[Dict[str, str]] = None,
+        context_ref_map: Optional[Dict[str, str]] = None,
+        task_file_map: Optional[Dict[str, List[str]]] = None,
+        parallel: bool = True,
+    ) -> Any:
+        """
+        执行一组指定任务（支持并发）。
+        """
+        try:
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。"
+            delegate_error = self._ensure_agent_delegate()
+            if delegate_error:
+                return delegate_error
+
+            ordered_ids: List[str] = []
+            seen: Set[str] = set()
+            for task_id in task_ids or []:
+                normalized = str(task_id or "").strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                ordered_ids.append(normalized)
+            if not ordered_ids:
+                return "[错误] task_ids 不能为空。"
+
+            tasks: List[Any] = []
+            for task_id in ordered_ids:
+                task = self._task_list_manager.get_task(task_id)
+                if not task:
+                    return f"[错误] 任务不存在: {task_id}"
+                if task_group and (task.task_group or "") != task_group:
+                    return (
+                        f"[错误] task_group 不匹配: task_id={task_id}, "
+                        f"task.task_group={task.task_group or ''}, provided={task_group}"
+                    )
+                tasks.append(task)
+
+            resolved_group = task_group or (tasks[0].task_group if tasks else None)
+            agent_types = {(t.agent_type or "").strip() for t in tasks}
+            if "" in agent_types:
+                missing = next((t.id for t in tasks if not (t.agent_type or "").strip()), "")
+                return f"[错误] 任务 {missing} 缺少 agent_type。"
+            if len(agent_types) != 1:
+                return "[错误] execute_tasks 当前仅支持同一 agent_type 的任务集合。"
+            agent_type = next(iter(agent_types))
+
+            for task in tasks:
+                status = str(getattr(getattr(task, "status", None), "value", getattr(task, "status", "")))
+                if status != "pending":
+                    return f"[错误] 任务 {task.id} 当前状态为 {status}，仅支持执行 pending 任务。"
+                if agent_type == "vuln_analysis" and not (task.function_identifier or "").strip():
+                    self._set_recovery_lock(task.id)
+                    return self._format_recoverable_error(
+                        error_code="MISSING_FUNCTION_IDENTIFIER",
+                        message=f"任务 {task.id} 缺少 function_identifier（vuln_analysis 必需）。",
+                        payload={"task_id": task.id, "task_group": resolved_group or ""},
+                    )
+
+            claimed_tasks = self._task_list_manager.claim_tasks_by_ids(
+                task_ids=ordered_ids,
+                claimant=self._claimant_id,
+                lease_seconds=1200,
+                task_group=resolved_group,
+                expected_agent_type=agent_type,
+                require_function_identifier=(agent_type == "vuln_analysis"),
+                atomic=True,
+            )
+            if len(claimed_tasks) != len(ordered_ids):
+                return "[错误] execute_tasks 认领失败（可能存在状态变化或前置条件不满足）。"
+
+            task_context_map = task_context_map or {}
+            context_ref_map = context_ref_map or {}
+            task_file_map = task_file_map or {}
+
+            async def _run_one(task: Any):
+                specific_context = task_context_map.get(task.id, "")
+                merged_extra = "\n\n".join(
+                    part for part in [additional_context.strip(), specific_context.strip()] if part
                 )
-                if selected_files:
-                    input_override = selected_files
-                task, result, output_file = await self._execute_single_task(
+                context_ref = context_ref_map.get(task.id, "")
+                merged_context = self._merge_task_context(
+                    task=task,
+                    additional_context=merged_extra,
+                    context_ref=context_ref,
+                )
+                selected_ids = task_file_map.get(task.id) or []
+                input_override, _unresolved = self._resolve_selected_input_files(
+                    current_task_id=task.id,
+                    task_group=resolved_group,
+                    selected_file_ids=selected_ids,
+                )
+                return await self._execute_single_task(
                     task=task,
                     agent_type=agent_type,
-                    additional_context=task_context,
+                    additional_context=merged_context,
                     input_files_override=input_override,
+                    task_group=resolved_group,
                 )
-                content = self._format_execution_result(
-                    task=task,
-                    result=result,
-                    output_file=output_file,
-                    task_group=task_group,
-                )
-                return await self._maybe_pack_tool_output("execute_next_task", content)
 
-            semaphore = asyncio.Semaphore(self._max_parallel_tasks(agent_type))
+            if parallel:
+                semaphore = asyncio.Semaphore(self._max_parallel_tasks(agent_type))
 
-            async def _run_task(t):
-                async with semaphore:
-                    task_context = self._build_task_context(t, additional_context) if agent_type == "vuln_analysis" else additional_context
-                    input_override = None
-                    candidate_files = input_override or self._get_previous_task_outputs(t.id, task_group=task_group)
-                    selected_files = await self._select_context_files(
-                        task_description=t.description,
-                        additional_context=additional_context,
-                        input_files=candidate_files,
-                    )
-                    if selected_files:
-                        input_override = selected_files
-                    return await self._execute_single_task(
-                        task=t,
-                        agent_type=agent_type,
-                        additional_context=task_context,
-                        input_files_override=input_override,
-                    )
+                async def _guarded(task: Any):
+                    async with semaphore:
+                        return await _run_one(task)
 
-            results = await asyncio.gather(*[_run_task(t) for t in batch_tasks])
-            content = self._format_batch_execution_result(results, task_group=task_group)
-            return await self._maybe_pack_tool_output("execute_next_task", content)
-        
+                results = await asyncio.gather(*[_guarded(task) for task in claimed_tasks])
+            else:
+                results = []
+                for task in claimed_tasks:
+                    results.append(await _run_one(task))
+
+            base = self._format_batch_execution_result(results, task_group=resolved_group)
+            lines = [
+                "# Execute Tasks",
+                "",
+                f"- task_group: `{resolved_group or 'N/A'}`",
+                f"- agent_type: `{agent_type}`",
+                f"- parallel: `{str(bool(parallel)).lower()}`",
+                f"- task_ids: {', '.join(ordered_ids)}",
+                "",
+                base,
+            ]
+            return await self._maybe_pack_tool_output("execute_tasks", "\n".join(lines))
         except Exception as e:
-            return f"[错误] 执行任务失败: {str(e)}"
+            return f"[错误] execute_tasks 失败: {str(e)}"
 
     async def get_task_status(self, task_group: Optional[str] = None) -> str:
         """获取当前任务列表状态
@@ -1562,40 +2257,265 @@ class OrchestratorTools:
 
         return "\n".join(lines)
 
+    async def write_artifact_entry(
+        self,
+        kind: str,
+        content: str,
+        task_id: str = "",
+        task_group: str = "",
+        slot: str = "",
+        summary: str = "",
+    ) -> str:
+        """
+        写入统一 Artifact Ledger，可选绑定到任务槽位。
+
+        Args:
+            kind: Artifact 类型（如 evidence_bundle / task_context / task_note）
+            content: 正文内容（Markdown 纯文本）
+            task_id: 可选任务 ID
+            task_group: 可选 task_group/workflow_id
+            slot: 可选任务槽位（如 context/output/evidence）
+            summary: 可选摘要，缺省时自动截断生成
+        """
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化。"
+        normalized_kind = (kind or "").strip()
+        if not normalized_kind:
+            return "[错误] kind 不能为空。"
+        text = str(content or "")
+        if not text.strip():
+            return "[错误] content 不能为空。"
+        final_summary = (summary or "").strip() or self._build_artifact_summary(text)
+        ref = self.artifact_store.put_text(
+            content=text,
+            kind=normalized_kind,
+            summary=final_summary,
+            task_id=(task_id or "").strip(),
+            workflow_id=(task_group or "").strip(),
+            producer="tool.write_artifact_entry",
+            metadata={
+                "kind": normalized_kind,
+                "task_id": task_id,
+                "task_group": task_group,
+                "slot": slot,
+            },
+        )
+        if task_id and slot and self._task_list_manager:
+            self._task_list_manager.set_task_artifact(task_id, slot, ref.artifact_id)
+        return "\n".join(
+            [
+                "# Artifact 写入成功",
+                "",
+                f"- artifact_ref: `{ref.artifact_id}`",
+                f"- kind: `{normalized_kind}`",
+                f"- task_id: `{task_id or 'N/A'}`",
+                f"- task_group: `{task_group or 'N/A'}`",
+                f"- slot: `{slot or 'N/A'}`",
+                f"- size: {ref.size}",
+            ]
+        )
+
+    async def link_task_artifact(
+        self,
+        task_id: str,
+        slot: str,
+        artifact_ref: str,
+    ) -> str:
+        """
+        将现有 artifact_ref 绑定到任务槽位。
+        """
+        if not self._task_list_manager:
+            return "[错误] TaskListManager 未初始化。"
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化。"
+        normalized_task_id = (task_id or "").strip()
+        normalized_slot = (slot or "").strip()
+        normalized_ref = self._extract_artifact_id(artifact_ref)
+        if not normalized_task_id:
+            return "[错误] task_id 不能为空。"
+        if not normalized_slot:
+            return "[错误] slot 不能为空。"
+        if not normalized_ref:
+            return "[错误] artifact_ref 不能为空。"
+        if not self.artifact_store.exists(normalized_ref):
+            return f"[错误] artifact_ref 不存在: {normalized_ref}"
+        try:
+            self._task_list_manager.set_task_artifact(
+                task_id=normalized_task_id,
+                slot=normalized_slot,
+                artifact_ref=normalized_ref,
+            )
+        except Exception as e:
+            return f"[错误] 绑定失败: {str(e)}"
+        return "\n".join(
+            [
+                "# 任务 Artifact 绑定成功",
+                "",
+                f"- task_id: `{normalized_task_id}`",
+                f"- slot: `{normalized_slot}`",
+                f"- artifact_ref: `{normalized_ref}`",
+            ]
+        )
+
+    async def list_task_artifacts(self, task_id: str) -> str:
+        """
+        列出任务槽位绑定的全部 Artifact。
+        """
+        if not self._task_list_manager:
+            return "[错误] TaskListManager 未初始化。"
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化。"
+        normalized_task_id = (task_id or "").strip()
+        if not normalized_task_id:
+            return "[错误] task_id 不能为空。"
+        mappings = self._task_list_manager.list_task_artifacts(normalized_task_id)
+        if not mappings:
+            return f"# 任务 Artifact 列表\n\n任务 `{normalized_task_id}` 暂无槽位绑定。"
+        lines = [
+            "# 任务 Artifact 列表",
+            "",
+            f"- task_id: `{normalized_task_id}`",
+            f"- slots: {len(mappings)}",
+            "",
+        ]
+        for slot, ref in mappings.items():
+            meta = self.artifact_store.read_metadata(ref)
+            lines.append(f"## {slot}")
+            lines.append(f"- artifact_ref: `{ref}`")
+            lines.append(f"- kind: {meta.get('kind', 'unknown')}")
+            lines.append(f"- summary: {meta.get('summary', '') or '(none)'}")
+            lines.append("")
+        return "\n".join(lines)
+
     async def read_task_output(self, task_id: str) -> Any:
-        """读取指定任务的输出文件
+        """读取指定任务的输出 Artifact。
         
-        根据 task_id 找到输出文件，返回文件内容。
+        根据 task_id 查找 `output` 槽位绑定的 artifact_ref 并返回内容。
         
         Args:
             task_id: 任务 ID，例如 "task_1"
         
         Returns:
-            任务输出文件的内容；若输出超长，返回 {"content": "...", "summary": "..."}。
+            任务输出内容（Markdown 文本）。
         """
         try:
-            # 检查是否已初始化
-            if not hasattr(self, '_file_manager'):
-                return "[错误] FileManager 未初始化。请先初始化 Orchestrator。"
-            
-            # 生成输出文件路径
-            output_file = self._file_manager.get_artifact_path(
-                task_id=task_id,
-                artifact_name="output"
+            if not self._task_list_manager:
+                return "[错误] TaskListManager 未初始化。"
+            if not self.artifact_store:
+                return "[错误] ArtifactStore 未初始化。"
+            normalized_task_id = str(task_id or "").strip()
+            if not normalized_task_id:
+                return self._format_recoverable_error(
+                    error_code="INVALID_ARGUMENT",
+                    message="task_id 不能为空。",
+                    payload={
+                        "required_next_actions": [
+                            "传入合法 task_id（如 task_1）后重试 read_task_output",
+                        ],
+                    },
+                )
+
+            task = self._task_list_manager.get_task(normalized_task_id)
+            if not task:
+                return self._format_recoverable_error(
+                    error_code="TASK_NOT_FOUND",
+                    message=f"任务不存在: {normalized_task_id}",
+                    payload={
+                        "task_id": normalized_task_id,
+                        "required_next_actions": [
+                            "调用 get_task_status(task_group=...) 获取真实任务列表",
+                            "确认 task_id 后再调用 read_task_output",
+                        ],
+                    },
+                )
+
+            task_group = str(getattr(task, "task_group", "") or "").strip()
+            task_description = str(getattr(task, "description", "") or "").strip()
+            task_status = str(
+                getattr(getattr(task, "status", None), "value", getattr(task, "status", "unknown"))
+            ).strip() or "unknown"
+
+            execute_cmd = (
+                f"execute_task(task_id=\"{normalized_task_id}\", task_group=\"{task_group}\")"
+                if task_group
+                else f"execute_task(task_id=\"{normalized_task_id}\")"
             )
-            
-            # 检查文件是否存在
-            if not output_file.exists():
-                return f"[错误] 任务 {task_id} 的输出文件不存在: {output_file}"
-            
-            # 读取文件内容
-            content = self._file_manager.read_artifact(output_file)
-            
+            list_status_cmd = (
+                f"get_task_status(task_group=\"{task_group}\")"
+                if task_group
+                else "get_task_status(task_group=...)"
+            )
+            list_runnable_cmd = (
+                f"list_runnable_tasks(task_group=\"{task_group}\")"
+                if task_group
+                else "list_runnable_tasks(task_group=...)"
+            )
+
+            output_ref = self._task_list_manager.get_task_artifact(normalized_task_id, "output")
+            if not output_ref:
+                if task_status == "pending":
+                    actions = [
+                        f"先调用 {list_runnable_cmd} 确认可执行任务",
+                        f"调用 {execute_cmd} 执行任务产出输出",
+                        "执行成功后再调用 read_task_output",
+                    ]
+                elif task_status == "in_progress":
+                    actions = [
+                        f"调用 {list_status_cmd} 检查任务是否已完成",
+                        "若任务长时间无进展，再重试 execute_task",
+                    ]
+                elif task_status == "failed":
+                    actions = [
+                        f"调用 {list_status_cmd} 查看失败原因",
+                        "根据错误修复前置条件后重试 execute_task",
+                    ]
+                elif task_status == "completed":
+                    actions = [
+                        f"调用 list_task_artifacts(task_id=\"{normalized_task_id}\") 检查槽位绑定",
+                        f"若确认缺失输出，重试 {execute_cmd} 重新产出 output artifact",
+                    ]
+                else:
+                    actions = [
+                        f"调用 {list_status_cmd} 确认任务状态",
+                        f"必要时调用 {execute_cmd} 重新执行任务",
+                    ]
+                return self._format_recoverable_error(
+                    error_code="MISSING_TASK_OUTPUT_ARTIFACT",
+                    message=f"任务 {normalized_task_id} 尚无输出 artifact。",
+                    payload={
+                        "task_id": normalized_task_id,
+                        "task_group": task_group,
+                        "task_description": task_description,
+                        "task_status": task_status,
+                        "required_next_actions": actions,
+                    },
+                )
+            if not self.artifact_store.exists(output_ref):
+                return self._format_recoverable_error(
+                    error_code="OUTPUT_ARTIFACT_NOT_FOUND",
+                    message=f"输出 artifact 不存在: {output_ref}",
+                    payload={
+                        "task_id": normalized_task_id,
+                        "task_group": task_group,
+                        "task_description": task_description,
+                        "task_status": task_status,
+                        "artifact_ref": output_ref,
+                        "required_next_actions": [
+                            f"调用 list_task_artifacts(task_id=\"{normalized_task_id}\") 核对 output 槽位绑定",
+                            f"调用 list_artifacts() 或 read_artifact(artifact_id=\"{output_ref}\") 校验 artifact 可读性",
+                            f"若 artifact 已失效，重试 {execute_cmd} 重新产出输出",
+                        ],
+                    },
+                )
+            content = self.artifact_store.read(output_ref)
+            meta = self.artifact_store.read_metadata(output_ref)
+
             # 格式化返回结果
             lines = [
-                f"# 任务输出: {task_id}",
+                f"# 任务输出: {normalized_task_id}",
                 "",
-                f"**文件路径**: {output_file}",
+                f"**artifact_ref**: {output_ref}",
+                f"**kind**: {meta.get('kind', 'task_output')}",
                 "",
                 "---",
                 "",
@@ -1604,24 +2524,24 @@ class OrchestratorTools:
             
             return "\n".join(lines)
         
-        except FileNotFoundError:
-            return f"[错误] 任务 {task_id} 的输出文件不存在"
         except Exception as e:
             return f"[错误] 读取任务输出失败: {str(e)}"
 
     # ==================== 辅助方法 ====================
 
-    def _get_previous_task_outputs(self, current_task_id: str, task_group: Optional[str] = None) -> List[Path]:
+    def _get_previous_task_outputs(self, current_task_id: str, task_group: Optional[str] = None) -> List[str]:
         """
-        获取前置任务的输出文件列表
+        获取前置任务的输出 artifact_ref 列表
         
         Args:
             current_task_id: 当前任务 ID (如 task_2)
             task_group: 任务分组标识（可选）
         
         Returns:
-            List[Path]: 前置任务的输出文件路径列表
+            List[str]: 前置任务的输出 artifact_ref 列表
         """
+        if not self._task_list_manager:
+            return []
         tasks = self._task_list_manager.get_all_tasks(task_group=task_group)
         if not tasks:
             return []
@@ -1631,236 +2551,73 @@ class OrchestratorTools:
             return []
 
         current_index = task_ids.index(current_task_id)
-        input_files = []
+        output_refs: List[str] = []
         for prev_task in tasks[:current_index]:
-            output_file = self._file_manager.get_artifact_path(
-                task_id=prev_task.id,
-                artifact_name="output",
-            )
-            if output_file.exists():
-                input_files.append(output_file)
+            ref = self._task_list_manager.get_task_artifact(prev_task.id, "output")
+            if ref and self.artifact_store and self.artifact_store.exists(ref):
+                output_refs.append(ref)
 
-        return input_files
-
-    async def _build_context_candidates(self, input_files: List[Path]) -> List[Dict[str, Any]]:
-        """
-        构建上下文候选摘要列表
-
-        Args:
-            input_files: 输入文件路径列表
-
-        Returns:
-            候选列表（每项包含 file_id, file_path, summary, size）
-        """
-        if not self._file_manager:
-            return []
-
-        candidates = []
-        for file_path in input_files:
-            summary_path = file_path.with_suffix(".summary.md")
-            if not summary_path.exists():
-                raise RuntimeError(f"[错误] 缺少摘要文件: {summary_path}")
-
-            try:
-                summary = self._file_manager.read_artifact(summary_path)
-            except Exception as e:
-                raise RuntimeError(f"[错误] 读取摘要文件失败: {summary_path} ({e})") from e
-
-            size = file_path.stat().st_size if file_path.exists() else 0
-            candidates.append({
-                "file_id": file_path.name,
-                "file_path": str(file_path),
-                "summary": summary,
-                "size": size,
-            })
-
-        return candidates
-
-    async def _select_context_files(
-        self,
-        task_description: str,
-        additional_context: str,
-        input_files: List[Path],
-    ) -> Optional[List[Path]]:
-        """
-        使用 LLM 选择当前任务所需的上下文文件列表
-
-        Args:
-            task_description: 任务描述
-            additional_context: 额外上下文
-            input_files: 候选输入文件路径
-
-        Returns:
-            选中的文件路径列表；失败返回 None（回退原始列表）
-        """
-        if not self.llm_client or not input_files:
-            return None
-        if len(input_files) <= 1:
-            return input_files
-
-        candidates = await self._build_context_candidates(input_files)
-        if not candidates:
-            return None
-
-        def finish_context_manifest(selected_file_ids: List[str], manifest_markdown: str = ""):
-            """
-            Return selected file ids and a Markdown context manifest.
-
-            Args:
-                selected_file_ids: 选中的 file_id 列表
-                manifest_markdown: Markdown 纯文本 Manifest
-            """
-            pass
-
-        system_prompt = (
-            "你是一个上下文选择器。"
-            "请根据任务目标选择最小但充分的上下文文件集合。"
-            "不要依赖数量阈值或规则判断。"
-        )
-        user_prompt = (
-            "请从候选上下文中选择与任务直接相关的文件。\n\n"
-            "## 任务描述\n"
-            f"{task_description}\n\n"
-            "## 额外上下文\n"
-            f"{additional_context}\n\n"
-            "## 候选摘要列表（每项包含 file_id）\n"
-            "```json\n"
-            f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n"
-            "```\n\n"
-            "输出要求：\n"
-            "- 返回 selected_file_ids（file_id 列表）\n"
-            "- manifest_markdown 为 Markdown 纯文本\n"
-            "- 不要输出 JSON 或结构化对象\n"
-        )
-
-        try:
-            session_tag = self._session_id or "default"
-            agent_id = f"context_selector_{session_tag}"
-            metadata_target = (task_description or "").strip() or "context_selection"
-            tool_client = ToolBasedLLMClient(
-                llm=self.llm_client,
-                max_retries=2,
-                retry_delay=1.0,
-                verbose=False,
-                enable_logging=True,
-                session_id=self._session_id,
-                agent_id=agent_id,
-                log_metadata={
-                    "agent_type": "context_selector",
-                    "target_function": metadata_target,
-                },
-            )
-            result = await tool_client.atool_call(
-                messages=[HumanMessage(content=user_prompt)],
-                tools=[finish_context_manifest],
-                system_prompt=system_prompt,
-            )
-            if result and result.tool_calls:
-                args = result.tool_calls[0].get("args", {})
-                selected_ids = args.get("selected_file_ids") or []
-                if not selected_ids:
-                    return None
-                selected = [p for p in input_files if p.name in set(selected_ids)]
-                return selected or None
-            if result and result.content:
-                return None
-        except Exception:
-            return None
-
-        return None
+        return output_refs
 
     def _max_parallel_tasks(self, agent_type: str) -> int:
         """根据 agent_type 返回最大并发任务数（由 Agent 控制）"""
-        if agent_type == "vuln_analysis":
+        if agent_type in {"vuln_analysis", "code_explorer"}:
             return self.max_vuln_concurrency
         return 1
-
-    def _select_batch_tasks(
-        self,
-        agent_type: str,
-        require_function_identifier: bool = False,
-        task_group: Optional[str] = None,
-    ) -> List[Any]:
-        """选择可并发执行的一批任务（从首个 PENDING 开始，连续同类型且条件满足）"""
-        from .task_list_manager import TaskStatus
-        all_tasks = self._task_list_manager.get_all_tasks(task_group=task_group)
-        start_idx = None
-        for idx, task in enumerate(all_tasks):
-            if task.status == TaskStatus.PENDING:
-                start_idx = idx
-                break
-        if start_idx is None:
-            return []
-
-        batch = []
-        max_parallel = self._max_parallel_tasks(agent_type)
-        for task in all_tasks[start_idx:]:
-            if task.status != TaskStatus.PENDING:
-                break
-            if not task.agent_type:
-                break
-            if task.agent_type != agent_type:
-                break
-            if require_function_identifier and not getattr(task, "function_identifier", None):
-                break
-            batch.append(task)
-            if len(batch) >= max_parallel:
-                break
-        return batch
 
     async def _execute_single_task(
         self,
         task: Any,
         agent_type: str,
         additional_context: str,
-        input_files_override: Optional[List[Path]] = None,
-    ) -> Tuple[Any, Any, Path]:
+        input_files_override: Optional[List[str]] = None,
+        task_group: Optional[str] = None,
+    ) -> Tuple[Any, Any, str]:
         """执行单个任务并返回结果元组"""
-        from .task_list_manager import TaskStatus
 
-        # 更新任务状态为 in_progress
-        self._task_list_manager.update_task_status(
-            task_id=task.id,
-            status=TaskStatus.IN_PROGRESS
-        )
-
-        # 读取前置任务的输出文件（如果有）
-        input_files = input_files_override if input_files_override is not None else self._get_previous_task_outputs(task.id)
-
-        # 生成输出文件路径
-        output_file = self._file_manager.get_artifact_path(
-            task_id=task.id,
-            artifact_name="output"
+        # 读取前置任务输出 artifact（如果有）
+        input_artifacts = (
+            input_files_override
+            if input_files_override is not None
+            else self._get_previous_task_outputs(task.id, task_group=task_group)
         )
 
         # 调用 AgentDelegate 执行任务
         result = await self._agent_delegate.delegate(
             agent_type=agent_type,
             task_description=task.description,
-            input_files=input_files,
-            output_file=output_file,
+            input_artifact_refs=input_artifacts,
             context=additional_context,
             function_identifier=getattr(task, "function_identifier", None),
+            task_id=task.id,
+            task_group=str(task_group or ""),
         )
+        output_ref = str(getattr(result, "output_ref", "") or "").strip()
+        if output_ref:
+            self._task_list_manager.set_task_artifact(task.id, "output", output_ref)
 
-        # 更新任务状态
-        if result.success:
-            self._task_list_manager.update_task_status(
-                task_id=task.id,
-                status=TaskStatus.COMPLETED
+        # 结束认领任务（claimant 校验）
+        finalized = self._task_list_manager.complete_claimed_task(
+            task_id=task.id,
+            claimant=self._claimant_id,
+            success=bool(result.success),
+            error_message=result.error_message,
+        )
+        if not finalized:
+            # 严格保持 claim 语义：结束失败时不越权改写状态，等待 lease 超时回收。
+            result.success = False
+            lease_msg = (
+                f"任务结束回写失败（task_id={task.id}, claimant={self._claimant_id}），"
+                "已保持原状态等待 lease 回收。"
             )
-        else:
-            self._task_list_manager.update_task_status(
-                task_id=task.id,
-                status=TaskStatus.FAILED,
-                error_message=result.error_message
-            )
+            prev_msg = getattr(result, "error_message", "") or ""
+            result.error_message = f"{prev_msg}; {lease_msg}".strip("; ")
 
-        return task, result, output_file
+        return task, result, output_ref
 
     def _format_batch_execution_result(
         self,
-        results: List[Tuple[Any, Any, Path]],
+        results: List[Tuple[Any, Any, str]],
         task_group: Optional[str] = None,
     ) -> str:
         """格式化批量任务执行结果"""
@@ -1871,12 +2628,12 @@ class OrchestratorTools:
             "",
         ]
 
-        for task, result, output_file in results:
+        for task, result, output_ref in results:
             lines.append(f"### {task.id} - {task.description}")
             if result.success:
                 lines.extend([
                     f"- 状态: 已完成 ✓",
-                    f"- 输出文件: {output_file.relative_to(self._file_manager.session_dir)}",
+                    f"- 输出 artifact_ref: {output_ref or 'N/A'}",
                 ])
             else:
                 lines.extend([
@@ -1921,7 +2678,7 @@ class OrchestratorTools:
         self,
         task: Any,
         result: Any,
-        output_file: Path,
+        output_ref: str,
         task_group: Optional[str] = None,
     ) -> str:
         """
@@ -1930,7 +2687,7 @@ class OrchestratorTools:
         Args:
             task: 任务对象
             result: AgentDelegate 返回的结果
-            output_file: 输出文件路径
+            output_ref: 输出 artifact_ref
         
         Returns:
             str: 格式化的结果文本
@@ -1944,7 +2701,7 @@ class OrchestratorTools:
         if result.success:
             lines.extend([
                 f"**状态**: 已完成 ✓",
-                f"**输出文件**: {output_file.relative_to(self._file_manager.session_dir)}",
+                f"**输出 artifact_ref**: {output_ref or 'N/A'}",
                 "",
             ])
             
@@ -1956,7 +2713,7 @@ class OrchestratorTools:
                     "",
                     '\n'.join(summary_lines),
                     "",
-                    "（完整结果已保存到输出文件）",
+                    "（完整结果已保存到输出 Artifact）",
                 ])
         else:
             lines.extend([
@@ -1996,45 +2753,6 @@ class OrchestratorTools:
                 "",
                 "🎉 **所有任务已完成！**",
             ])
-        
-        return "\n".join(lines)
-
-    def _format_all_completed_message(self, stats: Dict[str, Any], task_group: Optional[str] = None) -> str:
-        """
-        格式化所有任务已完成的消息
-        
-        Args:
-            stats: 统计信息
-        
-        Returns:
-            str: 格式化的消息
-        """
-        lines = [
-            "## 执行结果",
-            "",
-            "**状态**: 所有任务已完成 🎉",
-            "",
-            "---",
-            "",
-            "## 任务列表",
-            "",
-        ]
-        
-        # 添加任务列表
-        all_tasks = self._task_list_manager.get_all_tasks(task_group=task_group)
-        for task in all_tasks:
-            lines.append(task.to_markdown_line())
-        
-        # 添加统计信息
-        lines.extend([
-            "",
-            "---",
-            "",
-            f"**总计**: {stats['total']} 个任务",
-            f"**已完成**: {stats['completed']} 个",
-            f"**失败**: {stats['failed']} 个",
-            f"**完成率**: {stats['completion_rate']}%",
-        ])
         
         return "\n".join(lines)
 
@@ -2199,12 +2917,19 @@ class OrchestratorTools:
             # 简化的任务编排工具（新设计）
             self.plan_tasks,
             self.append_tasks,
-            self.execute_next_task,
+            self.list_runnable_tasks,
+            self.compose_task_context,
+            self.execute_task,
+            self.execute_tasks,
             self.resolve_function_identifier,
             self.set_task_function_identifier,
             self.get_task_status,
             self.read_task_output,
             self.list_artifacts,
+            self.write_artifact_entry,
+            self.link_task_artifact,
+            self.list_task_artifacts,
+            self.mark_compression_projection,
             # 统一的 Agent 委托接口
             self.delegate_task,
             # 数据访问工具
@@ -2215,14 +2940,23 @@ class OrchestratorTools:
         """
         获取执行器可用的 Tool 列表。
 
-        TaskExecutorAgent 只允许执行任务，不允许规划与委托。
+        TaskExecutorAgent 只允许执行任务，不允许规划与通用委托。
+        仅开放受限的 `delegate_code_explorer` 用于取证。
         """
         return [
-            self.execute_next_task,
+            self.list_runnable_tasks,
+            self.compose_task_context,
+            self.execute_task,
+            self.execute_tasks,
             self.resolve_function_identifier,
             self.set_task_function_identifier,
+            self.delegate_code_explorer,
             self.get_task_status,
             self.read_task_output,
+            self.write_artifact_entry,
+            self.link_task_artifact,
+            self.list_task_artifacts,
+            self.mark_compression_projection,
             self.read_artifact,
         ]
 

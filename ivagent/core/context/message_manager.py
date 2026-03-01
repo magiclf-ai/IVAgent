@@ -8,7 +8,6 @@ MessageManager - 结构化消息管理与引用投影
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 import time
-import uuid
 
 from .artifact_store import ArtifactStore, ArtifactReference
 
@@ -41,6 +40,10 @@ class MessageManager:
         self.artifact_store = artifact_store
         self.max_inline_chars = max_inline_chars
         self._messages: List[AgentMessage] = []
+        self._message_seq: int = 0
+        self._pending_projection_remove_message_ids: List[str] = []
+        self._pending_projection_fold_message_ids: List[str] = []
+        self._pending_projection_reason: str = ""
 
     async def add_system_message(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> AgentMessage:
         return await self._add_message("system", content, metadata)
@@ -147,6 +150,72 @@ class MessageManager:
         self._messages = [msg for msg in self._messages if msg.message_id not in remove_set]
         return before - len(self._messages)
 
+    def mark_compression_projection(
+        self,
+        remove_message_ids: Optional[List[str]] = None,
+        fold_message_ids: Optional[List[str]] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """
+        标记下一轮上下文压缩前要应用的消息级裁切清单（删除/折叠）。
+
+        Returns:
+            {
+              "accepted_remove_message_ids": [...],
+              "accepted_fold_message_ids": [...],
+              "reason": "...",
+            }
+        """
+        def _normalize_ids(values: Any) -> List[str]:
+            if isinstance(values, list):
+                raw = values
+            elif values is None:
+                raw = []
+            else:
+                raw = [values]
+            accepted_ids: List[str] = []
+            for item in raw:
+                value = str(item or "").strip()
+                if value:
+                    accepted_ids.append(value)
+            return list(dict.fromkeys(accepted_ids))
+
+        accepted_remove = _normalize_ids(remove_message_ids)
+        accepted_fold = _normalize_ids(fold_message_ids)
+        if accepted_remove and accepted_fold:
+            remove_set = set(accepted_remove)
+            accepted_fold = [mid for mid in accepted_fold if mid not in remove_set]
+
+        self._pending_projection_remove_message_ids = accepted_remove
+        self._pending_projection_fold_message_ids = accepted_fold
+        self._pending_projection_reason = str(reason or "").strip()
+        return {
+            "accepted_remove_message_ids": list(accepted_remove),
+            "accepted_fold_message_ids": list(accepted_fold),
+            "reason": self._pending_projection_reason,
+        }
+
+    def pop_compression_projection(self) -> Dict[str, Any]:
+        """
+        读取并清空待应用的压缩投影裁切清单。
+        """
+        payload = {
+            "remove_message_ids": list(self._pending_projection_remove_message_ids),
+            "fold_message_ids": list(self._pending_projection_fold_message_ids),
+            "reason": self._pending_projection_reason,
+        }
+        self._pending_projection_remove_message_ids = []
+        self._pending_projection_fold_message_ids = []
+        self._pending_projection_reason = ""
+        return payload
+
+    def has_pending_compression_projection(self) -> bool:
+        """是否存在待应用的压缩投影裁切清单。"""
+        return bool(
+            self._pending_projection_remove_message_ids
+            or self._pending_projection_fold_message_ids
+        )
+
     def build_compressed_message(
         self,
         summary: str,
@@ -164,7 +233,7 @@ class MessageManager:
         meta = metadata or {}
         meta["compressed"] = True
         created_at = time.time()
-        message_id = uuid.uuid4().hex
+        message_id = self._next_message_id()
 
         if store_artifact:
             artifact = self.artifact_store.store(
@@ -204,7 +273,7 @@ class MessageManager:
         content = content or ""
         meta = metadata or {}
         created_at = time.time()
-        message_id = uuid.uuid4().hex
+        message_id = self._next_message_id()
 
         if role != "tool":
             msg = AgentMessage(
@@ -264,6 +333,10 @@ class MessageManager:
 
         self._messages.append(msg)
         return msg
+
+    def _next_message_id(self) -> str:
+        self._message_seq += 1
+        return f"Message_{self._message_seq:06d}"
 
     def _format_reference_display(self, summary: str, artifact_id: str, role: str) -> str:
         prefix = "【已归档输出】" if role == "tool" else "【已归档消息】"

@@ -4,6 +4,7 @@
 """
 
 from typing import Optional, Any, List
+from ..core.cli_logger import CLILogger
 from .base_static_analysis_engine import (
     FunctionDef, CallSite, CrossReference, BaseStaticAnalysisEngine,
     SearchOptions, SearchResult
@@ -75,12 +76,20 @@ def create_engine(
         BaseEngine 实例
     """
     engine_type = engine_type.lower()
+    logger = kwargs.pop("logger", None)
+    fallback_logger = CLILogger(component="EngineFactory")
+
+    def _log(level: str, event: str, message: str, **fields: Any) -> None:
+        if logger and hasattr(logger, "log"):
+            logger.log(level=level, event=event, message=message, **fields)
+            return
+        fallback_logger.log(level=level, event=event, message=message, **fields)
 
     if engine_type == "ida":
         host = kwargs.pop("host", "127.0.0.1")
         port = kwargs.pop("port", 9999)
         max_concurrency = kwargs.pop("max_concurrency", 10)
-        print(f"[*] Creating IDAEngine connecting to {host}:{port}")
+        _log("info", "engine.create", "创建 IDAEngine", engine="ida", host=host, port=port)
         return IDAStaticAnalysisEngine(
             target_path=target_path,
             host=host,
@@ -88,6 +97,7 @@ def create_engine(
             max_concurrency=max_concurrency,
             source_root=source_root,
             llm_client=llm_client,
+            logger=logger,
             **kwargs
         )
 
@@ -95,7 +105,7 @@ def create_engine(
         host = kwargs.pop("host", "127.0.0.1")
         port = kwargs.pop("port", 16161)
         max_concurrency = kwargs.pop("max_concurrency", 10)
-        print(f"[*] Creating JEBEngine connecting to {host}:{port}")
+        _log("info", "engine.create", "创建 JEBEngine", engine="jeb", host=host, port=port)
         return JEBStaticAnalysisEngine(
             target_path=target_path,
             host=host,
@@ -103,6 +113,7 @@ def create_engine(
             max_concurrency=max_concurrency,
             source_root=source_root,
             llm_client=llm_client,
+            logger=logger,
             **kwargs
         )
 
@@ -116,12 +127,13 @@ def create_engine(
         else:
             url = f"http://{host}:{port}/mcp"
 
-        print(f"[*] Creating AbcEngine connecting to {url}")
+        _log("info", "engine.create", "创建 AbcEngine", engine="abc", url=url)
         return AbcStaticAnalysisEngine(
             target_path=target_path,
             host=url,
             source_root=source_root,
             llm_client=llm_client,
+            logger=logger,
             **kwargs
         )
 
@@ -144,12 +156,13 @@ def create_engine(
         kwargs.pop("timeout", None)
         kwargs.pop("auto_connect", None)
         max_concurrency = kwargs.pop("max_concurrency", 10)
-        print(f"[*] Creating SourceCodeEngine for: {target_path or source_root}")
+        _log("info", "engine.create", "创建 SourceCodeEngine", engine="source", target=target_path or source_root)
         return SourceCodeEngine(
             target_path=target_path,
             source_root=source_root,
             llm_client=llm_client,
             max_concurrency=max_concurrency,
+            logger=logger,
             **kwargs
         )
 

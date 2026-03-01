@@ -9,12 +9,14 @@ import os
 import sys
 import json
 import re
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
 # Add package root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from ivagent.core.cli_logger import CLILogger, format_duration
 from ivagent.scanner import IVAgentScanner, ScanConfig
 from ivagent.models.constraints import Precondition
 
@@ -130,6 +132,8 @@ def load_preset_precondition(preset_name: str) -> Precondition:
    
 
 async def main():
+    startup_t0 = time.perf_counter()
+
     parser = argparse.ArgumentParser(
         description="IVAgent Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -169,6 +173,7 @@ async def main():
     parser.add_argument("--output", "-o", help="Output file for results (JSON)")
 
     args = parser.parse_args()
+    logger = CLILogger(component="ivagent_scan", verbose=args.verbose)
 
     # Validate arguments
     if not args.function:
@@ -180,7 +185,7 @@ async def main():
         targets.append(args.function)
 
     if not targets:
-        print("[!] No functions to scan.")
+        logger.warning("scan.no_targets", "没有可扫描的函数")
         return
 
     # Prepare configuration
@@ -198,7 +203,7 @@ async def main():
         source_root=args.source_root
     )
 
-    scanner = IVAgentScanner(config)
+    scanner = IVAgentScanner(config, logger=CLILogger(component="ivagent.scanner", verbose=args.verbose))
 
     # Prepare precondition
     precondition = None
@@ -208,41 +213,43 @@ async def main():
         # Load from custom config file
         try:
             precondition = load_precondition_from_file(args.config_file)
-            print(f"[*] Loaded precondition from {args.config_file}")
-            print(f"    Name: {precondition.name}")
+            logger.info("precondition.loaded", "已加载前置条件文件", path=args.config_file, name=precondition.name)
             if precondition.description:
-                print(f"    Description: {precondition.description}")
-            print(f"    Target: {precondition.target}")
+                logger.info("precondition.description", precondition.description)
+            logger.info("precondition.target", "前置条件目标", target=precondition.target)
         except Exception as e:
-            print(f"[X] Failed to load precondition file: {e}")
+            logger.exception("precondition.load_failed", e, path=args.config_file)
             return
     elif args.preset_name:
         # Load from preset
         try:
             precondition = load_preset_precondition(args.preset_name)
-            print(f"[*] Using preset: {precondition.name}")
+            logger.info("precondition.preset", "使用预置前置条件", preset=args.preset_name, name=precondition.name)
             if precondition.description:
-                print(f"    Description: {precondition.description}")
+                logger.info("precondition.description", precondition.description)
         except Exception as e:
-            print(f"[X] Failed to load preset: {e}")
+            logger.exception("precondition.preset_failed", e, preset=args.preset_name)
             return
     else:
-        print("[!] No precondition specified. Analysis will proceed without target-specific constraints.")
-        print("    Use --list-presets to see available presets, or --config to specify a custom file.")
+        logger.warning(
+            "precondition.none",
+            "未指定前置条件，将按通用约束执行分析",
+        )
 
-    print(f"\n{'=' * 50}")
-    print(f"IVAgent Scan Session")
-    print(f"{'=' * 50}")
-    print(f"[+] Engine: {args.engine}")
-    if args.target:
-        print(f"[+] Target: {args.target}")
-    if args.source_root:
-        print(f"[+] Source Root: {args.source_root}")
-    print(f"[+] Functions to scan: {len(targets)}")
-    print(f"[+] Concurrency: {args.concurrency}")
-    print(f"{'=' * 50}\n")
+    startup_elapsed = time.perf_counter() - startup_t0
+    logger.success(
+        "startup.ready",
+        "CLI 启动完成，开始扫描",
+        startup_time=format_duration(startup_elapsed),
+        engine=args.engine,
+        target=args.target or "(未指定)",
+        source_root=args.source_root or "(未指定)",
+        functions=len(targets),
+        concurrency=args.concurrency,
+    )
 
     try:
+        scan_t0 = time.perf_counter()
         results = await scanner.scan_functions(targets, precondition)
 
         # Calculate stats
@@ -257,24 +264,35 @@ async def main():
                 success_count += 1
                 vuln_count += len(r.get("vulnerabilities", []))
 
-        print(f"\n{'=' * 50}")
-        print(f"Scan Completed")
-        print(f"{'=' * 50}")
-        print(f"[+] Successful: {success_count}")
-        print(f"[+] Failed: {failed_count}")
-        print(f"[+] Total Vulnerabilities: {vuln_count}")
+        scan_elapsed = time.perf_counter() - scan_t0
+        total_elapsed = time.perf_counter() - startup_t0
+        logger.success(
+            "scan.completed",
+            "扫描完成",
+            successful=success_count,
+            failed=failed_count,
+            vulnerabilities=vuln_count,
+            scan_time=format_duration(scan_elapsed),
+            total_time=format_duration(total_elapsed),
+        )
 
         # Save results
         if args.output:
             with open(args.output, 'w', encoding='utf-8') as f:
                 # Convert results to list if not already (results is a list)
                 json.dump(results, f, indent=2, ensure_ascii=False, default=str)
-            print(f"[+] Results saved to {args.output}")
+            logger.info("scan.output_saved", "结果已保存", output=args.output)
 
     except KeyboardInterrupt:
-        print("\n[!] Scan interrupted by user.")
+        logger.warning("scan.interrupted", "用户中断扫描")
     except Exception as e:
-        print(f"\n[X] Unexpected error: {e}")
+        logger.exception(
+            "scan.failed",
+            e,
+            engine=args.engine,
+            target=args.target or "(未指定)",
+            function=args.function,
+        )
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ Abc-Decompiler (Jadx-based) Engine Implementation
 Provides static analysis capabilities using the Abc-Decompiler MCP Server.
 """
 
-import logging
 from typing import Optional, List, Dict, Any
 import re
 
@@ -24,9 +23,6 @@ from ..backends.abc_decompiler import AbcDecompilerClient, DecompiledMethod
 
 # Import SourceCodeEngine as fallback
 from .source_code_engine import SourceCodeEngine
-
-logger = logging.getLogger(__name__)
-
 
 class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
     """
@@ -67,8 +63,12 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             await self.client.connect()
             self._connected = True
         except Exception as e:
-            logger.error(f"Failed to connect to Abc-Decompiler MCP Server at {self.host}: {e}")
-            logger.error("Please ensure the server is running: python jadx_mcp_server.py --http --port 3000")
+            self._log(str(e), "error", event="engine.abc.connect_failed", host=self.host)
+            self._log(
+                "请确保服务已启动: python jadx_mcp_server.py --http --port 3000",
+                "error",
+                event="engine.abc.connect_hint",
+            )
             raise RuntimeError(f"Could not connect to Abc-Decompiler MCP Server: {e}") from e
 
     async def _do_close(self):
@@ -80,7 +80,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             try:
                 await self._source_code_engine._do_close()
             except Exception as e:
-                logger.warning(f"Error closing SourceCodeEngine fallback: {e}")
+                self._log(str(e), "warning", event="engine.abc.close_source_fallback_failed")
             self._source_code_engine = None
 
     async def _ensure_connected(self):
@@ -98,7 +98,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                 )
                 await self._source_code_engine._do_initialize()
             except Exception as e:
-                logger.warning(f"Failed to initialize SourceCodeEngine fallback: {e}")
+                self._log(str(e), "warning", event="engine.abc.init_source_fallback_failed")
                 return None
         return self._source_code_engine
 
@@ -230,7 +230,11 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             if '.' in function_name:
                 target_class, target_method = self._parse_signature(function_name)
             else:
-                logger.warning(f"get_function_def: Cannot determine class for method {function_name}")
+                self._log(
+                    f"get_function_def: Cannot determine class for method {function_name}",
+                    "warning",
+                    event="engine.abc.get_function_def_no_class",
+                )
 
         try:
             # Fetch method source
@@ -254,6 +258,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                 code_with_line_comment += f"[{line_index:4d}] {line}\n"
 
             return FunctionDef(
+                function_identifier=f"{target_class}.{target_method}",
                 signature=f"{target_class}.{target_method}",
                 name=target_method,
                 code=code_with_line_comment,
@@ -263,7 +268,11 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             )
 
         except Exception as e:
-            logger.warning(f"AbcDecompiler failed for {target_class}.{target_method}: {e}, trying SourceCodeEngine fallback")
+            self._log(
+                f"AbcDecompiler failed for {target_class}.{target_method}: {e}, trying SourceCodeEngine fallback",
+                "warning",
+                event="engine.abc.decompiler_failed",
+            )
 
             # Fallback: Use SourceCodeEngine with pure text + LLM
             source_engine = await self._get_source_code_engine()
@@ -273,12 +282,24 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                         function_identifier=f"{target_class}.{target_method}"
                     )
                     if func_def:
-                        logger.info(f"SourceCodeEngine fallback succeeded for {target_class}.{target_method}")
+                        self._log(
+                            f"SourceCodeEngine fallback succeeded for {target_class}.{target_method}",
+                            "info",
+                            event="engine.abc.source_fallback_ok",
+                        )
                         return func_def
                 except Exception as fallback_e:
-                    logger.error(f"SourceCodeEngine fallback also failed: {fallback_e}")
+                    self._log(
+                        f"SourceCodeEngine fallback also failed: {fallback_e}",
+                        "error",
+                        event="engine.abc.source_fallback_failed",
+                    )
 
-            logger.error(f"Error getting function def for {target_class}.{target_method}: {e}")
+            self._log(
+                f"Error getting function def for {target_class}.{target_method}: {e}",
+                "error",
+                event="engine.abc.get_function_def_failed",
+            )
             return None
 
     async def get_callee(
@@ -314,7 +335,11 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
         """Get callers (functions calling this function)."""
         # Current MCP server does not expose get_xrefs_to_method.
         # We cannot efficiently implement this.
-        logger.warning("get_caller is not supported by current Abc-Decompiler backend (missing get_xrefs_to_method)")
+        self._log(
+            "get_caller is not supported by current Abc-Decompiler backend (missing get_xrefs_to_method)",
+            "warning",
+            event="engine.abc.get_caller_unsupported",
+        )
         return []
 
     async def get_cross_reference(
@@ -324,7 +349,11 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
     ) -> Optional[CrossReference]:
         """Get cross references."""
         # Not supported
-        logger.warning("get_cross_reference is not supported by current Abc-Decompiler backend")
+        self._log(
+            "get_cross_reference is not supported by current Abc-Decompiler backend",
+            "warning",
+            event="engine.abc.get_cross_reference_unsupported",
+        )
         return None
 
     async def get_variable_constraints(
@@ -407,7 +436,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                     match_score = 1.0 if class_name_cmp.startswith(query_cmp) else 0.8
                     results.append(SearchResult(
                         name=class_name,
-                        signature=class_name,
+                        identifier=class_name,
                         symbol_type=SymbolType.CLASS,
                         file_path=f"{class_name.replace('.', '/')}.ts",
                         line=0,
@@ -468,7 +497,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                     if matched:
                         results.append(SearchResult(
                             name=method_name,
-                            signature=signature,
+                            identifier=signature,
                             symbol_type=SymbolType.METHOD,
                             file_path=f"{class_name.replace('.', '/')}.ts",
                             line=0,
@@ -494,7 +523,7 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
                             if field_matched:
                                 results.append(SearchResult(
                                     name=field_name,
-                                    signature=field_sig,
+                                    identifier=field_sig,
                                     symbol_type=SymbolType.FIELD,
                                     file_path=f"{class_name.replace('.', '/')}.ts",
                                     line=0,
@@ -512,5 +541,5 @@ class AbcStaticAnalysisEngine(BaseStaticAnalysisEngine):
             return results[start_idx:end_idx]
 
         except Exception as e:
-            logger.warning(f"Search failed: {e}")
+            self._log(f"Search failed: {e}", "warning", event="engine.abc.search_failed")
             return []

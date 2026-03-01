@@ -2,17 +2,17 @@
 """
 AgentDelegate - Agent 委托器
 
-负责将任务委托给专门的子 Agent 执行，处理输入文件读取、输出文件写入和错误处理。
+负责将任务委托给专门的子 Agent 执行，处理输入 Artifact 读取、输出 Artifact 写入和错误处理。
 """
 
 import asyncio
 from typing import Any, List, Optional
-from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
 from ..models.constraints import FunctionContext, Precondition
+from ..core.context import ArtifactStore
 
 class AgentType(str, Enum):
     """支持的 Agent 类型"""
@@ -35,6 +35,7 @@ class DelegateResult:
     success: bool
     output: str
     summary: str = ""
+    output_ref: str = ""
     error_message: Optional[str] = None
     agent_type: Optional[str] = None
 
@@ -45,10 +46,10 @@ class AgentDelegate:
     
     职责：
     - 根据 agent_type 创建相应的子 Agent
-    - 读取输入文件内容
+    - 读取输入 Artifact 内容
     - 构造任务 Prompt
     - 调用子 Agent 执行
-    - 将输出写入文件
+    - 将输出写入 ArtifactStore
     - 处理错误和重试
     """
     
@@ -60,7 +61,8 @@ class AgentDelegate:
         self,
         engine: BaseStaticAnalysisEngine,
         llm_client: Any,
-        file_manager: Optional[Any] = None,
+        artifact_store: Optional[ArtifactStore] = None,
+        verbose: bool = True,
     ):
         """
         初始化 Agent 委托器
@@ -68,20 +70,22 @@ class AgentDelegate:
         Args:
             engine: 静态分析引擎
             llm_client: LLM 客户端
-            file_manager: 文件管理器（可选，用于读写文件）
+            artifact_store: ArtifactStore（统一 Artifact 落盘）
         """
         self.engine = engine
         self.llm_client = llm_client
-        self.file_manager = file_manager
+        self.artifact_store = artifact_store
+        self.verbose = verbose
     
     async def delegate(
         self,
         agent_type: str,
         task_description: str,
-        input_files: Optional[List[Path]] = None,
-        output_file: Optional[Path] = None,
+        input_artifact_refs: Optional[List[str]] = None,
         context: Optional[str] = None,
         function_identifier: Optional[str] = None,
+        task_id: str = "",
+        task_group: str = "",
         max_iterations: int = 15,
     ) -> DelegateResult:
         """
@@ -90,10 +94,11 @@ class AgentDelegate:
         Args:
             agent_type: Agent 类型 (code_explorer, vuln_analysis)
             task_description: 任务描述
-            input_files: 输入文件路径列表（前置任务的输出）
-            output_file: 输出文件路径
+            input_artifact_refs: 输入 artifact_ref 列表（前置任务输出）
             context: 额外上下文信息
             function_identifier: 目标函数标识符（vuln_analysis 必需）
+            task_id: 任务 ID（用于输出归档）
+            task_group: 任务分组（workflow_id）
             max_iterations: 最大迭代次数
         
         Returns:
@@ -111,8 +116,8 @@ class AgentDelegate:
             )
         
         input_content = ""
-        if agent_type_enum == AgentType.CODE_EXPLORER and input_files:
-            input_content = await self._read_input_files(input_files)
+        if agent_type_enum == AgentType.CODE_EXPLORER and input_artifact_refs:
+            input_content = await self._read_input_artifacts(input_artifact_refs)
 
         task_prompt = ""
         if agent_type_enum == AgentType.CODE_EXPLORER:
@@ -132,52 +137,67 @@ class AgentDelegate:
             task_description=task_description,
         )
         
-        # 写入输出文件
-        if result.success and output_file and result.output:
+        # 写入输出 Artifact
+        if result.success and result.output:
             try:
-                await self._write_output_file(
-                    output_file=output_file,
+                output_ref = await self._write_output_artifact(
                     content=result.output,
                     summary=result.summary,
+                    task_id=task_id,
+                    task_group=task_group,
+                    agent_type=agent_type,
                 )
+                result.output_ref = output_ref
             except Exception as e:
                 return DelegateResult(
                     success=False,
                     output=result.output,
                     summary=result.summary,
-                    error_message=f"写入输出文件失败: {str(e)}",
+                    error_message=f"写入输出 Artifact 失败: {str(e)}",
                     agent_type=agent_type,
                 )
         
         return result
     
-    async def _read_input_files(self, input_files: List[Path]) -> str:
+    async def _read_input_artifacts(self, input_artifact_refs: List[str]) -> str:
         """
         读取输入文件内容
         
         Args:
-            input_files: 输入文件路径列表
+            input_artifact_refs: 输入 artifact_ref 列表
         
         Returns:
             str: 合并的文件内容
         """
         contents = []
         
-        for file_path in input_files:
+        if not self.artifact_store:
+            return "[错误] ArtifactStore 未初始化，无法读取输入 artifacts。"
+
+        for artifact_ref in input_artifact_refs:
             try:
-                if self.file_manager:
-                    # 使用 FileManager 读取（带安全检查）
-                    content = self.file_manager.read_artifact(file_path)
-                else:
-                    # 直接读取文件
-                    content = file_path.read_text(encoding="utf-8")
-                
-                contents.append(f"## 输入文件: {file_path.name}\n\n{content}")
-            
-            except FileNotFoundError:
-                contents.append(f"## 输入文件: {file_path.name}\n\n[错误] 文件不存在")
+                normalized_ref = str(artifact_ref or "").strip()
+                if not normalized_ref:
+                    continue
+                content = self.artifact_store.read(normalized_ref)
+                meta = self.artifact_store.read_metadata(normalized_ref)
+                kind = str(meta.get("kind") or "unknown")
+                task_id = str(meta.get("task_id") or "")
+                contents.append(
+                    "\n".join(
+                        [
+                            f"## 输入 Artifact: {normalized_ref}",
+                            f"- kind: {kind}",
+                            f"- source_task: {task_id or 'N/A'}",
+                            "",
+                            content,
+                        ]
+                    )
+                )
             except Exception as e:
-                contents.append(f"## 输入文件: {file_path.name}\n\n[错误] 读取失败: {str(e)}")
+                contents.append(
+                    f"## 输入 Artifact: {artifact_ref}\n\n[错误] 读取失败: {str(e)}"
+                )
         
         return "\n\n---\n\n".join(contents) if contents else ""
     
@@ -488,7 +508,7 @@ class AgentDelegate:
                 llm_client=self.llm_client,
                 max_iterations=max_iterations,
                 max_depth=10,
-                verbose=True,
+                verbose=self.verbose,
                 system_prompt=base_prompt,
             )
             
@@ -606,43 +626,43 @@ class AgentDelegate:
         
         return "\n".join(lines)
     
-    async def _write_output_file(
+    async def _write_output_artifact(
         self,
-        output_file: Path,
         content: str,
         summary: str,
-    ) -> None:
+        task_id: str,
+        task_group: str,
+        agent_type: str,
+    ) -> str:
         """
-        写入输出文件并写入摘要文件
-        
+        写入任务输出 Artifact 并返回 artifact_ref。
+
         Args:
-            output_file: 输出文件路径
-            content: 文件内容
-            summary: 摘要内容（Markdown 纯文本）
-        
-        Raises:
-            Exception: 写入失败
+            content: 任务输出正文
+            summary: 输出摘要（Markdown 纯文本）
+            task_id: 任务 ID
+            task_group: workflow/task_group
+            agent_type: agent 类型
         """
-        try:
-            if self.file_manager:
-                # 使用 FileManager 写入（带安全检查）
-                self.file_manager.write_artifact(output_file, content)
-            else:
-                # 确保目录存在
-                output_file.parent.mkdir(parents=True, exist_ok=True)
-                # 直接写入文件
-                output_file.write_text(content, encoding="utf-8")
-
-            if not summary or not summary.strip():
-                raise Exception("摘要为空，无法写入 summary 文件")
-            summary_path = output_file.with_suffix(".summary.md")
-            if self.file_manager:
-                self.file_manager.write_artifact(summary_path, summary)
-            else:
-                summary_path.write_text(summary, encoding="utf-8")
-
-        except Exception as e:
-            raise Exception(f"写入输出文件失败: {str(e)}")
+        if not self.artifact_store:
+            raise Exception("ArtifactStore 未初始化")
+        if not summary or not summary.strip():
+            raise Exception("摘要为空，无法写入输出 Artifact")
+        ref = self.artifact_store.put_text(
+            content=content,
+            kind="task_output",
+            summary=summary,
+            workflow_id=(task_group or "").strip(),
+            task_id=(task_id or "").strip(),
+            producer="agent_delegate",
+            metadata={
+                "agent_type": agent_type,
+                "task_id": task_id,
+                "task_group": task_group,
+                "kind": "task_output",
+            },
+        )
+        return ref.artifact_id
 
 
 __all__ = [

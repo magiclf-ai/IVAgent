@@ -14,11 +14,11 @@ import time
 from langchain_openai import ChatOpenAI
 from ..engines import BaseStaticAnalysisEngine
 from ..core import ToolBasedLLMClient, SummaryService
+from ..core.cli_logger import CLILogger
 from ..core.context import MessageManager, ContextAssembler, ContextCompressor, ArtifactStore, ReadArtifactPruner
 from ..core.agent_logger import get_agent_log_manager, AgentStatus
 from .tools import OrchestratorTools
 from .task_list_manager import TaskListManager
-from .file_manager import FileManager
 from .agent_delegate import AgentDelegate
 
 
@@ -86,6 +86,7 @@ class TaskExecutorAgent:
         self.enable_logging = enable_logging
         self.execution_phase = execution_phase or "base"
         self.agent_id = f"task_executor_{self.task_group}"
+        self._logger = CLILogger(component=f"TaskExecutor:{self.task_group}", verbose=verbose)
         self.target_function = (
             f"task_group: {self.task_group}"
             if self.task_group
@@ -96,8 +97,8 @@ class TaskExecutorAgent:
         self.executor_dir = session_dir / task_group
         self.executor_dir.mkdir(parents=True, exist_ok=True)
 
-        # 独立的 artifact 目录
-        self.artifact_dir = self.executor_dir / "artifacts"
+        # 统一 artifact 目录（session 级）
+        self.artifact_dir = self.session_dir / "artifacts"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
         # 状态
@@ -158,6 +159,9 @@ class TaskExecutorAgent:
         )
         self.context_compressor = ContextCompressor(
             summary_service=self.summary_service,
+            compression_profile="task_executor",
+            consumer_agent="task_executor",
+            compression_purpose="task execution progression and recovery",
         )
         self.read_artifact_pruner = ReadArtifactPruner()
 
@@ -167,6 +171,9 @@ class TaskExecutorAgent:
             compressor=self.context_compressor,
             read_artifact_pruner=self.read_artifact_pruner,
             token_threshold=8000,
+            compression_profile="task_executor",
+            compression_consumer="task_executor",
+            compression_purpose="task execution progression and recovery",
         )
 
         # 6. 任务列表管理器（统一任务看板）
@@ -175,19 +182,15 @@ class TaskExecutorAgent:
             tasks_file=tasks_file,
         )
 
-        # 7. 文件管理器（统一 artifacts 目录）
-        self.file_manager = FileManager(
-            session_dir=self.session_dir,
-        )
-
-        # 8. Agent 委托器
+        # 7. Agent 委托器
         self.agent_delegate: AgentDelegate = AgentDelegate(
             engine=self.engine,
             llm_client=self.llm_client,
-            file_manager=self.file_manager,
+            artifact_store=self.artifact_store,
+            verbose=self.verbose,
         )
 
-        # 9. 工具管理器
+        # 8. 工具管理器
         self.tools_manager = OrchestratorTools(
             llm_client=self.llm_client,
             workflow_context=None,
@@ -198,7 +201,10 @@ class TaskExecutorAgent:
             session_id=self.task_group,
             summary_service=self.summary_service,
             tool_output_summary_threshold=self.message_manager.max_inline_chars,
+            verbose=self.verbose,
+            logger=self._logger,
         )
+        self.tools_manager.set_message_manager(self.message_manager)
 
         # 10. 设置已初始化的引擎
         self.tools_manager.engine = self.engine
@@ -215,26 +221,18 @@ class TaskExecutorAgent:
             self.tools_manager.engine_name = engine_cls
         self.tools_manager._initialized = True
 
-        # 11. 设置组件引用
+        # 10. 设置组件引用
         self.tools_manager._task_list_manager = self.task_list_manager
-        self.tools_manager._file_manager = self.file_manager
         self.tools_manager._agent_delegate = self.agent_delegate
 
-        # 12. 创建工具列表（仅执行器工具）
+        # 11. 创建工具列表（仅执行器工具）
         self.tools = self.tools_manager.get_executor_tools()
 
     def _log(self, message: str, level: str = "info") -> None:
         """打印日志"""
-        if self.verbose:
-            prefix = f"[TaskExecutor:{self.task_group}]"
-            if level == "error":
-                print(f"[X] {prefix} {message}")
-            elif level == "warning":
-                print(f"[!] {prefix} {message}")
-            elif level == "success":
-                print(f"[+] {prefix} {message}")
-            else:
-                print(f"[*] {prefix} {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="task_executor.event", message=message)
 
     def _normalize_tool_output(self, result_data: Any) -> tuple[str, Optional[str]]:
         """
@@ -253,46 +251,69 @@ class TaskExecutorAgent:
 
     def _get_system_prompt(self) -> str:
         """获取系统提示词（执行器模式）"""
-        return f"""# 任务执行器
+        return """# 任务执行器
 
 你是一个**漏洞挖掘任务执行器**，只负责执行任务列表，不负责规划。
 请严格依据任务描述与工具返回结果行动，**优先通过 tool call 获取证据**，禁止以经验推断代替代码事实。
 
-# 当前任务分组
-
-{self.task_group}
-
-# 当前目标
-
-{self.goal}
-
 # 可用工具
 
-- `execute_next_task(agent_type, additional_context, task_group)`: 执行下一个任务
+- `list_runnable_tasks(task_group, agent_type)`: 查看可执行任务与阻塞原因
+- `compose_task_context(analysis_target, task_id, artifact_refs, conversation_context, extra_context, required_sections, mode, task_group)`: 组装任务上下文（analysis_target 可留空并回退到任务描述）
+- `execute_task(task_id, task_group, additional_context, selected_file_ids, context_ref)`: 执行指定任务（`selected_file_ids` 传 `artifact_ref` 列表）
+- `execute_tasks(task_ids, task_group, ...)`: 执行指定任务集合（支持并发）
 - `get_task_status(task_group)`: 获取任务列表状态
 - `read_task_output(task_id)`: 读取指定任务输出
 - `resolve_function_identifier(task_id, query_hint)`: 解析 function_identifier 候选
 - `set_task_function_identifier(task_id, function_identifier, source="search_symbol")`: 写回 function_identifier
+- `delegate_code_explorer(query, context, max_iterations)`: 受限委托 code_explorer 做探索取证
 - `read_artifact(artifact_id)`: 读取已归档内容
+- `mark_compression_projection(remove_message_ids, fold_message_ids, reason)`: 提交上下文裁切清单（按消息ID）
 
 # 执行要求
 
-1. **只执行任务，不要规划**：禁止调用 `plan_tasks` 或 `delegate_task`。
-2. **必须带 task_group**：所有执行相关调用必须显式传入 task_group=`{self.task_group}`。
-3. **遇到缺失 function_identifier**：按顺序调用
-   - `resolve_function_identifier` → `set_task_function_identifier` → `execute_next_task(agent_type="vuln_analysis", task_group="{self.task_group}")`
-4. **任务未完成禁止结束**：只要当前 task_group 还有 pending / in_progress，必须继续执行。
-5. **上下文摘要必须基于事实**：analysis_context 只能包含入参约束/全局约束/风险点等代码事实，禁止编造或“应当/需要”类描述。
-6. **当传递 additional_context 时必须结构化**：优先使用并保持以下章节标题
+1. **只执行任务，不要规划**：禁止调用 `plan_tasks`、`append_tasks`、通用 `delegate_task`。
+2. **必须带 task_group**：所有执行相关调用必须显式传入当前任务分组的 `task_group`。
+3. **按任务执行**：优先使用 `list_runnable_tasks -> compose_task_context -> execute_task`。
+4. **agent_type 必须匹配当前待执行任务**：从任务看板读取目标任务的 agent_type，禁止猜测或固定写 `vuln_analysis`。
+5. **任务未完成禁止结束**：只要当前 task_group 还有 pending / in_progress，必须继续执行。
+6. **上下文摘要必须基于事实**：analysis_context 只能包含目标函数约束与证据等代码事实，禁止编造或“应当/需要”类描述。
+7. **当传递 additional_context 时必须结构化**：优先使用并保持以下章节标题
    - `## 目标函数`
-   - `## 攻击者可控性`
-   - `## 输入与边界约束`
-   - `## 全局/状态/认证约束`
-   - `## 风险操作与漏洞假设`
-   - `## 可利用性前提`
+   - `## 入参约束`
+   - `## 全局变量约束`
    - `## 证据锚点`
-   - `## 未知项与待验证`
-   若缺证据锚点，不要补写推断，先通过工具取证。
+   其中 `## 入参约束` 必须按参数逐条给出：来源/可控性/污点/边界/校验/证据。
+   且入参约束仅允许目标函数签名参数，局部变量只能作为证据锚点。
+   若缺约束或证据锚点，不要补写推断，先通过工具取证。
+8. **优先最小动作推进**：若任务列表已给出，首轮优先执行 `list_runnable_tasks` 后直接 `execute_task`。
+9. **避免无效重试**：同一错误码连续出现 2 次且无新证据时，必须切换策略（读取产物或调用 `delegate_code_explorer`）。
+10. **禁止空转**：连续 5 轮任务状态无变化时，输出失败摘要并停止。
+11. **特殊错误处理指南（必须遵守）**：
+    - `MISSING_FUNCTION_IDENTIFIER`：先 `resolve_function_identifier`，再 `set_task_function_identifier`，然后重试执行。
+    - `INVALID_ARGUMENT`：先修正参数，再重试；不要在参数错误状态下做无关调用。
+    - `MISSING_TASK_GROUP`：先确认并传入正确 `task_group` 后再执行。
+    - `RECOVERY_LOCK_ACTIVE`：优先处理被锁定任务，禁止跳过。
+    - `MISSING_TASK_OUTPUT_ARTIFACT`：不要重复调用 `read_task_output`；先看 `task_status`，必要时 `list_task_artifacts` / `get_task_status`，再执行 `execute_task` 产出输出。
+    - `OUTPUT_ARTIFACT_NOT_FOUND`：先核对 `artifact_ref` 与槽位绑定，必要时重试 `execute_task` 重新生成输出。
+    - `INSUFFICIENT_CONTEXT` / `MISSING_ANALYSIS_CONTEXT`：先 `read_task_output`/`read_artifact` 取证，不足再 `delegate_code_explorer`，然后按需 `compose_task_context` 后重试。
+    - `ENGINE_NOT_READY` / `LLM_CLIENT_UNAVAILABLE`：视为环境阻塞，立即停止并上报。
+
+# 压缩信号驱动（必须遵守）
+
+若上下文包含压缩摘要章节：
+- `## 与当前分析目标匹配的语义理解蒸馏`
+- `### 是否需要继续获取信息`
+- `### 最小补充信息集`
+- `## LLM 驱动裁切上下文`
+
+则必须按以下规则执行：
+1. `是否需要继续获取信息 = 是`：优先执行最小补证动作，不得直接宣告完成。
+2. `是否需要继续获取信息 = 否`：默认禁止重复取证，优先推进当前可执行任务闭环。
+3. 裁切上下文章节仅用于去重与降噪，不得删除对未完成任务仍关键的证据链。
+4. 若需要提交裁切清单，必须使用消息首行的 `消息ID: ...` 作为 `remove_message_ids` / `fold_message_ids`。
+5. 提交裁切清单时必须规避 tool call 链断裂：assistant tool_call 与 ToolMessage 需保持成对可追踪关系。
+6. 对于会破坏链路的长消息，优先使用 `fold_message_ids` 折叠，不要删除。
 
 现在开始执行你的任务。"""
 
@@ -354,27 +375,22 @@ class TaskExecutorAgent:
                 preview = "；".join(t.description for t in pending_tasks[:3])
                 self._log(f"待执行任务摘要: {preview}")
 
-            # 1. 初始化消息：告诉执行器任务约束
-            task_lines = []
-            for i, task in enumerate(group_tasks, 1):
-                desc = task.description
-                agent_type = task.agent_type
-                task_desc = f"[{agent_type}] {desc}" if agent_type else desc
-                task_lines.append(f"{i}. {task_desc}")
-
+            # 1. 初始化消息：告诉执行器任务约束（任务清单以 list_runnable_tasks 为唯一权威来源）
             await self.message_manager.add_user_message(
                 f"""你的任务分组是：{self.task_group}
 
 目标：{self.goal}
 
-任务列表：
-{chr(10).join(task_lines)}
-
 执行规则：
 - 只执行任务，不要规划。
 - 所有执行相关调用必须显式传入 task_group="{self.task_group}"。
-- 若出现 MISSING_FUNCTION_IDENTIFIER，按顺序调用：
-  resolve_function_identifier -> set_task_function_identifier -> execute_next_task(agent_type="vuln_analysis", task_group="{self.task_group}")。
+- 优先调用 list_runnable_tasks 后使用 execute_task 推进。
+- 上下文优先使用 compose_task_context 生成。
+- 首轮先调用 list_runnable_tasks 获取权威任务列表，不要先调用 get_task_status。
+- agent_type 必须使用目标任务要求的类型，禁止固定为 vuln_analysis。
+- 若遇到证据不足，可先 read_task_output/read_artifact，再按需调用 delegate_code_explorer。
+- 若出现 MISSING_FUNCTION_IDENTIFIER，先 resolve_function_identifier，再 set_task_function_identifier，然后重试执行。
+- 若同一错误连续出现且无新证据，请切换策略，不要重复无效调用。
 - 若出现 MISSING_AGENT_TYPE，请回到规划阶段补齐。
 """
             )
@@ -383,13 +399,26 @@ class TaskExecutorAgent:
             max_iterations = 30
             iteration = 0
             stall_rounds = 0
+            no_progress_rounds = 0
+            last_stats = self.task_list_manager.get_statistics(task_group=self.task_group)
 
             while True:
                 iteration += 1
-                self._log(f"迭代 {iteration}/{max_iterations}")
+                self._log(f"迭代 {iteration}/{max_iterations}", "debug")
 
                 if iteration > max_iterations:
                     self._log(f"达到最大迭代次数 {max_iterations}，结束执行", "warning")
+                    break
+
+                # 硬收敛：当前 task_group 无 pending/in_progress 时立即结束，避免空转
+                current_stats = self.task_list_manager.get_statistics(task_group=self.task_group)
+                if current_stats.get("pending", 0) == 0 and current_stats.get("in_progress", 0) == 0:
+                    if current_stats.get("failed", 0) == 0 and current_stats.get("total", 0) > 0:
+                        self._log("检测到任务组已无待执行项，提前收敛结束", "success")
+                        self.completed = True
+                    else:
+                        self._log("检测到任务组无待执行项但存在失败任务，提前终止", "warning")
+                        self.errors.append("任务组无待执行项但存在失败任务，停止继续工具循环。")
                     break
 
                 assembled_messages = await self.context_assembler.build_messages(
@@ -416,7 +445,8 @@ class TaskExecutorAgent:
                         )
                         await self.message_manager.add_user_message(
                             "任务尚未完成，必须继续调用工具。"
-                            "若出现 MISSING_FUNCTION_IDENTIFIER，请按恢复链路处理。"
+                            "请根据最近错误原因选择下一步，避免重复无效调用。"
+                            "若证据不足，请先 read_task_output/read_artifact，必要时调用 delegate_code_explorer。"
                         )
                         if stall_rounds >= 3:
                             self.errors.append("连续 3 轮无工具调用且任务未完成，保护性终止。")
@@ -427,12 +457,15 @@ class TaskExecutorAgent:
                     break
 
                 stall_rounds = 0
+                executed_task_in_round = False
                 for tool_call in result.tool_calls:
                     tool_name = tool_call.get("name", "")
                     tool_args = tool_call.get("args", {})
                     tool_id = tool_call.get("id", "")
 
-                    self._log(f"Tool 调用: {tool_name}")
+                    self._log(f"Tool 调用: {tool_name}", "debug")
+                    if tool_name in {"execute_task", "execute_tasks"}:
+                        executed_task_in_round = True
 
                     try:
                         result_data = await self._execute_tool(tool_name, tool_args)
@@ -460,6 +493,40 @@ class TaskExecutorAgent:
                             tool_name=tool_name,
                             tool_call_id=tool_id,
                         )
+
+                # 进度感知收敛：若连续多轮状态无变化，避免 read_task_output/get_task_status 空转
+                current_stats = self.task_list_manager.get_statistics(task_group=self.task_group)
+                progressed = (
+                    current_stats.get("completed", 0) != last_stats.get("completed", 0)
+                    or current_stats.get("pending", 0) != last_stats.get("pending", 0)
+                    or current_stats.get("failed", 0) != last_stats.get("failed", 0)
+                )
+                has_unfinished = (
+                    current_stats.get("pending", 0) > 0
+                    or current_stats.get("in_progress", 0) > 0
+                )
+
+                if progressed:
+                    no_progress_rounds = 0
+                elif has_unfinished:
+                    no_progress_rounds += 1
+                    self._log(
+                        f"检测到任务状态无进展 ({no_progress_rounds}/5)",
+                        "warning",
+                    )
+                    if not executed_task_in_round and no_progress_rounds >= 2:
+                        await self.message_manager.add_user_message(
+                            "当前任务状态未推进。请根据最近错误码先补齐缺失前置条件，"
+                            "或先取证（read_task_output/read_artifact/delegate_code_explorer）后再重试执行。"
+                        )
+                    if no_progress_rounds >= 5:
+                        self.errors.append("连续 5 轮有工具调用但任务状态无进展，保护性终止。")
+                        self._log("连续 5 轮无进展，保护性终止。", "warning")
+                        break
+                else:
+                    no_progress_rounds = 0
+
+                last_stats = current_stats
 
             # 3. 汇总结果
             end_time = time.time()
@@ -498,8 +565,20 @@ class TaskExecutorAgent:
                 for error in self.errors:
                     summary += f"- {error}\n"
 
-            summary_file = self.executor_dir / "task_group_summary.md"
-            summary_file.write_text(summary, encoding="utf-8")
+            summary_ref = self.artifact_store.put_text(
+                content=summary,
+                kind="task_group_summary",
+                summary=f"{self.task_group} 执行摘要",
+                workflow_id=self.task_group,
+                producer="task_executor",
+                metadata={
+                    "kind": "task_group_summary",
+                    "task_group": self.task_group,
+                    "workflow_name": self.workflow_name,
+                    "execution_phase": self.execution_phase,
+                },
+            ).artifact_id
+            self._log(f"已写入任务组摘要 artifact: {summary_ref}")
 
             self._log(f"执行完成: {completed_tasks}/{total_tasks} 任务完成", "success")
 
@@ -559,7 +638,12 @@ class TaskExecutorAgent:
         tool_method = getattr(self.tools_manager, tool_name, None)
         if tool_method is None:
             return {"error": f"Unknown tool: {tool_name}"}
-        if tool_name == "execute_next_task" and "task_group" not in tool_args:
+        if tool_name in {
+            "list_runnable_tasks",
+            "compose_task_context",
+            "execute_task",
+            "execute_tasks",
+        } and "task_group" not in tool_args:
             tool_args["task_group"] = self.task_group
         try:
             result = await tool_method(**tool_args)

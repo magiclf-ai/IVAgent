@@ -669,7 +669,7 @@ ITERATION_PROMPT_TEMPLATE = """
 
 ### 目标函数
 - 名称: {func_name}
-- 签名: {func_signature}
+- 函数标识符: {func_signature}
 
 ### 上下文约束
 {context_constraints}
@@ -867,10 +867,16 @@ def build_iteration_prompt(
 
 """
 
+    func_identifier = (
+        getattr(func_def, "function_identifier", None)
+        or getattr(func_def, "signature", None)
+        or getattr(func_def, "identifier", "")
+    )
+
     prompt = ITERATION_PROMPT_TEMPLATE.format(
         iteration=iteration + 1,
         func_name=func_def.name,
-        func_signature=func_def.signature,
+        func_signature=func_identifier,
         context_constraints=context_constraints,
         func_code=func_def.code,
         depth=context.depth,
@@ -1471,7 +1477,8 @@ FUNCTION_SUMMARY_ANALYSIS_TEMPLATE = """
 # 目标函数信息
 
 - 函数名: {func_name}
-- 签名: {func_signature}
+- 函数标识符: {func_identifier}
+- 可读签名: {func_signature}
 
 ## 分析上下文
 
@@ -1490,17 +1497,17 @@ SIMPLE_TEXT_SUMMARY_PROMPT = """
 你是资深软件分析专家，聚焦**安全导向的函数静态分析**，擅长从源码中提取核心行为、精准识别参数可信/污点属性、梳理约束检查与全局变量操作，为漏洞挖掘提供高精准的函数摘要信息。
 
 ## 核心任务
-基于给定的函数名、函数签名和完整源码，严格按要求提取**函数行为、参数约束、返回值含义、全局变量操作**四大核心信息，无分析过程、无冗余表述，仅输出标准化结果。
+基于给定的函数名、函数标识符、函数签名和完整源码，严格按要求提取**函数行为、参数约束、返回值含义、全局变量操作**四大核心信息，无分析过程、无冗余表述，仅输出标准化结果。
 
 ## 保真与证据约束（必须）
-1. 以函数签名为唯一标识锚点，所有结论必须可在源码中定位，禁止编造。
+1. 以函数标识符为唯一锚点，函数签名仅作可读参考；所有结论必须可在源码中定位，禁止编造。
 2. 参数约束必须优先保留漏洞挖掘关键事实：可控输入来源、长度/计数/索引边界、类型转换与符号影响、状态前置条件。
 3. 若存在全局变量/对象状态/认证状态对路径有约束，必须写入 `global_var_operations`，不要遗漏。
 4. 若信息不足，不要猜测；在对应字段用“未见明确证据/待验证”表述。
 5. 仅保留事实，不输出“应当/需要/建议”等规范性措辞。
 
 ## 分析流程【按序执行，无遗漏】
-1. 精读函数源码与签名，梳理核心业务逻辑，识别**显式的安全检查、参数校验、条件约束**规则；
+1. 精读函数源码与标识信息，梳理核心业务逻辑，识别**显式的安全检查、参数校验、条件约束**规则；
 2. 判定每个参数的可信/污点属性，梳理返回值与执行结果的关联、全局变量的读/写/修改行为，最终按格式整合所有信息。
 
 ## 分析要点【强制遵守字数+内容要求】
@@ -1511,7 +1518,8 @@ SIMPLE_TEXT_SUMMARY_PROMPT = """
 
 ## 目标函数
 - 函数名: {func_name}
-- 签名: {func_signature}
+- 函数标识符: {func_identifier}
+- 可读签名: {func_signature}
 
 ## 函数源码
 ```{code_lang}

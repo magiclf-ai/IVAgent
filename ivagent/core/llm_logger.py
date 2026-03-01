@@ -19,6 +19,9 @@ from contextlib import contextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+from .cli_logger import CLILogger
+
+_internal_logger = CLILogger(component="LLMLogManager")
 
 class LogStorageType(Enum):
     """日志存储类型"""
@@ -868,7 +871,11 @@ class LLMLogManager:
                 self.storage = MemoryLogStorage()
         except Exception as e:
             # 如果初始化失败，使用内存存储作为回退
-            print(f"Warning: Failed to initialize log storage: {e}, using memory storage")
+            _internal_logger.warning(
+                "llm_logger.storage_fallback",
+                "日志存储初始化失败，回退到内存存储",
+                error=str(e),
+            )
             self.storage = MemoryLogStorage()
         
         self._executor = ThreadPoolExecutor(max_workers=2)

@@ -11,6 +11,7 @@ import asyncio
 import pickle
 import hashlib
 
+from .cli_logger import CLILogger
 
 class AnalysisState(str, Enum):
     """分析状态枚举"""
@@ -53,6 +54,7 @@ class RedisCache:
         self._available = False
         self._availability_error_logged = False
         self._last_unavailable_message = ""
+        self._logger = CLILogger(component="RedisCache")
 
     def ensure_available(self) -> None:
         """确保 Redis 可用，不可用时给出一次性友好提示并抛错"""
@@ -75,7 +77,7 @@ class RedisCache:
             detailed = f"{message} 原因: {e}"
             self._last_unavailable_message = detailed
             if not self._availability_error_logged:
-                print(f"[RedisCache] {detailed}")
+                self._logger.error("cache.redis.unavailable", detailed, host=self.host, port=self.port)
                 self._availability_error_logged = True
             raise RuntimeError(detailed)
     
@@ -108,7 +110,7 @@ class RedisCache:
                 return None
             return pickle.loads(data)
         except Exception as e:
-            print(f"[RedisCache] Get error for key {key}: {e}")
+            self._logger.warning("cache.redis.get_failed", str(e), key=key)
             return None
     
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
@@ -121,7 +123,7 @@ class RedisCache:
             self._get_redis().setex(full_key, expire, data)
             return True
         except Exception as e:
-            print(f"[RedisCache] Set error for key {key}: {e}")
+            self._logger.warning("cache.redis.set_failed", str(e), key=key)
             return False
     
     def expire(self, key: str, ttl: Optional[int] = None) -> bool:
@@ -133,7 +135,7 @@ class RedisCache:
             result = self._get_redis().expire(full_key, expire)
             return bool(result)
         except Exception as e:
-            print(f"[RedisCache] Expire error for key {key}: {e}")
+            self._logger.warning("cache.redis.expire_failed", str(e), key=key)
             return False
     
     def delete(self, key: str) -> bool:
@@ -144,7 +146,7 @@ class RedisCache:
             self._get_redis().delete(full_key)
             return True
         except Exception as e:
-            print(f"[RedisCache] Delete error for key {key}: {e}")
+            self._logger.warning("cache.redis.delete_failed", str(e), key=key)
             return False
     
     def exists(self, key: str) -> bool:
@@ -154,7 +156,7 @@ class RedisCache:
             full_key = self._make_key(key)
             return self._get_redis().exists(full_key) > 0
         except Exception as e:
-            print(f"[RedisCache] Exists error for key {key}: {e}")
+            self._logger.warning("cache.redis.exists_failed", str(e), key=key)
             return False
     
     def clear(self) -> bool:
@@ -167,7 +169,7 @@ class RedisCache:
                 redis_client.delete(key)
             return True
         except Exception as e:
-            print(f"[RedisCache] Clear error: {e}")
+            self._logger.warning("cache.redis.clear_failed", str(e))
             return False
 
 
@@ -200,11 +202,13 @@ class FunctionSummaryCache:
         self.wait_interval = wait_interval
         self.max_wait_time = max_wait_time
         self.verbose = verbose
+        self._logger = CLILogger(component="SummaryCache", verbose=verbose)
     
     def log(self, message: str, level: str = "INFO"):
         """打印日志（统一日志格式）"""
-        if self.verbose:
-            print(f"[{level}] FunctionSummaryCache: {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="cache.summary.event", message=message)
     
     def _generate_cache_key(self, function_identifier: str, context_hash: Optional[str] = None) -> str:
         """
@@ -262,7 +266,7 @@ class FunctionSummaryCache:
                 redis_client.setex(status_key, expire, state.value)
                 return True
         except Exception as e:
-            print(f"[FunctionSummaryCache] Set status error: {e}")
+            self._logger.warning("cache.summary.set_status_failed", str(e), status_key=status_key)
             return False
     
     def _delete_status(self, status_key: str) -> bool:
@@ -272,7 +276,7 @@ class FunctionSummaryCache:
             self.cache._get_redis().delete(status_key)
             return True
         except Exception as e:
-            print(f"[FunctionSummaryCache] Delete status error: {e}")
+            self._logger.warning("cache.summary.delete_status_failed", str(e), status_key=status_key)
             return False
     
     def _acquire_lock(self, lock_key: str):
@@ -288,7 +292,7 @@ class FunctionSummaryCache:
                 return lock
             return None
         except Exception as e:
-            print(f"[FunctionSummaryCache] Lock acquire error: {e}")
+            self._logger.warning("cache.summary.acquire_lock_failed", str(e), lock_key=lock_key)
             return None
     
     def _release_lock(self, lock) -> bool:
@@ -297,7 +301,7 @@ class FunctionSummaryCache:
             lock.release()
             return True
         except Exception as e:
-            print(f"[FunctionSummaryCache] Lock release error: {e}")
+            self._logger.warning("cache.summary.release_lock_failed", str(e))
             return False
     
     def get(self, function_identifier: str, context_hash: Optional[str] = None) -> Optional[Any]:
@@ -341,7 +345,7 @@ class FunctionSummaryCache:
         # 步骤1: 检查缓存
         cached = self.get(function_identifier, context_hash)
         if cached is not None:
-            self.log(f"Cache hit for {function_identifier}")
+            self.log(f"Cache hit for {function_identifier}", "DEBUG")
             # 刷新缓存 TTL，延长存活时间
             self.refresh_ttl(function_identifier, context_hash, ttl)
             return cached
@@ -352,14 +356,14 @@ class FunctionSummaryCache:
             status = self._get_status(status_key)
             
             if status == AnalysisState.ANALYZING:
-                self.log(f"Waiting for ongoing analysis: {function_identifier}")
+                self.log(f"Waiting for ongoing analysis: {function_identifier}", "DEBUG")
                 await asyncio.sleep(self.wait_interval)
                 wait_time += self.wait_interval
                 
                 # 再次检查缓存
                 cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit after waiting: {function_identifier}")
+                    self.log(f"Cache hit after waiting: {function_identifier}", "DEBUG")
                     # 刷新缓存 TTL
                     self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
@@ -368,12 +372,12 @@ class FunctionSummaryCache:
             elif status == AnalysisState.COMPLETED:
                 cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit (status=completed): {function_identifier}")
+                    self.log(f"Cache hit (status=completed): {function_identifier}", "DEBUG")
                     # 刷新缓存 TTL
                     self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
                 # 缓存丢失，重新分析
-                self.log(f"Cache lost (status=completed but no data), retrying: {function_identifier}")
+                self.log(f"Cache lost (status=completed but no data), retrying: {function_identifier}", "DEBUG")
                 self._delete_status(status_key)
             
             elif status == AnalysisState.FAILED:
@@ -394,7 +398,7 @@ class FunctionSummaryCache:
                 # 双重检查缓存
                 cached = self.get(function_identifier, context_hash)
                 if cached is not None:
-                    self.log(f"Cache hit (double-check): {function_identifier}")
+                    self.log(f"Cache hit (double-check): {function_identifier}", "DEBUG")
                     # 刷新缓存 TTL
                     self.refresh_ttl(function_identifier, context_hash, ttl)
                     return cached
@@ -410,7 +414,7 @@ class FunctionSummaryCache:
                     wait_time += self.wait_interval
                     continue
                 
-                self.log(f"Starting analysis: {function_identifier}")
+                self.log(f"Starting analysis: {function_identifier}", "DEBUG")
                 
                 # 执行分析（compute_func 是异步函数），添加超时控制
                 try:
@@ -429,7 +433,7 @@ class FunctionSummaryCache:
                 # 更新状态为完成（延长 TTL，避免过早过期）
                 self._set_status(status_key, AnalysisState.COMPLETED, ttl=3600)
                 
-                self.log(f"Analysis completed: {function_identifier}")
+                self.log(f"Analysis completed: {function_identifier}", "DEBUG")
                 return result
                 
             except Exception as e:

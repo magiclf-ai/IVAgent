@@ -11,17 +11,25 @@ import argparse
 import asyncio
 import os
 import sys
+import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
-import os
+from ivagent.core.cli_logger import CLILogger, format_duration
 
 
-def disable_system_proxy():
+# 禁用本地地址的代理，避免请求被转发到代理服务器
+os.environ['no_proxy'] = '127.0.0.1,localhost'
+os.environ['NO_PROXY'] = '127.0.0.1,localhost'
+
+def disable_system_proxy(logger: Optional[CLILogger] = None) -> list[str]:
     """
     彻底禁用系统代理（清除所有相关环境变量）
     覆盖大小写形式，适配不同操作系统的命名习惯
     """
+    logger = logger or CLILogger(component="orchestrator_cli")
+
     # 所有可能的代理环境变量（包含大小写，覆盖Windows/Linux/macOS）
     proxy_env_vars = [
         'HTTP_PROXY', 'HTTPS_PROXY', 'FTP_PROXY', 'SOCKS_PROXY',
@@ -29,21 +37,22 @@ def disable_system_proxy():
         'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'
     ]
 
+    cleared_vars: list[str] = []
+
     # 逐个删除环境变量
     for var in proxy_env_vars:
         if var in os.environ:
             del os.environ[var]
-            print(f"已清除系统代理环境变量: {var}")
+            cleared_vars.append(var)
+            logger.debug("proxy.cleared", "已清除系统代理环境变量", env_var=var)
 
     # 验证是否清理干净
     remaining_proxy_vars = [var for var in proxy_env_vars if var in os.environ]
     if not remaining_proxy_vars:
-        print("✅ 所有系统代理环境变量已清除，系统代理已禁用")
+        logger.info("proxy.disabled", "系统代理已禁用", cleared=len(cleared_vars))
     else:
-        print(f"⚠️ 仍有未清除的代理变量: {remaining_proxy_vars}")
-
-
-disable_system_proxy()
+        logger.warning("proxy.remaining", "仍有未清除代理变量", variables=",".join(remaining_proxy_vars))
+    return cleared_vars
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent
@@ -94,6 +103,7 @@ async def run_workflow(
         source_root: Optional[str] = None,
         execution_mode: str = "parallel",
         verbose: bool = True,
+        logger: Optional[CLILogger] = None,
 ) -> MasterOrchestratorResult:
     """
     执行 Workflow
@@ -105,6 +115,7 @@ async def run_workflow(
         source_root: 源代码根目录（可选，用于源码分析）
         execution_mode: 执行模式 (sequential, parallel)
         verbose: 是否打印详细日志
+        logger: CLI 日志器（用于清理阶段告警）
 
     Returns:
         执行结果
@@ -123,13 +134,32 @@ async def run_workflow(
     )
 
     # 执行 Workflow
-    result = await orchestrator.execute_workflow(workflow_path, target_path=target_path)
+    try:
+        result = await orchestrator.execute_workflow(workflow_path, target_path=target_path)
+    finally:
+        # 显式关闭引擎，避免 aiohttp ClientSession 泄漏警告
+        engine = getattr(orchestrator, "engine", None)
+        if engine and hasattr(engine, "close"):
+            try:
+                await engine.close()
+            except Exception as e:
+                if logger:
+                    logger.warning("workflow.cleanup_failed", "引擎关闭失败", error=str(e))
 
     return result
 
 
 def main():
     """主函数"""
+    # Python 3.14 下第三方已知兼容 warning，避免污染 CLI 输出
+    warnings.filterwarnings(
+        "ignore",
+        message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+        category=UserWarning,
+    )
+
+    startup_t0 = time.perf_counter()
+
     parser = argparse.ArgumentParser(
         description="IVAgent Orchestrator - Workflow 驱动的漏洞挖掘",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -188,8 +218,14 @@ def main():
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
-        default=True,
-        help="打印详细日志（默认: True）",
+        default=False,
+        help="详细日志模式（显示更多阶段信息）",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="调试日志模式（显示全量追踪日志）",
     )
 
     parser.add_argument(
@@ -200,22 +236,44 @@ def main():
 
     args = parser.parse_args()
 
+    # 确定日志模式与显示开关
+    if args.debug:
+        log_mode = "debug"
+    elif args.verbose:
+        log_mode = "verbose"
+    else:
+        log_mode = "normal"
+    os.environ["IVAGENT_LOG_MODE"] = log_mode
+
+    verbose = not args.quiet
+    logger = CLILogger(component="orchestrator_cli", verbose=verbose, mode=log_mode)
+
+    # cleared_vars = disable_system_proxy(logger)
+
     # 检查 Workflow 文件是否存在
     workflow_path = Path(args.workflow)
     if not workflow_path.exists():
-        print(f"[X] Error: Workflow file not found: {args.workflow}")
+        logger.error(
+            "startup.invalid_workflow",
+            "Workflow 文件不存在",
+            workflow=args.workflow,
+        )
         sys.exit(1)
 
-    # 确定是否详细输出
-    verbose = args.verbose and not args.quiet
-
-    # 执行 Workflow
-    print(f"[*] IVAgent Orchestrator")
-    print(f"[*] Workflow: {args.workflow}")
-    print(f"[*] 执行模式: {args.mode}")
-    print()
+    startup_elapsed = time.perf_counter() - startup_t0
+    logger.success(
+        "startup.ready",
+        "CLI 启动完成，开始执行 Workflow",
+        startup_time=format_duration(startup_elapsed),
+        workflow=str(workflow_path.absolute()),
+        mode=args.mode,
+        engine=args.engine or "auto",
+        log_mode=log_mode,
+        proxy_cleared=len([]),
+    )
 
     try:
+        run_t0 = time.perf_counter()
         result = asyncio.run(run_workflow(
             workflow_path=str(workflow_path.absolute()),
             engine_type=args.engine,
@@ -223,36 +281,38 @@ def main():
             source_root=args.source_root,
             execution_mode=args.mode,
             verbose=verbose,
+            logger=logger,
         ))
 
-        print()
-        print("=" * 60)
-        print("执行结果")
-        print("=" * 60)
-        print(f"状态: {'成功' if result.success else '失败'}")
-        print(f"总 Workflow 数: {result.total_workflows}")
-        print(f"完成 Workflow 数: {result.completed_workflows}")
-        print(f"发现漏洞总数: {result.total_vulnerabilities}")
-        print(f"执行时间: {result.execution_time:.2f} 秒")
-        print()
-        print("摘要:")
-        print(result.summary)
+        wall_time = time.perf_counter() - run_t0
+        logger.success(
+            "workflow.completed",
+            "Workflow 执行完成",
+            status="成功" if result.success else "失败",
+            completed=f"{result.completed_workflows}/{result.total_workflows}",
+            vulnerabilities=result.total_vulnerabilities,
+            execution_time=format_duration(result.execution_time),
+            wall_time=format_duration(wall_time),
+        )
+        logger.info("workflow.summary", result.summary or "(无摘要)")
 
         if result.errors:
-            print()
-            print("警告/错误:")
-            for error in result.errors:
-                print(f"  - {error}")
+            for idx, error in enumerate(result.errors, 1):
+                logger.warning("workflow.issue", error, index=idx)
 
         sys.exit(0 if result.success else 1)
 
     except KeyboardInterrupt:
-        print("\n[!] 用户中断")
+        logger.warning("workflow.interrupted", "用户中断")
         sys.exit(130)
     except Exception as e:
-        print(f"\n[X] 执行失败: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(
+            "workflow.failed",
+            e,
+            workflow=str(workflow_path.absolute()),
+            mode=args.mode,
+            engine=args.engine or "auto",
+        )
         sys.exit(1)
 
 

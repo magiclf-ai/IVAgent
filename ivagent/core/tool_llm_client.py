@@ -19,6 +19,7 @@ from langchain_core.tools import tool, BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from .llm_logger import get_log_manager, LLMLogManager, LogStorageType
+from .cli_logger import CLILogger
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -94,11 +95,13 @@ class ToolBasedLLMClient:
         self.agent_id = agent_id
         self.log_metadata = log_metadata or {}
         self._log_manager = get_log_manager() if enable_logging else None
+        self._logger = CLILogger(component="ToolBasedLLMClient", verbose=verbose)
 
     def _log(self, message: str, level: str = "INFO"):
         """打印日志"""
-        if self.verbose:
-            print(f"[{level}] ToolBasedLLMClient: {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="tool_llm.event", message=message, agent_id=self.agent_id)
 
     def _messages_to_dict(self, messages: List[BaseMessage]) -> List[Dict[str, Any]]:
         """将消息列表转换为字典列表"""
@@ -133,6 +136,38 @@ class ToolBasedLLMClient:
                 pass
             result.append(tool_dict)
         return result
+
+    def _build_tool_name_alias_map(self, tools: List[Callable]) -> Dict[str, str]:
+        """
+        构建工具名别名映射：
+        - 原始函数名 -> 原始函数名
+        - 去掉 `_tool` 后缀的别名 -> 原始函数名
+        """
+        alias_map: Dict[str, str] = {}
+        for tool_func in tools:
+            raw_name = str(getattr(tool_func, "__name__", "") or "").strip()
+            if not raw_name:
+                continue
+            alias_map[raw_name] = raw_name
+            if raw_name.endswith("_tool"):
+                alias_map[raw_name[:-5]] = raw_name
+        return alias_map
+
+    def _normalize_tool_args(self, raw_args: Any) -> Dict[str, Any]:
+        """规范化工具参数，确保返回 dict。"""
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            text = raw_args.strip()
+            if not text:
+                return {}
+            try:
+                decoded = json.loads(text)
+                if isinstance(decoded, dict):
+                    return decoded
+            except Exception:
+                return {}
+        return {}
 
     async def atool_call(
         self,
@@ -192,6 +227,8 @@ class ToolBasedLLMClient:
         last_error = None
         final_retry_count = 0
 
+        tool_name_alias_map = self._build_tool_name_alias_map(tools)
+
         for attempt in range(self.max_retries):
             try:
                 # 绑定工具函数
@@ -201,7 +238,11 @@ class ToolBasedLLMClient:
                 response = await llm_with_tools.ainvoke(messages)
                 
                 # 解析响应
-                result = self._parse_tool_response(response, allow_text_response)
+                result = self._parse_tool_response(
+                    response=response,
+                    allow_text_response=allow_text_response,
+                    tool_name_alias_map=tool_name_alias_map,
+                )
                 
                 # 记录调用成功
                 final_retry_count = attempt
@@ -254,7 +295,8 @@ class ToolBasedLLMClient:
     def _parse_tool_response(
         self,
         response: AIMessage,
-        allow_text_response: bool = True
+        allow_text_response: bool = True,
+        tool_name_alias_map: Optional[Dict[str, str]] = None,
     ) -> ToolCallResult:
         """
         解析 LLM 响应，提取 Tool Call
@@ -271,17 +313,31 @@ class ToolBasedLLMClient:
         
         if tool_calls:
             parsed_calls = []
+            alias_map = tool_name_alias_map or {}
             for tc in tool_calls:
+                raw_name = str(tc.get('name', '') or '').strip()
+                canonical_name = alias_map.get(raw_name, "")
+                if not canonical_name:
+                    continue
                 parsed_calls.append({
                     'id': tc.get('id', ''),
-                    'name': tc.get('name', ''),
-                    'args': tc.get('args', {}),
+                    'name': canonical_name,
+                    'args': self._normalize_tool_args(tc.get('args', {})),
                 })
-            
+
+            if parsed_calls:
+                return ToolCallResult(
+                    success=True,
+                    tool_calls=parsed_calls,
+                    content=response.content or "",
+                )
+
+            # 存在 tool_calls 但全部非法：按“无有效工具调用”处理，交给上层继续引导
             return ToolCallResult(
                 success=True,
-                tool_calls=parsed_calls,
+                tool_calls=[],
                 content=response.content or "",
+                error="All tool calls were filtered out as invalid tool names",
             )
         
         # 如果没有 tool call，检查是否允许纯文本响应
@@ -407,10 +463,12 @@ class SimpleJSONLLMClient:
         self.max_retries = max_retries
         self.verbose = verbose
         self._log_manager = get_log_manager()
+        self._logger = CLILogger(component="SimpleJSONLLMClient", verbose=verbose)
 
     def _log(self, message: str, level: str = "INFO"):
-        if self.verbose:
-            print(f"[{level}] SimpleJSONLLMClient: {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="json_llm.event", message=message)
 
     async def ajson_call(
         self,

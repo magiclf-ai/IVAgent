@@ -1,12 +1,11 @@
 import json
-import logging
 from typing import Optional, Dict, Any, List
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-logger = logging.getLogger(__name__)
+from ...core.cli_logger import CLILogger
 
 class AbcDecompilerClient:
     """
@@ -25,6 +24,7 @@ class AbcDecompilerClient:
         self.url = url
         self.session: Optional[ClientSession] = None
         self._exit_stack: Optional[AsyncExitStack] = None
+        self._logger = CLILogger(component="AbcDecompilerClient")
 
     async def connect(self):
         """Connect to the MCP server."""
@@ -38,9 +38,9 @@ class AbcDecompilerClient:
             # Initialize ClientSession
             self.session = await self._exit_stack.enter_async_context(ClientSession(read, write))
             await self.session.initialize()
-            logger.info(f"Connected to Abc-Decompiler MCP server at {self.url}")
+            self._logger.info("backend.abc_client.connected", "已连接 Abc-Decompiler MCP 服务", url=self.url)
         except Exception as e:
-            logger.error(f"Failed to connect to MCP server: {e}")
+            self._logger.error("backend.abc_client.connect_failed", str(e), url=self.url)
             if self._exit_stack:
                 await self._exit_stack.aclose()
             self._exit_stack = None
@@ -52,7 +52,7 @@ class AbcDecompilerClient:
             await self._exit_stack.aclose()
             self._exit_stack = None
             self.session = None
-            logger.info("Disconnected from MCP server")
+            self._logger.info("backend.abc_client.disconnected", "已断开 MCP 服务连接")
 
     async def __aenter__(self):
         await self.connect()
@@ -105,7 +105,7 @@ class AbcDecompilerClient:
             # Check for server-side error response
             if isinstance(parsed_result, dict) and 'error' in parsed_result:
                 error_msg = parsed_result['error']
-                logger.error(f"Tool '{tool_name}' returned error: {error_msg}")
+                self._logger.error("backend.abc_client.tool_error", "工具返回错误", tool=tool_name, error=error_msg)
                 raise RuntimeError(f"AbcDecompiler tool '{tool_name}' failed: {error_msg}")
 
             return parsed_result
@@ -114,7 +114,7 @@ class AbcDecompilerClient:
             # Re-raise our own exceptions
             raise
         except Exception as e:
-            logger.error(f"Error calling tool {tool_name}: {e}")
+            self._logger.error("backend.abc_client.call_failed", str(e), tool=tool_name)
             raise RuntimeError(f"Failed to call tool '{tool_name}': {e}") from e
 
     def _validate_tool_params(self, tool_name: str, arguments: Dict[str, Any]):

@@ -13,6 +13,7 @@ import time
 import asyncio
 
 from ivagent import BaseStaticAnalysisEngine
+from ..core.cli_logger import CLILogger
 
 
 class BaseAgent(ABC):
@@ -49,6 +50,7 @@ class BaseAgent(ABC):
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.max_concurrency = max_concurrency
+        self._logger = CLILogger(component=self.__class__.__name__, verbose=verbose)
 
         # 执行历史
         self.execution_history: List[Dict[str, Any]] = []
@@ -63,8 +65,9 @@ class BaseAgent(ABC):
 
     def log(self, message: str, level: str = "INFO"):
         """打印日志"""
-        if self.verbose:
-            print(f"[{level}] {self.__class__.__name__}: {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="agent.event", message=message)
 
     async def add_history(self, entry: Dict[str, Any]):
         """异步添加执行历史"""

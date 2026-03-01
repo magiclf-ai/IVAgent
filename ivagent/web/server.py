@@ -17,9 +17,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from web.api import start_server
+from core.cli_logger import CLILogger
 
 
 def main():
+    logger = CLILogger(component="web.server", verbose=True)
     parser = argparse.ArgumentParser(description='LLM 交互日志可视化服务器')
     parser.add_argument('--host', default='0.0.0.0', help='服务器主机地址 (默认: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8080, help='服务器端口 (默认: 8080)')
@@ -27,14 +29,9 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║          LLM 交互日志可视化系统                              ║
-╠══════════════════════════════════════════════════════════════╣
-║  服务地址: http://{args.host}:{args.port:<21}║
-║  API 文档: http://{args.host}:{args.port}/docs{'':<16}║
-╚══════════════════════════════════════════════════════════════╝
-    """)
+    logger.info("startup.banner", "LLM 交互日志可视化系统")
+    logger.info("startup.addr", "服务地址", url=f"http://{args.host}:{args.port}")
+    logger.info("startup.docs", "API 文档地址", url=f"http://{args.host}:{args.port}/docs")
     
     start_server(host=args.host, port=args.port, reload=args.reload)
 

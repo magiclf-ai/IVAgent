@@ -578,19 +578,65 @@ function updateConnectionStatus(connected) {
 
 // ==================== API 调用 ====================
 
+// 带超时的 fetch 封装
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            throw new Error('请求超时');
+        }
+        throw error;
+    }
+}
+
+// 带重试机制的 API 请求
+async function apiRequestWithRetry(url, options = {}, maxRetries = 2) {
+    let lastError;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await fetchWithTimeout(url, options);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `HTTP ${response.status}`);
+            }
+            return response;
+        } catch (error) {
+            lastError = error;
+            console.warn(`API请求失败 (尝试 ${attempt + 1}/${maxRetries + 1}):`, error.message);
+            
+            // 如果不是最后一次尝试，等待后重试
+            if (attempt < maxRetries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt), 3000); // 指数退避，最大3秒
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    throw lastError;
+}
+
 async function apiGet(endpoint) {
-    const response = await fetch(`${API_BASE}${endpoint}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`);
     return response.json();
 }
 
 async function apiPost(endpoint, data) {
-    const response = await fetch(`${API_BASE}${endpoint}`, {
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
 }
 
@@ -606,20 +652,22 @@ async function apiDelete(endpoint) {
 
 async function loadDashboard() {
     try {
-        // 并行加载统计数据和最近日志
-        const [stats, logs] = await Promise.all([
-            apiGet('/api/stats'),
-            apiGet(`/api/logs?limit=${state.recentPagination.limit}&offset=${(state.recentPagination.page - 1) * state.recentPagination.limit}`)
-        ]);
-
+        // 先加载统计数据
+        const stats = await apiGet('/api/stats');
         updateStats(stats);
+        
+        // 再加载最近日志（串行避免数据库竞争）
+        const logs = await apiGet(`/api/logs?limit=${state.recentPagination.limit}&offset=${(state.recentPagination.page - 1) * state.recentPagination.limit}`);
         state.recentLogs = logs;
         updateRecentLogs(logs);
         updateRecentPagination();
 
     } catch (error) {
         console.error('Failed to load dashboard:', error);
-        showError('加载仪表盘失败');
+        const tbody = document.querySelector('#recent-logs-table tbody');
+        if (tbody) {
+            showErrorInContainer(tbody, `加载最近日志失败: ${error.message}`, 'loadDashboard');
+        }
     }
 }
 
@@ -646,7 +694,9 @@ async function loadLogs() {
         
     } catch (error) {
         console.error('Failed to load logs:', error);
-        showError('加载日志失败');
+        if (elements.logsTableBody) {
+            showErrorInContainer(elements.logsTableBody, `加载日志失败: ${error.message}`, 'loadLogs');
+        }
     }
 }
 
@@ -677,9 +727,8 @@ async function loadSessions() {
         
     } catch (error) {
         console.error('Failed to load sessions:', error);
-        showError('加载会话失败');
         if (elements.sessionsGrid) {
-            elements.sessionsGrid.innerHTML = `<div class="col-12 text-center py-5 text-danger"><p>加载失败: ${error.message}</p></div>`;
+            showErrorInContainer(elements.sessionsGrid, `加载会话失败: ${error.message}`, 'loadSessions');
         }
     }
 }
@@ -793,6 +842,7 @@ async function loadFilters() {
         
     } catch (error) {
         console.error('Failed to load filters:', error);
+        // 筛选器加载失败不影响主要功能，静默处理
     }
 }
 
@@ -821,7 +871,9 @@ async function loadAgentsTimeline() {
         }
     } catch (error) {
         console.error('Failed to load agents timeline:', error);
-        showError('加载 Agent 时间轴失败');
+        if (elements.agentsTimeline) {
+            showErrorInContainer(elements.agentsTimeline, `加载 Agent 时间轴失败: ${error.message}`, 'loadAgentsTimeline');
+        }
     }
 }
 
@@ -1733,7 +1785,20 @@ async function viewLog(logId) {
         showLogDetail(log);
     } catch (error) {
         console.error('Failed to load log:', error);
-        showError('加载日志详情失败: ' + (error.message || error));
+        // 在弹窗中显示错误而不是 alert
+        if (elements.modalBody) {
+            elements.modalBody.innerHTML = `
+                <div class="text-center py-5 text-secondary">
+                    <i class="bi bi-exclamation-circle fs-1 mb-3 d-block" style="opacity: 0.5;"></i>
+                    <p>加载日志详情失败: ${error.message || error}</p>
+                    <button class="btn btn-sm btn-primary mt-3" onclick="viewLog('${logId}')">
+                        <i class="bi bi-arrow-clockwise"></i> 重试
+                    </button>
+                </div>
+            `;
+        }
+        // 仍然打开弹窗显示错误
+        if (bsModal) bsModal.show();
     }
 }
 
@@ -2380,8 +2445,37 @@ function showNotification(title, message) {
     }
 }
 
-function showError(message) {
-    alert(message);
+// 显示错误信息（在页面上静默显示，不使用 alert）
+function showError(message, targetElement = null) {
+    // 如果指定了目标元素，在该元素内显示错误
+    if (targetElement) {
+        targetElement.innerHTML = `
+            <div class="text-center py-5 text-danger">
+                <i class="bi bi-exclamation-triangle fs-1 mb-3"></i>
+                <p>${message}</p>
+            </div>
+        `;
+    }
+    // 只在控制台输出，不弹窗打扰用户
+    console.error('[Error]', message);
+}
+
+// 在表格/容器内显示错误信息，带重试按钮
+function showErrorInContainer(container, message, retryCallback = null) {
+    if (!container) return;
+    
+    const retryButton = retryCallback ? 
+        `<button class="btn btn-sm btn-primary mt-3" onclick="${retryCallback}()">
+            <i class="bi bi-arrow-clockwise"></i> 重试
+        </button>` : '';
+    
+    container.innerHTML = `
+        <div class="text-center py-5 text-secondary">
+            <i class="bi bi-exclamation-circle fs-1 mb-3 d-block" style="opacity: 0.5;"></i>
+            <p class="mb-2">${message}</p>
+            ${retryButton}
+        </div>
+    `;
 }
 
 // 请求通知权限
@@ -2456,7 +2550,10 @@ async function loadToolCalls() {
         updateToolCallPagination();
     } catch (error) {
         console.error('Failed to load tool calls:', error);
-        showError('加载 Tool Call 日志失败');
+        const container = document.getElementById('toolcalls-list');
+        if (container) {
+            showErrorInContainer(container, `加载 Tool Call 日志失败: ${error.message}`, 'loadToolCalls');
+        }
     }
 }
 

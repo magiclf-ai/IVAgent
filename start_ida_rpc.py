@@ -10,9 +10,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 # 导入 server 模块
 from ivagent.backends.ida.rpc.server import start_server
+from ivagent.core.cli_logger import CLILogger
 
 
 def main():
+    logger = CLILogger(component="start_ida_rpc", verbose=True)
     parser = argparse.ArgumentParser(
         description="IDA RPC HTTP Server 启动器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -29,8 +31,8 @@ def main():
     parser.add_argument("--debug", action="store_true", help="启用 Flask 调试模式")
     args = parser.parse_args()
 
-    print("[*] IDA RPC Server 启动器")
-    print(f"[*] 工作目录: {Path.cwd()}")
+    logger.info("startup.begin", "IDA RPC Server 启动器")
+    logger.info("startup.cwd", "工作目录", cwd=Path.cwd())
     
     # 启动服务器
     server = start_server(

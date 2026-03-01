@@ -22,6 +22,7 @@ from .base_static_analysis_engine import (
     SearchResult,
 )
 from ..models.callsite import CallsiteInfo
+from ..core.cli_logger import CLILogger
 
 # 导入 ToolBasedLLMClient
 try:
@@ -54,6 +55,7 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             source_root: Optional[str] = None,
             llm_client: Optional[Any] = None,
             max_iterations: int = 30,
+            logger: Optional[CLILogger] = None,
     ):
         """
         初始化源码分析引擎
@@ -65,7 +67,7 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             llm_client: LLM 客户端 (ChatOpenAI 或 ToolBasedLLMClient)
             max_iterations: Tool Call 最大迭代次数
         """
-        super().__init__(target_path, max_concurrency, source_root, llm_client)
+        super().__init__(target_path, max_concurrency, source_root, llm_client, logger=logger)
 
         if llm_client is None:
             raise ValueError("llm_client is required for SourceCodeEngine")
@@ -580,12 +582,16 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
         """异步初始化引擎"""
         if not self.source_root.exists():
             raise ValueError(f"Source root does not exist: {self.source_root}")
-        print(f"[*] SourceCodeEngine initialized: {self.source_root}")
-        print(f"[*] Agent ID: {self.agent_id}")
+        self._log(
+            "SourceCodeEngine 初始化完成",
+            event="engine.source.initialized",
+            source_root=self.source_root,
+            agent_id=self.agent_id,
+        )
 
     async def _do_close(self):
         """异步关闭引擎"""
-        print("[*] SourceCodeEngine closed")
+        self._log("SourceCodeEngine 已关闭", event="engine.source.closed")
 
     async def get_function_def(
             self,
@@ -600,6 +606,7 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
 
         def finish_analysis(
                 found: bool,
+                function_identifier: str = "",
                 name: str = "",
                 signature: str = "",
                 file_path: str = "",
@@ -615,6 +622,7 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             
             Args:
                 found: Whether the function definition was found.
+                function_identifier: Unique function identifier for downstream tools.
                 name: Function name.
                 signature: Full function signature (return type, name, parameters).
                 file_path: Relative path to the file containing the function.
@@ -639,7 +647,8 @@ Guidelines:
 - Read enough context to identify the complete function (from definition to closing brace)
 - Extract accurate line numbers
 - Include complete function code with original line numbers
-- Parse parameters with their types"""
+- Parse parameters with their types
+- Return both function_identifier (stable identifier) and signature (readable declaration)"""
 
         user_prompt = f"Find the complete function definition for: {query}\n\nSource root: {self.source_root}"
 
@@ -648,8 +657,15 @@ Guidelines:
         if result.get("success") and result.get("result"):
             data = result["result"]
             if data.get("found"):
+                resolved_identifier = (
+                    data.get("function_identifier")
+                    or data.get("identifier")
+                    or data.get("signature")
+                    or query
+                )
                 return FunctionDef(
-                    signature=data.get("signature", query),
+                    function_identifier=resolved_identifier,
+                    signature=data.get("signature", resolved_identifier),
                     name=data.get("name", query),
                     code=data.get("code", ""),
                     file_path=data.get("file_path", ""),
@@ -707,7 +723,12 @@ Guidelines:
                     caller_name=caller_name,
                     caller_identifier=function_identifier,
                     callee_name=c.get("callee_name", ""),
-                    callee_identifier=c.get("callee_name", ""),
+                    callee_identifier=(
+                        c.get("function_identifier")
+                        or c.get("identifier")
+                        or c.get("signature")
+                        or c.get("callee_name", "")
+                    ),
                     line_number=c.get("line_number", 0),
                     file_path="",
                     call_context=c.get("context", ""),
@@ -901,23 +922,26 @@ Constraint types:
 
         func_name = callsite.function_identifier.split('(')[0].strip()
 
-        def finish_analysis(resolved: bool, signature: str = "", reason: str = ""):
+        def finish_analysis(resolved: bool, function_identifier: str = "", reason: str = ""):
             """
             Report the resolved function identifier.
             
             Args:
                 resolved: Whether the identifier was successfully resolved.
-                signature: The resolved full signature.
+                function_identifier: The resolved unique function identifier.
                 reason: Explanation if not resolved.
             """
             pass
 
-        system_prompt = """You are an expert code analyst. Resolve a function call to its complete signature.
+        system_prompt = """You are an expert code analyst. Resolve a function call to its unique function identifier.
 
 Your workflow:
 1. If caller is provided, examine the call context
 2. Otherwise, search for the function definition
-3. Call finish_analysis with the resolved signature"""
+3. Call finish_analysis with the resolved function_identifier
+
+Rule:
+- Do not return C/C++ declaration text like 'foo(int x)'; return a stable identifier."""
 
         user_prompt = f"Resolve function call: {callsite.function_identifier}\nLocation: {callsite.file_path}:{callsite.line_number}"
         if caller_identifier:
@@ -929,7 +953,11 @@ Your workflow:
         if result.get("success") and result.get("result"):
             data = result["result"]
             if data.get("resolved"):
-                return data.get("signature")
+                return (
+                    data.get("function_identifier")
+                    or data.get("identifier")
+                    or data.get("signature")
+                )
 
         return None
 
@@ -963,7 +991,8 @@ Your workflow:
             Args:
                 symbols: List of symbol dicts, each containing:
                     - name: Symbol name
-                    - signature: Full signature
+                    - function_identifier: Stable function identifier
+                    - signature: Full signature (optional readable form)
                     - symbol_type: Type of symbol (function, class, global_var, etc.)
                     - file_path: Path to file
                     - line: Line number
@@ -975,7 +1004,7 @@ Your workflow:
 Your workflow:
 1. Use search_code to find potential matches
 2. Examine each match to confirm it's a symbol definition (function, class, global variable)
-3. Call finish_analysis with all matching symbols, including their types"""
+3. Call finish_analysis with all matching symbols, including function_identifier and types"""
 
         # 请求更多结果以支持 offset
         fetch_limit = limit + offset
@@ -1003,7 +1032,11 @@ Your workflow:
 
                 results.append(SearchResult(
                     name=s.get("name", ""),
-                    signature=s.get("signature", ""),
+                    identifier=(
+                        s.get("function_identifier")
+                        or s.get("identifier")
+                        or s.get("signature", "")
+                    ),
                     symbol_type=symbol_type,
                     file_path=s.get("file_path"),
                     line=s.get("line", 0),

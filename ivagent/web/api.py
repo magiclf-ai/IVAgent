@@ -6,6 +6,7 @@ LLM 日志 Web API
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.llm_logger import get_log_manager, LLMLogEntry, LogStorageType
 from core.agent_logger import get_agent_log_manager, AgentLogManager
 from core.vuln_storage import get_vulnerability_manager, VulnerabilityManager, VulnerabilitySeverity, VulnerabilityStatus
+from core.cli_logger import CLILogger
 from api_redis import redis_router
 
 
@@ -93,6 +95,8 @@ app = FastAPI(
 
 # 注册 Redis 路由
 app.include_router(redis_router)
+WEB_DEBUG = os.environ.get("IVAGENT_WEB_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+web_logger = CLILogger(component="web.api", verbose=WEB_DEBUG)
 
 # WebSocket 连接管理器
 class ConnectionManager:
@@ -137,8 +141,8 @@ async def startup_event():
     agent_logger = get_agent_logger()
     llm_db = getattr(logger.storage, 'db_path', 'N/A (Memory Storage)')
     agent_db = getattr(agent_logger.storage, 'db_path', 'N/A (Memory Storage)')
-    print(f"[STARTUP] LLM Logs DB: {llm_db}")
-    print(f"[STARTUP] Agent Logs DB: {agent_db}")
+    web_logger.info("startup.llm_db", "LLM 日志数据库路径", db_path=llm_db)
+    web_logger.info("startup.agent_db", "Agent 日志数据库路径", db_path=agent_db)
 
 # 获取漏洞管理器
 def get_vuln_manager():
@@ -841,36 +845,35 @@ async def get_agent_timeline(agent_id: str, limit: int = Query(default=100, ge=1
 @app.get("/api/agents/timeline/all")
 async def get_all_agents_timeline(limit: int = Query(default=50, ge=1, le=200)):
     """获取所有 Agent 的时间轴（用于 Agent 维度视图）"""
-    import os
     logger = get_logger()
     agent_logger = get_agent_logger()
     
     # 调试信息
     db_path = agent_logger.storage.db_path
-    print(f"[DEBUG] Agent DB path: {db_path}")
-    print(f"[DEBUG] Agent DB exists: {os.path.exists(db_path)}")
+    web_logger.debug("agents_timeline.db_path", "Agent DB 路径", db_path=db_path)
+    web_logger.debug("agents_timeline.db_exists", "Agent DB 是否存在", exists=os.path.exists(db_path))
     
     # 检查表是否存在和数据量
     try:
         conn = agent_logger.storage._get_conn()
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall()]
-        print(f"[DEBUG] Tables in DB: {tables}")
+        web_logger.debug("agents_timeline.tables", "数据库表列表", tables=tables)
         
         if 'agent_executions' in tables:
             count = conn.execute("SELECT COUNT(*) FROM agent_executions").fetchone()[0]
-            print(f"[DEBUG] Total rows in agent_executions: {count}")
+            web_logger.debug("agents_timeline.row_count", "agent_executions 行数", count=count)
             
             # 查看前几条记录
             rows = conn.execute("SELECT id, agent_type, status, start_time FROM agent_executions LIMIT 5").fetchall()
             for row in rows:
-                print(f"[DEBUG] Row: {row}")
+                web_logger.debug("agents_timeline.sample_row", "样例行", row=row)
     except Exception as e:
-        print(f"[DEBUG] Error checking DB: {e}")
+        web_logger.warning("agents_timeline.db_check_failed", str(e))
     
     # 首先从 Agent 执行日志中获取所有 Agent
     all_agent_executions = agent_logger.storage.query_executions(limit=1000)
-    print(f"[DEBUG] Found {len(all_agent_executions)} agent executions")
+    web_logger.debug("agents_timeline.execution_count", "读取到 Agent 执行记录", count=len(all_agent_executions))
     
     result = []
     for agent_exec in all_agent_executions:
@@ -907,7 +910,7 @@ async def get_all_agents_timeline(limit: int = Query(default=50, ge=1, le=200)):
         return agent_info.start_time if agent_info else ""
     
     result.sort(key=get_sort_key, reverse=True)
-    print(f"[DEBUG] Returning {len(result)} agents for timeline")
+    web_logger.debug("agents_timeline.return_count", "返回时间轴 Agent 数量", count=len(result))
     return result
 
 

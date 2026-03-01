@@ -35,6 +35,7 @@ from .base_static_analysis_engine import (
 )
 
 from ..models.callsite import CallsiteInfo
+from ..core.cli_logger import CLILogger
 
 
 class JEBClient:
@@ -57,6 +58,7 @@ class JEBClient:
             timeout: int = 120,
             max_retries: int = 3,
             retry_delay: float = 1.0,
+            logger: Optional[CLILogger] = None,
     ):
         self.host = host
         self.port = port
@@ -67,6 +69,7 @@ class JEBClient:
         self._sync_client = None
         self._executor = ThreadPoolExecutor(max_workers=10)
         self._connected = False
+        self._logger = logger or CLILogger(component="JEBClient")
 
     def _get_sync_client(self):
         """获取或创建同步 JEB 客户端"""
@@ -86,7 +89,7 @@ class JEBClient:
             self._connected = result == "pong"
             return self._connected
         except Exception as e:
-            print(f"[!] Failed to connect to JEB: {e}")
+            self._logger.warning("engine.jeb.connect_failed", str(e), host=self.host, port=self.port)
             return False
 
     async def disconnect(self):
@@ -203,6 +206,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
             max_concurrency: int = 10,
             source_root: Optional[str] = None,
             llm_client: Optional[Any] = None,
+            logger: Optional[CLILogger] = None,
     ):
         """
         初始化异步 JEB 引擎
@@ -217,7 +221,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
             source_root: 源代码根目录（用于 CallsiteAgent 源码分析）
             llm_client: LLM 客户端（用于 CallsiteAgent）
         """
-        super().__init__(target_path, max_concurrency, source_root, llm_client)
+        super().__init__(target_path, max_concurrency, source_root, llm_client, logger=logger)
 
         self.host = host
         self.port = port
@@ -240,24 +244,30 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
             host=self.host,
             port=self.port,
             timeout=self.timeout,
+            logger=self._logger,
         )
 
-        print(f"[*] Connecting to JEB RPC Server at {self.host}:{self.port}...")
+        self._log(
+            "连接 JEB RPC Server",
+            event="engine.jeb.connecting",
+            host=self.host,
+            port=self.port,
+        )
         if not await self._client.connect():
             raise RuntimeError(
                 f"Failed to connect to JEB RPC Server at {self.host}:{self.port}\n"
                 f"Please ensure JEB is running with the HTTP server enabled."
             )
 
-        print(f"[*] Connected to JEB RPC Server")
+        self._log("JEB RPC 连接成功", event="engine.jeb.connected", host=self.host, port=self.port)
         if self.target_path:
-            print(f"[*] Target APK: {self.target_path}")
+            self._log("目标 APK", event="engine.jeb.target", target_path=self.target_path)
 
     async def _do_close(self):
         """异步关闭引擎"""
         if self._client:
             await self._client.disconnect()
-            print("[*] JEB Client disconnected")
+            self._log("JEB Client 已断开", event="engine.jeb.disconnected")
             self._client = None
 
     async def _ensure_client(self):
@@ -265,7 +275,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
         if self._client is None:
             raise RuntimeError("JEB Client not initialized")
 
-    def _to_function_def(self, signature: str, code: str, callees) -> Optional[FunctionDef]:
+    def _to_function_def(self, function_identifier: str, code: str, callees) -> Optional[FunctionDef]:
         """将 JEB 返回的数据转换为 FunctionDef"""
         if not code:
             return None
@@ -277,35 +287,37 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
             lines = lines[:10000]
 
         # 提取方法名
-        name = signature
-        if '->' in signature:
-            name = signature.split('->')[1].split('(')[0]
+        function_name = function_identifier
+        if '->' in function_identifier:
+            function_name = function_identifier.split('->')[1].split('(')[0]
 
         # 构建带行号的代码
         code_with_line_comment = ""
         for line_index, line in enumerate(lines):
             code_with_line_comment += f"[{line_index:4d}] {line}\n"
 
-        call_comments = "// 函数中代码行与调用点签名信息如下\n"
-        for i, callee in enumerate(callees):
+        call_comments = "// 函数中代码行与调用点函数标识信息如下\n"
+        for i, callee in enumerate(callees or []):
             arguments = callee.get("arguments", [])
             line = callee.get("line", "")
-            name = callee.get('method').get('name')
-            signature = callee.get('method').get("signature", "")
-            call_comments += f"// <调用点_{i}> <name>{name}</name> <signature>{signature}</signature> <callsite_code>{line}</callsite_code> <参数>{arguments}</参数> </调用点_{i}>\n"
+            method_info = callee.get("method") or {}
+            callee_name = method_info.get("name", "")
+            callee_identifier = method_info.get("signature", "")
+            call_comments += f"// <调用点_{i}> <name>{callee_name}</name> <function_identifier>{callee_identifier}</function_identifier> <callsite_code>{line}</callsite_code> <参数>{arguments}</参数> </调用点_{i}>\n"
 
         code = f"{call_comments}\n{code_with_line_comment}\n"
 
         return FunctionDef(
-            signature=signature,
-            name=name,
+            function_identifier=function_identifier,
+            signature=function_identifier,
+            name=function_name,
             code=code,
             file_path=self.target_path,
             start_line=0,
             end_line=len(lines),
             parameters=[],  # JEB API 不直接提供参数信息
             return_type=None,
-            location=signature,  # JEB 使用签名作为位置标识
+            location=function_identifier,  # JEB 使用方法标识作为位置标识
         )
 
     def _to_call_sites(self, data: List[Dict[str, Any]], is_callee: bool = True) -> List[CallSite]:
@@ -348,7 +360,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
                         arguments=arguments,
                     ))
             except Exception as e:
-                print(f"[!] Error converting call site: {e}")
+                self._log(str(e), "warning", event="engine.jeb.callsite_convert_failed")
                 continue
 
         return call_sites
@@ -433,12 +445,12 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
             caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
-        [实现基类方法] 静态分析：根据调用点信息解析函数签名
+        [实现基类方法] 静态分析：根据调用点信息解析函数标识符
         
         实现策略：
         1. 如果提供了 caller_identifier，先获取调用者函数定义
         2. 从调用者的 callee 列表中查找匹配行号和函数名的调用
-        3. 返回被调用函数的签名
+        3. 返回被调用函数标识符
         """
         await self._ensure_client()
 
@@ -459,7 +471,7 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
 
             except Exception as e:
-                print(f"[!] Error resolving callsite from caller context: {e}")
+                self._log(str(e), "warning", event="engine.jeb.callsite_resolve_failed")
 
         # 策略2: 直接通过函数名搜索
         try:
@@ -581,14 +593,14 @@ class JEBStaticAnalysisEngine(BaseStaticAnalysisEngine):
                 name = item["name"]
                 signature = item["signature"]
                 if match(name):
-                    search_results.append(SearchResult(name=name, signature=signature, symbol_type=SymbolType.METHOD))
+                    search_results.append(SearchResult(name=name, identifier=signature, symbol_type=SymbolType.METHOD))
 
             classes = await self._client.get_all_classes(self.target_path)
             for item in classes:
                 name = item["name"]
                 signature = item["signature"]
                 if match(name):
-                    search_results.append(SearchResult(name=name, signature=signature, symbol_type=SymbolType.CLASS))
+                    search_results.append(SearchResult(name=name, identifier=signature, symbol_type=SymbolType.CLASS))
 
             # 应用 offset 和 limit
             return search_results[offset:offset + limit]

@@ -39,6 +39,7 @@ from .base_static_analysis_engine import (
 )
 
 from ..models.callsite import CallsiteInfo
+from ..core.cli_logger import CLILogger
 
 
 class IDAClient:
@@ -59,6 +60,7 @@ class IDAClient:
             timeout: int = 60,
             max_retries: int = 3,
             retry_delay: float = 1.0,
+            logger: Optional[CLILogger] = None,
     ):
         self.host = host
         self.port = port
@@ -70,6 +72,7 @@ class IDAClient:
         self._url = f"http://{host}:{port}/rpc"
         self._request_id = 0
         self._lock = asyncio.Lock()
+        self._logger = logger or CLILogger(component="IDAClient")
 
     async def connect(self) -> bool:
         """异步连接到 RPC Server"""
@@ -86,7 +89,7 @@ class IDAClient:
             result = await self.ping()
             return result is not None and result.get("status") == "ok"
         except Exception as e:
-            print(f"[!] Failed to connect: {e}")
+            self._logger.warning("engine.ida.connect_failed", str(e), host=self.host, port=self.port)
             return False
 
     async def disconnect(self):
@@ -247,6 +250,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             max_concurrency: int = 10,
             source_root: Optional[str] = None,
             llm_client: Optional[Any] = None,
+            logger: Optional[CLILogger] = None,
     ):
         """
         初始化异步 IDA 引擎
@@ -261,7 +265,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             source_root: 源代码根目录（用于 CallsiteAgent 源码分析）
             llm_client: LLM 客户端（用于 CallsiteAgent）
         """
-        super().__init__(target_path, max_concurrency, source_root, llm_client)
+        super().__init__(target_path, max_concurrency, source_root, llm_client, logger=logger)
 
         self.host = host
         self.port = port
@@ -284,9 +288,15 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             host=self.host,
             port=self.port,
             timeout=self.timeout,
+            logger=self._logger,
         )
 
-        print(f"[*] Connecting to IDA RPC Server at {self.host}:{self.port}...")
+        self._log(
+            "连接 IDA RPC Server",
+            event="engine.ida.connecting",
+            host=self.host,
+            port=self.port,
+        )
         if not await self._client.connect():
             raise RuntimeError(
                 f"Failed to connect to IDA RPC Server at {self.host}:{self.port}\n"
@@ -297,8 +307,12 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         # 获取 IDB 信息
         info = await self._client.get_idb_info()
-        print(f"[*] Connected to IDA {info.get('ida_version')}")
-        print(f"[*] Input file: {info.get('input_file')}")
+        self._log(
+            "IDA RPC 连接成功",
+            event="engine.ida.connected",
+            ida_version=info.get("ida_version"),
+            input_file=info.get("input_file"),
+        )
 
     async def _do_close(self):
         """异步关闭引擎"""
@@ -306,7 +320,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             await self._client.disconnect()
             # 给 aiohttp 一点时间完成资源清理
             await asyncio.sleep(0.1)
-            print("[*] RPC Client disconnected")
+            self._log("RPC Client 已断开", event="engine.ida.disconnected")
             self._client = None
 
     async def _ensure_client(self):
@@ -345,11 +359,11 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             code_with_line_comment += f"[{line_index:4d}] {line}\n"
 
         # 添加调用点元数据注释（帮助 LLM 识别反编译函数名和实际函数名的差异）
-        call_comments = "// 函数中代码行与调用点签名信息如下\n"
+        call_comments = "// 函数中代码行与调用点函数标识信息如下\n"
         if callees:
             for i, callee in enumerate(callees):
                 name = callee.callee_name
-                signature = callee.callee_identifier
+                function_identifier = callee.callee_identifier
                 line_number = callee.line_number
                 arguments = callee.arguments if callee.arguments else []
                 # 获取调用点的代码行（如果行号有效）
@@ -357,14 +371,15 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
                 if 0 <= line_number < len(lines):
                     callsite_code = lines[line_number].strip()
 
-                call_comments += f"// <调用点_{i}> <name>{name}</name> <signature>{signature}</signature> <line>{line_number}</line> <callsite_code>{callsite_code}</callsite_code> <参数>{arguments}</参数> </调用点_{i}>\n"
+                call_comments += f"// <调用点_{i}> <name>{name}</name> <function_identifier>{function_identifier}</function_identifier> <line>{line_number}</line> <callsite_code>{callsite_code}</callsite_code> <参数>{arguments}</参数> </调用点_{i}>\n"
         else:
             call_comments += "// (无调用点信息)\n"
 
         code = f"{call_comments}\n{code_with_line_comment}\n"
 
         return FunctionDef(
-            signature=data.get("name", ""),
+            function_identifier=data.get("name", ""),
+            signature=data.get("signature", data.get("name", "")),
             name=data.get("name", ""),
             code=code,
             file_path=None,
@@ -396,7 +411,7 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
                     arguments=item.get("arg_texts", []),
                 ))
             except Exception as e:
-                print(f"[!] Error converting call site: {e}")
+                self._log(str(e), "warning", event="engine.ida.callsite_convert_failed")
                 continue
 
         return call_sites
@@ -457,12 +472,12 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             caller_identifier: Optional[str] = None,
     ) -> Optional[str]:
         """
-        [实现基类方法] 静态分析：根据调用点信息解析函数签名
+        [实现基类方法] 静态分析：根据调用点信息解析函数标识符
         
         实现策略：
-        1. 如果提供了 caller_identifier，先获取调用者函数定义
-        2. 从调用者的 callee 列表中查找匹配行号和函数名的调用
-        3. 返回被调用函数的签名
+        1. 如果提供了 caller_identifier，优先从调用者上下文按行号定位调用点
+        2. 若候选不唯一，再用调用名辅助判定
+        3. 返回被调用函数标识符
         """
         await self._ensure_client()
 
@@ -475,27 +490,40 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
                 # 获取调用者的 callee 列表
                 callees = await self.get_callee(caller_identifier)
 
-                # 在 callee 中查找匹配的行号和函数名
-                for callee in callees:
-                    # 匹配行号（允许一定的误差范围，因为 LLM 提供的行号可能不完全准确）
-                    line_match = abs(callee.line_number - callsite.line_number) <= 2
-                    # 匹配函数名
-                    name_match = callee.callee_name == callsite.function_identifier
+                line_candidates = [
+                    callee for callee in callees
+                    if abs(callee.line_number - callsite.line_number) <= 2
+                ]
+                if len(line_candidates) == 1:
+                    return line_candidates[0].callee_identifier
 
-                    if line_match and name_match:
-                        return callee.callee_identifier
+                if len(line_candidates) > 1:
+                    preferred = [
+                        callee for callee in line_candidates
+                        if (
+                            callee.callee_name == callsite.function_identifier
+                            or callee.callee_identifier == callsite.function_identifier
+                        )
+                    ]
+                    if preferred:
+                        return preferred[0].callee_identifier
 
-                # 如果没有精确匹配，尝试只匹配函数名
-                for callee in callees:
-                    if callee.callee_name == callsite.function_identifier:
-                        return callee.callee_identifier
+                name_matches = [
+                    callee for callee in callees
+                    if (
+                        callee.callee_name == callsite.function_identifier
+                        or callee.callee_identifier == callsite.function_identifier
+                    )
+                ]
+                if name_matches:
+                    return name_matches[0].callee_identifier
 
             except Exception as e:
-                print(f"[!] Error resolving callsite from caller context: {e}")
+                self._log(str(e), "warning", event="engine.ida.callsite_resolve_failed")
 
         # 策略2: 直接通过函数名搜索
         try:
-            # 尝试直接获取函数信息
+            # 尝试直接获取函数信息（name 字段为唯一函数标识）
             func_info = await self._client.get_function_info(callsite.function_identifier)
             if func_info and "error" not in func_info:
                 return func_info.get("name", callsite.function_identifier)
@@ -504,10 +532,16 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         # 策略3: 搜索匹配函数名的函数
         try:
-            matching_funcs = await self.search_symbol(callsite.function_identifier, limit=10)
+            matching_funcs = await self.search_symbol(
+                query=callsite.function_identifier,
+                options=SearchOptions(limit=10),
+            )
             for func in matching_funcs:
-                if callsite.function_identifier in func.name:
-                    return func.signature
+                if (
+                    callsite.function_identifier in func.name
+                    or callsite.function_identifier in func.identifier
+                ):
+                    return func.identifier
         except Exception:
             pass
 
@@ -524,10 +558,28 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
 
         xrefs = await self._client.get_xrefs_to(signature)
         if xrefs:
+            normalized_refs = []
+            for item in xrefs:
+                if not isinstance(item, dict):
+                    continue
+                from_addr = item.get("from", "")
+                to_addr = item.get("to", "")
+                xref_type = item.get("type", "reference")
+                normalized_refs.append(
+                    {
+                        "file": "",
+                        "line": 0,
+                        "content": f"{from_addr} -> {to_addr}",
+                        "type": xref_type,
+                        "from": from_addr,
+                        "to": to_addr,
+                    }
+                )
+
             return CrossReference(
                 target_type=target_type,
                 target_signature=signature,
-                references=[x["from"] for x in xrefs],
+                references=normalized_refs,
             )
         return None
 
@@ -588,11 +640,11 @@ class IDAStaticAnalysisEngine(BaseStaticAnalysisEngine):
             if not match:
                 continue
 
-            func_def = await self.get_function_def(name)
+            func_def = await self.get_function_def(function_identifier=name)
             if func_def:
                 results.append(SearchResult(
                     name=func_def.name,
-                    signature=func_def.signature,
+                    identifier=func_def.function_identifier,
                     symbol_type=SymbolType.FUNCTION,
                     file_path=func_def.file_path,
                     line=func_def.start_line,

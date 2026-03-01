@@ -298,25 +298,64 @@ function bindEvents() {
 
 // ==================== API 调用 ====================
 
-async function apiGet(endpoint) {
-    const response = await fetch(`${API_BASE}${endpoint}`);
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || `HTTP ${response.status}`);
+// 带超时的 fetch 封装
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            throw new Error('请求超时');
+        }
+        throw error;
     }
+}
+
+// 带重试机制的 API 请求
+async function apiRequestWithRetry(url, options = {}, maxRetries = 2) {
+    let lastError;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await fetchWithTimeout(url, options);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `HTTP ${response.status}`);
+            }
+            return response;
+        } catch (error) {
+            lastError = error;
+            console.warn(`API请求失败 (尝试 ${attempt + 1}/${maxRetries + 1}):`, error.message);
+            
+            if (attempt < maxRetries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt), 3000);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    throw lastError;
+}
+
+async function apiGet(endpoint) {
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`);
     return response.json();
 }
 
 async function apiPost(endpoint, data) {
-    const response = await fetch(`${API_BASE}${endpoint}`, {
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
     });
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || `HTTP ${response.status}`);
-    }
     return response.json();
 }
 
@@ -328,16 +367,12 @@ async function apiDelete(endpoint, data) {
     if (data) {
         options.body = JSON.stringify(data);
     }
-    const response = await fetch(`${API_BASE}${endpoint}`, options);
-    if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || `HTTP ${response.status}`);
-    }
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`, options);
     return response.json();
 }
 
 async function apiPut(endpoint, data) {
-    const response = await fetch(`${API_BASE}${endpoint}`, {
+    const response = await apiRequestWithRetry(`${API_BASE}${endpoint}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data)
@@ -1186,8 +1221,27 @@ function showNotification(title, message) {
     // 可以扩展为 toast 通知
 }
 
+// 显示错误信息（在页面上静默显示，不使用 alert）
 function showError(message) {
-    alert(message);
+    // 只在控制台输出，不弹窗打扰用户
+    console.error('[Error]', message);
+    
+    // 在页面顶部显示一个非侵入式的提示条
+    let errorBar = document.getElementById('error-notification-bar');
+    if (!errorBar) {
+        errorBar = document.createElement('div');
+        errorBar.id = 'error-notification-bar';
+        errorBar.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; background: #dc3545; color: white; padding: 8px 16px; text-align: center; z-index: 9999; font-size: 14px; display: none;';
+        document.body.prepend(errorBar);
+    }
+    
+    errorBar.textContent = message;
+    errorBar.style.display = 'block';
+    
+    // 3秒后自动隐藏
+    setTimeout(() => {
+        errorBar.style.display = 'none';
+    }, 3000);
 }
 
 // 渲染分析状态

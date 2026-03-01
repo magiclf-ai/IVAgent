@@ -366,6 +366,20 @@ class DeepVulnAgent(BaseAgent):
     # 类级别的执行状态追踪（用于可视化）
     _execution_states: Dict[str, AgentExecutionState] = {}
     _states_lock = asyncio.Lock()
+    # 类级别共享分析任务缓存（跨实例去重）
+    _inflight_analysis_tasks: Dict[str, asyncio.Future] = {}
+    _completed_analysis_results: Dict[str, Dict[str, Any]] = {}
+    _analysis_cache_lock = asyncio.Lock()
+    _tool_name_aliases: Dict[str, str] = {
+        "get_function_summary_tool": "get_function_summary_tool",
+        "get_function_summary": "get_function_summary_tool",
+        "create_sub_agent_tool": "create_sub_agent_tool",
+        "create_sub_agent": "create_sub_agent_tool",
+        "report_vulnerability_tool": "report_vulnerability_tool",
+        "report_vulnerability": "report_vulnerability_tool",
+        "finalize_analysis_tool": "finalize_analysis_tool",
+        "finalize_analysis": "finalize_analysis_tool",
+    }
 
     def __init__(
             self,
@@ -512,46 +526,52 @@ class DeepVulnAgent(BaseAgent):
                 frame.function_identifier for frame in self.call_stack_detailed
             ]
 
-    def _log_progress(self, message: str, level: str = "info"):
+    def _log_progress(self, message: str, level: str = "info", kind: str = "trace", **extra_fields: Any):
         """
         记录进度日志
 
         Args:
             message: 日志消息
             level: 日志级别 (info, warning, error, success)
+            kind: 日志分类（用于 CLI 降噪）
         """
         # 如果有外部日志回调，交给外部处理，避免重复打印
         if self._progress_logger:
             try:
+                self._progress_logger(message, level, kind=kind, **extra_fields)
+            except TypeError:
                 self._progress_logger(message, level)
             except Exception:
                 pass
             return
 
-        # 构建有意义的标识符：函数名 + Agent类型
+        # 提取函数标识信息，作为结构化字段输出
         if self.execution_state and self.execution_state.function_identifier:
-            # 提取函数名（从标识符中提取）
             func_sig = self.execution_state.function_identifier
-            # 尝试提取简单函数名
             if '(' in func_sig:
                 func_name = func_sig[:func_sig.index('(')].strip()
             else:
                 func_name = func_sig
-            # 如果太长，截断
             if len(func_name) > 30:
                 func_name = "..." + func_name[-27:]
-            prefix = f"[{func_name} | 漏洞挖掘Agent]"
         else:
-            prefix = "[初始化 | 漏洞挖掘Agent]"
+            func_name = "初始化"
 
-        if level == "error":
-            print(f"  [X] {prefix} {message}")
-        elif level == "warning":
-            print(f"  [!] {prefix} {message}")
-        elif level == "success":
-            print(f"  [+] {prefix} {message}")
-        else:
-            print(f"  [*] {prefix} {message}")
+        self._logger.log(
+            level=level,
+            event="deep_vuln.progress",
+            message=message,
+            kind=kind,
+            function=func_name,
+            **extra_fields,
+        )
+
+    def _canonical_tool_name(self, raw_name: Any) -> str:
+        """归一化工具名。返回空字符串表示未知工具。"""
+        name = str(raw_name or "").strip()
+        if not name:
+            return ""
+        return self._tool_name_aliases.get(name, "")
 
     async def _register_execution_state(self, function_identifier: str):
         """注册执行状态"""
@@ -582,6 +602,17 @@ class DeepVulnAgent(BaseAgent):
                 if hasattr(self.execution_state, key):
                     setattr(self.execution_state, key, value)
 
+    def _build_analysis_task_key(self, function_identifier: str) -> str:
+        """构建共享分析任务 key。"""
+        fid = (function_identifier or "").strip()
+        engine_scope = (
+            getattr(self.engine, "project_root", None)
+            or getattr(self.engine, "target_path", None)
+            or self.source_root
+            or "unknown_scope"
+        )
+        return f"{engine_scope}::{fid}"
+
     async def run(
             self,
             function_identifier: str,
@@ -599,29 +630,80 @@ class DeepVulnAgent(BaseAgent):
         """
         await self._register_execution_state(function_identifier)
 
-        self._log_progress(f"开始分析函数: {function_identifier}")
-        self._log_progress(f"调用深度: {len(self.call_stack)}/{self.max_depth}")
+        self._log_progress(f"开始分析函数: {function_identifier}", kind="lifecycle")
+        self._log_progress(f"调用深度: {len(self.call_stack)}/{self.max_depth}", kind="lifecycle")
 
         if self.precondition:
-            self._log_progress(f"前置条件: {self.precondition.name}", "info")
+            self._log_progress(f"前置条件: {self.precondition.name}", "info", kind="lifecycle")
 
+        analysis_key = self._build_analysis_task_key(function_identifier)
+        mode = "fresh"
+        is_leader = False
+        shared_future: Optional[asyncio.Future] = None
         result = None
         try:
-            result = await self._deep_analysis(function_identifier, context)
+            async with DeepVulnAgent._analysis_cache_lock:
+                cached_result = DeepVulnAgent._completed_analysis_results.get(analysis_key)
+                if cached_result is not None:
+                    mode = "cache_hit"
+                    result = cached_result
+                else:
+                    shared_future = DeepVulnAgent._inflight_analysis_tasks.get(analysis_key)
+                    if shared_future is None:
+                        shared_future = asyncio.get_running_loop().create_future()
+                        DeepVulnAgent._inflight_analysis_tasks[analysis_key] = shared_future
+                        is_leader = True
+                        mode = "leader"
+                    else:
+                        mode = "wait_inflight"
+
+            if mode == "cache_hit":
+                self._log_progress(
+                    f"[任务缓存命中] 复用已有结果: {function_identifier}",
+                    kind="subagent",
+                )
+            elif mode == "wait_inflight":
+                self._log_progress(
+                    f"[任务复用] 等待进行中任务: {function_identifier}",
+                    kind="subagent",
+                )
+                result = await shared_future
+            else:
+                self._log_progress(
+                    f"[任务创建] 开始新分析任务: {function_identifier}",
+                    kind="subagent",
+                )
+                result = await self._deep_analysis(function_identifier, context)
+                async with DeepVulnAgent._analysis_cache_lock:
+                    DeepVulnAgent._completed_analysis_results[analysis_key] = result
+                    if shared_future and not shared_future.done():
+                        shared_future.set_result(result)
+                    DeepVulnAgent._inflight_analysis_tasks.pop(analysis_key, None)
+
             await self._update_execution_state(status="completed")
             vuln_count = len(result.get("vulnerabilities", []))
+            summary_suffix = (
+                "using cached result"
+                if mode in {"cache_hit", "wait_inflight"}
+                else "from fresh analysis"
+            )
             self._agent_logger.log_execution_end(
                 agent_id=self.agent_id,
                 status=AgentStatus.COMPLETED,
                 vulnerabilities_found=vuln_count,
                 llm_calls=self.execution_state.llm_calls if self.execution_state else 0,
-                summary=f"Deep analysis completed, found {vuln_count} vulnerabilities"
+                summary=f"Deep analysis completed ({summary_suffix}), found {vuln_count} vulnerabilities"
             )
-            self._log_progress(f"深度分析完成，发现 {vuln_count} 个漏洞", "success")
+            self._log_progress(f"深度分析完成，发现 {vuln_count} 个漏洞", "success", kind="lifecycle")
 
         except Exception as e:
             error_msg = str(e)
-            self._log_progress(f"分析失败: {error_msg}", "error")
+            self._log_progress(f"分析失败: {error_msg}", "error", kind="error")
+            if is_leader and shared_future and not shared_future.done():
+                shared_future.set_result({"vulnerabilities": [], "constraints": [], "error": error_msg})
+            if is_leader:
+                async with DeepVulnAgent._analysis_cache_lock:
+                    DeepVulnAgent._inflight_analysis_tasks.pop(analysis_key, None)
             await self._update_execution_state(status="failed")
             self._agent_logger.log_execution_end(
                 agent_id=self.agent_id,
@@ -635,9 +717,9 @@ class DeepVulnAgent(BaseAgent):
         finally:
             # 等待所有子 Agent 任务完成
             if self._sub_agent_tasks:
-                self._log_progress(f"等待 {len(self._sub_agent_tasks)} 个子 Agent 完成...")
+                self._log_progress(f"等待 {len(self._sub_agent_tasks)} 个子 Agent 完成...", kind="subagent")
                 await asyncio.gather(*self._sub_agent_tasks, return_exceptions=True)
-                self._log_progress("所有子 Agent 已完成")
+                self._log_progress("所有子 Agent 已完成", kind="subagent")
 
         return result
 
@@ -662,9 +744,9 @@ class DeepVulnAgent(BaseAgent):
         - 避免 LLM 重复请求已提供的信息
         """
         # 获取函数信息
-        func_def = await self.engine.get_function_def(function_identifier)
+        func_def = await self.engine.get_function_def(function_identifier=function_identifier)
         if not func_def:
-            self._log_progress(f"获取方法定义失败: {function_identifier}")
+            self._log_progress(f"获取方法定义失败: {function_identifier}", "error", kind="error")
             return {"vulnerabilities": [], "constraints": [], "error": "Failed to get function definition"}
 
         # 初始化上下文
@@ -686,12 +768,13 @@ class DeepVulnAgent(BaseAgent):
             for taint in self.precondition.taint_sources:
                 if taint not in context.taint_sources:
                     context.taint_sources.append(taint)
-            self._log_progress(f"从前置条件添加污点源: {context.taint_sources}")
+            self._log_progress(f"从前置条件添加污点源: {context.taint_sources}", kind="summary")
 
         # 多轮对话状态
         all_vulnerabilities: List[VulnerabilityResult] = []
         sub_summaries: Dict[str, SimpleFunctionSummary] = {}
         final_analysis_summary = ""
+        consecutive_invalid_tool_rounds = 0
 
         # 跟踪已创建的子 Agent，避免重复创建
         created_sub_agents: Set[str] = set()
@@ -700,7 +783,7 @@ class DeepVulnAgent(BaseAgent):
         # 跟踪已请求的函数摘要，避免重复请求
         requested_summaries: Set[str] = set()
 
-        self._log_progress(f"开始多轮对话分析 (最多 {self.max_iterations} 轮)")
+        self._log_progress(f"开始多轮对话分析 (最多 {self.max_iterations} 轮)", kind="lifecycle")
 
         # 初始化多轮对话的 messages 列表
         # 第一轮：使用 build_iteration_prompt 构建完整上下文
@@ -756,21 +839,38 @@ class DeepVulnAgent(BaseAgent):
             summary_calls = []
             subagent_calls = []
             finalize_called = False
+            recognized_tool_calls = 0
+            unknown_tool_names: List[str] = []
 
             for tc in ai_tool_calls:
-                name = tc.get('name', '')
+                name = self._canonical_tool_name(tc.get('name', ''))
                 args = tc.get('args', {})
+                if not isinstance(args, dict):
+                    args = {}
 
-                if name == 'get_function_summary_tool' or 'get_function_summary' in name:
+                if not name:
+                    unknown_tool_names.append(str(tc.get('name', '') or ''))
+                    continue
+
+                recognized_tool_calls += 1
+                if name == 'get_function_summary_tool':
                     summary_calls.append(args)
-                elif name == 'create_sub_agent_tool' or 'create_sub_agent' in name:
+                elif name == 'create_sub_agent_tool':
                     subagent_calls.append(args)
-                elif name == 'finalize_analysis_tool' or 'finalize_analysis' in name:
+                elif name == 'finalize_analysis_tool':
                     finalize_called = True
 
             self._log_progress(
-                f"[Tool Call] 获取摘要: {len(summary_calls)}, 创建子Agent: {len(subagent_calls)}, 完成分析: {finalize_called}"
+                f"[Tool Call] 获取摘要: {len(summary_calls)}, 创建子Agent: {len(subagent_calls)}, 完成分析: {finalize_called}, 未识别: {len(unknown_tool_names)}",
+                kind="tool_round",
             )
+            if unknown_tool_names:
+                preview = ", ".join(repr(x) for x in unknown_tool_names[:2])
+                self._log_progress(
+                    f"[Tool Call] 忽略未识别工具名: {preview}",
+                    "warning",
+                    kind="tool_round",
+                )
 
             # 处理报告的漏洞 - 立即保存到数据库（增量保存）
             reported_vulns = tool_calls_result.get('reported_vulnerabilities', [])
@@ -804,7 +904,8 @@ class DeepVulnAgent(BaseAgent):
                         all_vulnerabilities.append(vuln_result)
                         self._log_progress(
                             f"[漏洞报告] {vuln_result.name} ({vuln_result.severity}) @ {vuln_result.location}",
-                            "warning"
+                            "warning",
+                            kind="vulnerability",
                         )
 
                         # 立即保存到数据库（增量保存）
@@ -822,13 +923,14 @@ class DeepVulnAgent(BaseAgent):
                                 )
                                 self._log_progress(
                                     f"[漏洞同步] 已保存漏洞到数据库: {vuln_result.name}",
-                                    "success"
+                                    "success",
+                                    kind="vulnerability",
                                 )
                         except Exception as e:
-                            self._log_progress(f"[漏洞同步] 保存失败: {e}", "warning")
+                            self._log_progress(f"[漏洞同步] 保存失败: {e}", "warning", kind="error")
 
                     except Exception as e:
-                        self._log_progress(f"[漏洞报告] 解析漏洞失败: {e}", "warning")
+                        self._log_progress(f"[漏洞报告] 解析漏洞失败: {e}", "warning", kind="error")
 
             # 后台启动子 Agent（带去重检查）
             if subagent_calls:
@@ -839,7 +941,7 @@ class DeepVulnAgent(BaseAgent):
                     dedup_key = f"{func_name}:{line_num}"
 
                     if dedup_key in created_sub_agents:
-                        self._log_progress(f"[去重跳过] 子 Agent {func_name} (行 {line_num}) 已创建")
+                        self._log_progress(f"[去重跳过] 子 Agent {func_name} (行 {line_num}) 已创建", kind="trace")
                         continue
 
                     created_sub_agents.add(dedup_key)
@@ -847,7 +949,7 @@ class DeepVulnAgent(BaseAgent):
                     created_sub_agent_signatures.append(func_name)
 
                 if unique_subagent_calls:
-                    self._log_progress(f"[后台启动] {len(unique_subagent_calls)} 个子 Agent")
+                    self._log_progress(f"[后台启动] {len(unique_subagent_calls)} 个子 Agent", kind="subagent")
                     for call_args in unique_subagent_calls:
                         self._start_sub_agent_background(call_args, context, func_def.code if func_def else None)
 
@@ -862,7 +964,7 @@ class DeepVulnAgent(BaseAgent):
                     dedup_key = f"{func_name}:{line_num}"
 
                     if func_name in requested_summaries:
-                        self._log_progress(f"[去重跳过] 函数 {func_name} 的摘要已在之前轮次请求过")
+                        self._log_progress(f"[去重跳过] 函数 {func_name} 的摘要已在之前轮次请求过", kind="trace")
                         # 记录空结果用于 ToolMessage
                         summary_results_map[func_name] = (func_name, None)
                         continue
@@ -871,7 +973,7 @@ class DeepVulnAgent(BaseAgent):
                     unique_summary_calls.append(call_args)
 
                 if unique_summary_calls:
-                    self._log_progress(f"[执行任务] {len(unique_summary_calls)} 个摘要任务")
+                    self._log_progress(f"[执行任务] {len(unique_summary_calls)} 个摘要任务", kind="summary")
                     summary_results = await self._execute_summary_tasks(
                         unique_summary_calls,
                         caller_identifier=context.function_identifier if context else None,
@@ -885,11 +987,14 @@ class DeepVulnAgent(BaseAgent):
 
             # 为每个 tool_call 添加 ToolMessage
             for idx, tc in enumerate(ai_tool_calls):
-                name = tc.get('name', '')
+                raw_name = str(tc.get('name', '') or '')
+                name = self._canonical_tool_name(raw_name)
                 args = tc.get('args', {})
+                if not isinstance(args, dict):
+                    args = {}
                 tool_call_id = f"call_{iteration}_{idx}"
 
-                if 'get_function_summary' in name:
+                if name == 'get_function_summary_tool':
                     func_name = args.get('function_identifier', 'unknown')
                     # 查找该函数的执行结果
                     result = summary_results_map.get(func_name)
@@ -905,37 +1010,61 @@ class DeepVulnAgent(BaseAgent):
                     messages.append(ToolMessage(
                         content=tool_content,
                         tool_call_id=tool_call_id,
-                        name=name
+                        name=name or raw_name
                     ))
-                elif 'create_sub_agent' in name:
+                elif name == 'create_sub_agent_tool':
                     func_name = args.get('function_identifier', 'unknown')
                     messages.append(ToolMessage(
                         content=f"子 Agent 已启动分析函数: {func_name}。该 Agent 将在后台独立执行深度分析。",
                         tool_call_id=tool_call_id,
-                        name=name
+                        name=name or raw_name
                     ))
-                elif 'report_vulnerability' in name:
+                elif name == 'report_vulnerability_tool':
                     vuln_name = args.get('name', '未知漏洞')
                     messages.append(ToolMessage(
                         content=f"漏洞 '{vuln_name}' 已记录。",
                         tool_call_id=tool_call_id,
-                        name=name
+                        name=name or raw_name
                     ))
-                elif 'finalize_analysis' in name:
+                elif name == 'finalize_analysis_tool':
                     final_analysis_summary = (args.get("analysis_summary") or "").strip()
                     messages.append(ToolMessage(
                         content="分析已完成。",
                         tool_call_id=tool_call_id,
-                        name=name
+                        name=name or raw_name
+                    ))
+                else:
+                    messages.append(ToolMessage(
+                        content=(
+                            "未识别的工具调用，已忽略。"
+                            "请仅调用：get_function_summary_tool / create_sub_agent_tool / "
+                            "report_vulnerability_tool / finalize_analysis_tool。"
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=raw_name or "unknown_tool"
                     ))
 
             # 检查是否完成
-            has_tool_calls = len(ai_tool_calls) > 0
+            has_tool_calls = recognized_tool_calls > 0
             should_finalize = finalize_called
 
             # 如果没有 tool call 但有 content，提示 LLM 调用工具完成分析
             if not has_tool_calls and not should_finalize:
-                self._log_progress(f"[提示] LLM 返回分析内容但未调用工具，提示调用 finalize_analysis_tool 完成分析")
+                consecutive_invalid_tool_rounds += 1
+                if all_vulnerabilities and consecutive_invalid_tool_rounds >= 2:
+                    if not final_analysis_summary:
+                        final_analysis_summary = "已报告漏洞；后续轮次连续返回无效工具调用，系统自动结束分析。"
+                    self._log_progress(
+                        "[收敛保护] 已有漏洞结果且连续无有效工具调用，自动结束当前分析",
+                        "warning",
+                        kind="tool_round",
+                    )
+                    break
+                self._log_progress(
+                    "[提示] LLM 返回分析内容但未调用工具，提示调用 finalize_analysis_tool 完成分析",
+                    "warning",
+                    kind="tool_round",
+                )
                 messages.append(HumanMessage(
                     content="你已完成分析并在上述内容中描述了发现，但尚未调用工具来报告结果。"
                             "请**通过工具调用**执行操作，**不要输出 JSON 列表或纯文本**。"
@@ -943,9 +1072,10 @@ class DeepVulnAgent(BaseAgent):
                             "或调用 `finalize_analysis_tool` 完成分析。"
                 ))
                 continue  # 继续下一轮，让 LLM 调用工具
+            consecutive_invalid_tool_rounds = 0
 
             if should_finalize:
-                self._log_progress(f"分析完成于第 {iteration + 1} 轮")
+                self._log_progress(f"分析完成于第 {iteration + 1} 轮", kind="lifecycle")
                 break
 
         # 分析完成，转换所有漏洞为 Vulnerability 对象用于返回
@@ -960,7 +1090,7 @@ class DeepVulnAgent(BaseAgent):
         # 生成分析摘要
         summary = final_analysis_summary.strip()
 
-        self._log_progress(f"深度分析完成，共发现 {len(vulnerabilities)} 个漏洞")
+        self._log_progress(f"深度分析完成，共发现 {len(vulnerabilities)} 个漏洞", kind="lifecycle")
 
         return {
             "vulnerabilities": vulnerabilities,
@@ -978,7 +1108,7 @@ class DeepVulnAgent(BaseAgent):
         将函数摘要格式化为 ToolMessage 的内容
         
         Args:
-            func_sig: 函数签名
+            func_sig: 函数标识符
             summary: 函数摘要
             
         Returns:
@@ -1044,7 +1174,10 @@ class DeepVulnAgent(BaseAgent):
                     report_vulnerability_tool,
                     finalize_analysis_tool,
                 ]
-                self._log_progress(f"[深度限制] 当前深度 {context.depth}/{context.max_depth}，已限制子函数分析工具")
+                self._log_progress(
+                    f"[深度限制] 当前深度 {context.depth}/{context.max_depth}，已限制子函数分析工具",
+                    kind="lifecycle",
+                )
             else:
                 # 正常深度时，提供所有工具
                 tools = [
@@ -1062,8 +1195,6 @@ class DeepVulnAgent(BaseAgent):
             )
 
             # 解析结果
-            analysis_complete = False
-            has_finalize = False
             reported_vulns = []
 
             tool_calls = result.tool_calls
@@ -1071,11 +1202,11 @@ class DeepVulnAgent(BaseAgent):
 
             # 检查 tool calls
             for tc in tool_calls:
-                name = tc.get('name', '')
+                name = self._canonical_tool_name(tc.get('name', ''))
                 args = tc.get('args', {})
-                if 'finalize_analysis' in name:
-                    has_finalize = True
-                elif 'report_vulnerability' in name:
+                if not isinstance(args, dict):
+                    args = {}
+                if name == 'report_vulnerability_tool':
                     reported_vulns.append(args)
 
             return {
@@ -1085,7 +1216,7 @@ class DeepVulnAgent(BaseAgent):
             }
 
         except Exception as e:
-            self._log_progress(f"[Tool Call] 分析失败: {e}", "error")
+            self._log_progress(f"[Tool Call] 分析失败: {e}", "error", kind="error")
             return {
                 'tool_calls': [],
                 'content': '',
@@ -1107,7 +1238,7 @@ class DeepVulnAgent(BaseAgent):
             caller_code: 调用者源代码（用于 CallsiteAgent）
             
         Returns:
-            [(函数签名, 摘要), ...] 的列表
+            [(函数标识符, 摘要), ...] 的列表
         """
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
@@ -1117,12 +1248,12 @@ class DeepVulnAgent(BaseAgent):
                 callsite = CallsiteInfo.from_dict(call_args)
 
                 # 解析 callsite 为函数标识符
-                func_sig = await self._resolve_callsite(callsite, caller_identifier, caller_code)
-                if not func_sig:
-                    func_sig = callsite.function_identifier
+                callee_identifier = await self._resolve_callsite(callsite, caller_identifier, caller_code)
+                if not callee_identifier:
+                    callee_identifier = callsite.function_identifier
 
-                result = await self._get_sub_function_summary(func_sig)
-                return func_sig, result
+                result = await self._get_sub_function_summary(callee_identifier)
+                return callee_identifier, result
 
         results = await asyncio.gather(
             *[_execute_with_semaphore(c) for c in calls],
@@ -1133,14 +1264,14 @@ class DeepVulnAgent(BaseAgent):
         processed_results = []
         for item in results:
             if isinstance(item, Exception):
-                self._log_progress(f"[摘要任务] 执行失败: {item}", "warning")
+                self._log_progress(f"[摘要任务] 执行失败: {item}", "warning", kind="error")
                 processed_results.append(("", None))
             else:
-                func_sig, summary = item
+                callee_identifier, summary = item
                 if summary:
-                    self._log_progress(f"[摘要任务] 获取 {func_sig} 成功")
+                    self._log_progress(f"[摘要任务] 获取 {callee_identifier} 成功", kind="trace")
                 else:
-                    self._log_progress(f"[摘要任务] 获取 {func_sig} 无结果", "warning")
+                    self._log_progress(f"[摘要任务] 获取 {callee_identifier} 无结果", "warning", kind="summary")
                 processed_results.append(item)
 
         return processed_results
@@ -1152,7 +1283,7 @@ class DeepVulnAgent(BaseAgent):
             caller_code: Optional[str] = None,
     ) -> Optional[str]:
         """
-        解析 callsite 为函数签名
+        解析 callsite 为函数标识符
         
         通过 Engine 统一处理（Engine 内部包含了静态分析和 CallsiteAgent 回退逻辑）
         
@@ -1162,24 +1293,27 @@ class DeepVulnAgent(BaseAgent):
             caller_code: 调用者源代码
         
         返回:
-            解析后的函数签名，失败返回 None
+            解析后的函数标识符，失败返回 None
         """
         try:
             # 委托给 Engine 处理
-            signature = await self.engine.resolve_function_by_callsite(
+            function_identifier = await self.engine.resolve_function_by_callsite(
                 callsite=callsite,
                 caller_identifier=caller_identifier,
                 caller_code=caller_code,
             )
 
-            if signature:
-                self._log_progress(f"Resolved callsite {callsite.function_identifier} -> {signature}")
-                return signature
+            if function_identifier:
+                self._log_progress(
+                    f"Resolved callsite {callsite.function_identifier} -> {function_identifier}",
+                    kind="trace",
+                )
+                return function_identifier
 
             return callsite.function_identifier
 
         except Exception as e:
-            self._log_progress(f"[Callsite解析] 解析失败: {e}", "warning")
+            self._log_progress(f"[Callsite解析] 解析失败: {e}", "warning", kind="error")
             return callsite.function_identifier
 
     def _start_sub_agent_background(
@@ -1195,10 +1329,6 @@ class DeepVulnAgent(BaseAgent):
         callsite_data = call_args
         func_name = callsite_data.get('function_identifier', 'unknown') if callsite_data else 'unknown'
 
-        current_call_stack = parent_context.call_stack if parent_context else self.call_stack
-        call_path = " -> ".join(current_call_stack + [func_name])
-        call_depth = len(current_call_stack) + 1
-
         async def _run_sub_agent():
             try:
 
@@ -1208,20 +1338,14 @@ class DeepVulnAgent(BaseAgent):
                 if sub_vulns:
                     async with self._vuln_lock:
                         self.vulnerabilities.extend(sub_vulns)
-                    self._log_progress(
-                        f"[子Agent完成] {func_name} 发现 {len(sub_vulns)} 个漏洞",
-                        "success"
-                    )
-                else:
-                    self._log_progress(f"[子Agent完成] {func_name} 未发现漏洞")
 
             except Exception as e:
-                self._log_progress(f"[子Agent失败] {func_name} | 错误: {e}", "warning")
+                self._log_progress(f"[子Agent失败] {func_name} | 错误: {e}", "warning", kind="error")
 
         # 创建后台任务
         task = asyncio.create_task(_run_sub_agent())
         self._sub_agent_tasks.append(task)
-        self._log_progress(f"[后台启动] 子 Agent: {func_name}")
+        self._log_progress(f"[后台启动] 子 Agent: {func_name}", kind="trace")
 
     async def _get_sub_function_summary(
             self,
@@ -1246,7 +1370,7 @@ class DeepVulnAgent(BaseAgent):
         
         基于调用点上下文构建子函数的约束条件（纯文本格式）。
         """
-        # 获取 callsite 信息并解析为函数签名
+        # 获取 callsite 信息并解析为函数标识符
         callsite_data = call_args
         if not callsite_data:
             return {"vulnerabilities": [], "skipped": True, "reason": "missing_callsite"}
@@ -1255,9 +1379,9 @@ class DeepVulnAgent(BaseAgent):
 
         # 解析 callsite 为函数标识符
         caller_identifier = parent_context.function_identifier if parent_context else None
-        func_sig = await self._resolve_callsite(callsite, caller_identifier, caller_code)
-        if not func_sig:
-            func_sig = callsite.function_identifier
+        callee_identifier = await self._resolve_callsite(callsite, caller_identifier, caller_code)
+        if not callee_identifier:
+            callee_identifier = callsite.function_identifier
 
         current_call_stack = parent_context.call_stack if parent_context else self.call_stack
         current_call_stack_detailed = parent_context.call_stack_detailed if parent_context else self.call_stack_detailed
@@ -1272,8 +1396,8 @@ class DeepVulnAgent(BaseAgent):
 
         # 构建新的调用栈帧
         new_frame = CallStackFrame(
-            function_identifier=func_sig,
-            function_name=func_sig.split('(')[0] if '(' in func_sig else func_sig,
+            function_identifier=callee_identifier,
+            function_name=callee_identifier.split('(')[0] if '(' in callee_identifier else callee_identifier,
             call_line=callsite.line_number,
             call_code=callsite.call_text,
             caller_function=call_args.get('caller_function', '') or (
@@ -1286,16 +1410,16 @@ class DeepVulnAgent(BaseAgent):
         current_call_stack_detailed = current_call_stack_detailed.copy()
         current_call_stack_detailed.append(new_frame)
 
-        call_path_str = " -> ".join(current_call_stack + [func_sig])
+        call_path_str = " -> ".join(current_call_stack + [callee_identifier])
 
         # 检查循环调用
         call_sigs_in_stack = [frame.function_identifier for frame in current_call_stack_detailed]
-        if func_sig in call_sigs_in_stack[:-1]:
-            self._log_progress(f"[子Agent跳过] 检测到循环调用 | 目标: {func_sig}", "warning")
+        if callee_identifier in call_sigs_in_stack[:-1]:
+            self._log_progress(f"[子Agent跳过] 检测到循环调用 | 目标: {callee_identifier}", "warning", kind="subagent")
             return {"vulnerabilities": [], "skipped": True, "reason": "circular_call"}
 
         if len(current_call_stack_detailed) > self.max_depth:
-            self._log_progress(f"[子Agent跳过] 超过递归深度 | 目标: {func_sig}", "warning")
+            self._log_progress(f"[子Agent跳过] 超过递归深度 | 目标: {callee_identifier}", "warning", kind="subagent")
             return {"vulnerabilities": [], "skipped": True, "reason": "max_depth"}
 
         # 构建子函数上下文 - 使用纯文本约束（不再解析约束内容）
@@ -1303,7 +1427,7 @@ class DeepVulnAgent(BaseAgent):
 
         # 基于调用上下文生成 precondition
         sub_precondition = self._build_call_context_precondition(
-            func_sig,
+            callee_identifier,
             call_args,
             argument_constraints,
             call_path_str
@@ -1311,8 +1435,8 @@ class DeepVulnAgent(BaseAgent):
 
         # 构建子函数上下文
         sub_context = FunctionContext(
-            function_identifier=func_sig,
-            call_stack=parent_context.call_stack + [func_sig],
+            function_identifier=callee_identifier,
+            call_stack=parent_context.call_stack + [callee_identifier],
             call_stack_detailed=current_call_stack_detailed,
             depth=parent_context.depth + 1,
             max_depth=self.max_depth,
@@ -1346,16 +1470,19 @@ class DeepVulnAgent(BaseAgent):
 
         await self._update_execution_state(sub_agents_created=self.execution_state.sub_agents_created + 1)
 
-        self._log_progress(f"[子Agent创建] 目标: {func_sig} | 深度: {sub_context.depth}/{self.max_depth}")
+        self._log_progress(
+            f"[子Agent创建] 目标: {callee_identifier} | 深度: {sub_context.depth}/{self.max_depth}",
+            kind="subagent",
+        )
 
         # 执行子 Agent
-        result = await sub_agent.run(function_identifier=func_sig, context=sub_context)
+        result = await sub_agent.run(function_identifier=callee_identifier, context=sub_context)
 
         sub_vulns = result.get("vulnerabilities", [])
         if sub_vulns:
-            self._log_progress(f"[子Agent结果] {func_sig} 发现 {len(sub_vulns)} 个漏洞", "success")
+            self._log_progress(f"[子Agent结果] {callee_identifier} 发现 {len(sub_vulns)} 个漏洞", "success", kind="subagent")
         else:
-            self._log_progress(f"[子Agent结果] {func_sig} 未发现漏洞")
+            self._log_progress(f"[子Agent结果] {callee_identifier} 未发现漏洞", kind="subagent")
 
         return result
 
@@ -1468,11 +1595,13 @@ class DeepVulnAgent(BaseAgent):
         duplicate_calls = []
 
         for tc in tool_calls:
-            name = tc.get('name', '')
+            name = self._canonical_tool_name(tc.get('name', ''))
             args = tc.get('args', {})
+            if not isinstance(args, dict):
+                args = {}
 
             # 检查是否是获取函数摘要的工具调用
-            if name == 'get_function_summary_tool' or 'get_function_summary' in name:
+            if name == 'get_function_summary_tool':
                 # 解析 callsite 信息
                 callsite_data = args
                 if not callsite_data:
@@ -1496,7 +1625,8 @@ class DeepVulnAgent(BaseAgent):
                     })
                     self._log_progress(
                         f"[去重过滤] 跳过重复的函数摘要请求: {func_identifier} (行 {line_number})",
-                        "info"
+                        "info",
+                        kind="trace",
                     )
                 else:
                     filtered_calls.append(tc)
@@ -1508,7 +1638,8 @@ class DeepVulnAgent(BaseAgent):
         if duplicate_calls:
             self._log_progress(
                 f"[去重统计] 过滤了 {len(duplicate_calls)} 个重复的函数摘要请求",
-                "info"
+                "info",
+                kind="trace",
             )
 
         return filtered_calls, duplicate_calls
@@ -1849,7 +1980,7 @@ class DeepVulnAgent(BaseAgent):
                 },
             )
         except Exception as e:
-            self._log_progress(f"[漏洞转换] 转换失败: {e}", "warning")
+            self._log_progress(f"[漏洞转换] 转换失败: {e}", "warning", kind="error")
             return None
 
     @classmethod
@@ -1861,3 +1992,9 @@ class DeepVulnAgent(BaseAgent):
     def clear_execution_states(cls):
         """清除执行状态"""
         cls._execution_states.clear()
+
+    @classmethod
+    def clear_analysis_task_cache(cls):
+        """清除共享分析任务缓存。"""
+        cls._inflight_analysis_tasks.clear()
+        cls._completed_analysis_results.clear()

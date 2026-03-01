@@ -17,6 +17,7 @@ from langchain_core.messages import SystemMessage, ToolMessage
 
 from ..models.workflow import WorkflowContext
 from ..core import ToolBasedLLMClient, SummaryService
+from ..core.cli_logger import CLILogger
 from ..core.context import ArtifactStore, MessageManager, ContextAssembler, ContextCompressor, ReadArtifactPruner
 from .workflow_parser import WorkflowParser
 from .tools import OrchestratorTools
@@ -82,6 +83,7 @@ class TaskOrchestratorAgent:
         self.max_inline_chars = max_inline_chars
         self.artifacts_dir = artifacts_dir
         self.source_root = source_root
+        self._logger = CLILogger(component="Orchestrator", verbose=verbose)
         
         # 初始化 Tools（如果提供了 engine_type 和 target_path 则立即初始化 engine）
         self.tools_manager = OrchestratorTools(
@@ -91,6 +93,8 @@ class TaskOrchestratorAgent:
             target_path=target_path,
             source_root=source_root,
             session_id=self.session_id,
+            verbose=verbose,
+            logger=self._logger,
         )
         self.tools: List[Any] = []
         
@@ -143,6 +147,9 @@ class TaskOrchestratorAgent:
         )
         self.context_compressor = ContextCompressor(
             summary_service=self.summary_service,
+            compression_profile="orchestrator",
+            consumer_agent="orchestrator",
+            compression_purpose="workflow orchestration and task execution continuity",
         )
         self.read_artifact_pruner = ReadArtifactPruner()
         self.context_assembler = ContextAssembler(
@@ -150,27 +157,24 @@ class TaskOrchestratorAgent:
             compressor=self.context_compressor,
             read_artifact_pruner=self.read_artifact_pruner,
             token_threshold=self.context_token_threshold,
+            compression_profile="orchestrator",
+            compression_consumer="orchestrator",
+            compression_purpose="workflow orchestration and task execution continuity",
         )
         self.tools_manager.set_artifact_store(self.artifact_store)
+        self.tools_manager.set_message_manager(self.message_manager)
         
         # 初始化新的任务编排组件（简化设计）
-        self._init_orchestrator_components()
+        self._init_orchestrator_components(emit_log=True)
         
         self.tools = self.tools_manager.get_tools()
 
 
     def _log(self, message: str, level: str = "info"):
         """打印日志"""
-        if self.verbose:
-            prefix = "[Orchestrator]"
-            if level == "error":
-                print(f"  [X] {prefix} {message}")
-            elif level == "warning":
-                print(f"  [!] {prefix} {message}")
-            elif level == "success":
-                print(f"  [+] {prefix} {message}")
-            else:
-                print(f"  [*] {prefix} {message}")
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="orchestrator.event", message=message)
 
     def _normalize_tool_output(self, result_data: Any) -> tuple[str, Optional[str]]:
         """
@@ -187,15 +191,16 @@ class TaskOrchestratorAgent:
             return result_data, None
         return json.dumps(result_data, ensure_ascii=False), None
 
-    def _init_orchestrator_components(self):
-        """初始化简化的任务编排组件（TaskListManager, FileManager, AgentDelegate）"""
+    def _init_orchestrator_components(self, emit_log: bool = True):
+        """初始化简化的任务编排组件（TaskListManager, AgentDelegate）"""
         # 确定 session 目录
         session_dir = self._resolve_session_dir()
         
         # 初始化 OrchestratorTools 的新组件
         self.tools_manager.initialize_orchestrator_components(session_dir)
         
-        self._log(f"初始化 session 目录: {session_dir}")
+        if emit_log:
+            self._log(f"初始化 session 目录: {session_dir}")
 
     def _resolve_session_dir(self) -> Path:
         """确定 session 目录路径"""
@@ -208,12 +213,8 @@ class TaskOrchestratorAgent:
         return base_dir / self.session_id
 
     def _resolve_artifact_dir(self, source_root: Optional[str]) -> Path:
-        """确定 Artifact 落盘目录"""
-        if self.artifacts_dir:
-            return Path(self.artifacts_dir)
-        base_root = Path(source_root) if source_root else Path.cwd()
-        session = self.session_id or self.agent_id
-        return base_root / ".ivagent_artifacts" / "orchestrator" / session
+        """确定统一 Artifact 落盘目录（session 级）。"""
+        return self._resolve_session_dir() / "artifacts"
 
     async def execute_workflow(self, workflow_path: str = None, target_path: str = None) -> OrchestratorResult:
         """
@@ -222,7 +223,7 @@ class TaskOrchestratorAgent:
         新的执行流程：
         1. 解析 Workflow 文档（如果提供了 workflow_path）
         2. 引导 LLM 调用 plan_tasks() 规划任务（如果提供了 workflow_path）
-        3. 循环引导 LLM 调用 execute_next_task() 执行任务
+        3. 循环引导 LLM 调用 execute_task()/execute_tasks() 执行任务
         4. 检测所有任务完成后结束
 
         Args:
@@ -345,9 +346,8 @@ class TaskOrchestratorAgent:
                         )
                         await self.message_manager.add_user_message(
                             "任务尚未完成，必须继续调用工具。"
-                            "如果工具返回 recoverable 错误，请先按 required_next_actions 修复。"
-                            "若出现 MISSING_FUNCTION_IDENTIFIER，请按顺序调用："
-                            "resolve_function_identifier -> set_task_function_identifier -> execute_next_task(agent_type=\"vuln_analysis\")。"
+                            "如果工具返回错误，请先根据错误码和错误原因修复后再继续。"
+                            "不要重复无效调用；必要时先取证再重试执行。"
                         )
                         if stall_rounds >= 3:
                             forced_stop_reason = "LLM 连续 3 轮未调用工具且任务未完成，保护性终止。"
@@ -450,7 +450,10 @@ class TaskOrchestratorAgent:
             # 简化的任务编排工具（新设计）
             "plan_tasks": self.tools_manager.plan_tasks,
             "append_tasks": self.tools_manager.append_tasks,
-            "execute_next_task": self.tools_manager.execute_next_task,
+            "list_runnable_tasks": self.tools_manager.list_runnable_tasks,
+            "compose_task_context": self.tools_manager.compose_task_context,
+            "execute_task": self.tools_manager.execute_task,
+            "execute_tasks": self.tools_manager.execute_tasks,
             "resolve_function_identifier": self.tools_manager.resolve_function_identifier,
             "set_task_function_identifier": self.tools_manager.set_task_function_identifier,
             "get_task_status": self.tools_manager.get_task_status,
@@ -460,6 +463,7 @@ class TaskOrchestratorAgent:
             # 数据访问工具
             "read_artifact": self.tools_manager.read_artifact,
             "list_artifacts": self.tools_manager.list_artifacts,
+            "mark_compression_projection": self.tools_manager.mark_compression_projection,
 
         }
 

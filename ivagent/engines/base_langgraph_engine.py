@@ -25,6 +25,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_core.tools import BaseTool, tool
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
+from ..core.cli_logger import CLILogger
 
 class WorkflowStatus(str, Enum):
     """工作流状态"""
@@ -107,6 +108,7 @@ class LangGraphEngine(ABC):
         self.llm_client: ChatOpenAI = llm_client
         self.tools = tools or []
         self.config = config or EngineConfig()
+        self._logger = CLILogger(component=self.__class__.__name__, verbose=self.config.verbose)
         
         # 工作流图
         self._workflow: Optional[StateGraph] = None
@@ -369,8 +371,9 @@ class LangGraphEngine(ABC):
     
     def log(self, message: str, level: str = "INFO"):
         """打印日志"""
-        if self.config.verbose:
-            print(f"[{level}] {self.__class__.__name__}: {message}")
+        if not self.config.verbose:
+            return
+        self._logger.log(level=level, event="langgraph_engine.event", message=message)
     
     async def _add_history_async(self, entry: Dict[str, Any]):
         """异步添加执行历史"""
