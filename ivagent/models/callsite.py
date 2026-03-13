@@ -6,7 +6,7 @@ Callsite 调用点数据模型
 LLM 提供 callsite 信息，Agent 通过引擎解析出具体函数签名。
 """
 
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 from dataclasses import dataclass, field
 
 

@@ -10,7 +10,6 @@ See the file 'LICENSE' for copying permission
 """
 
 import argparse
-import sys
 from fastmcp import FastMCP
 from src.banner import jadx_mcp_server_banner
 from src.server import config, tools
@@ -20,25 +19,11 @@ mcp = FastMCP("JADX-AI-MCP Plugin Reverse Engineering Server")
 
 # Import and register ALL tools using correct FastMCP pattern
 from src.server.tools.class_tools import (
-    fetch_current_class, get_selected_text, get_class_source,
-    get_all_classes, get_methods_of_class, get_fields_of_class, get_smali_of_class,
-    get_main_application_classes_names, get_main_application_classes_code, get_main_activity_class
+    get_selected_text, get_class_source,
+    get_all_classes, get_methods_of_class
 )
 from src.server.tools.search_tools import (
-    get_method_by_name, search_method_by_name, search_classes_by_keyword
-)
-from src.server.tools.resource_tools import (
-    get_android_manifest, get_strings, get_all_resource_file_names,
-    get_resource_file
-)
-from src.server.tools.refactor_tools import (
-    rename_class, rename_method, rename_field, rename_package, rename_variable
-)
-from src.server.tools.debug_tools import (
-    debug_get_stack_frames, debug_get_threads, debug_get_variables
-)
-from src.server.tools.xrefs_tools import (
-    get_xrefs_to_class, get_xrefs_to_method, get_xrefs_to_field
+    get_method_by_name
 )
 
 @mcp.tool()

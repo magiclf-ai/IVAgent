@@ -1,5 +1,5 @@
 import json
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession

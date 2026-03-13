@@ -18,15 +18,10 @@ IDA MCP 引擎实现
     4. 自动重试机制
 """
 
-import os
-import sys
 import re
-import time
-import atexit
 import asyncio
 import aiohttp
-from pathlib import Path
-from typing import Dict, List, Optional, Any, AsyncIterator
+from typing import Dict, List, Optional, Any
 
 from .base_static_analysis_engine import (
     FunctionDef,

@@ -61,7 +61,6 @@ class ASTExtractor:
         
         
         for method in java_class.getMethods():
-            method_name = method.getName()
             self._extract_calls_from_method(method)
         
     def _extract_calls_from_method(self, method):

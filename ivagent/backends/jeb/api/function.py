@@ -5,8 +5,7 @@
 基于 DecompiledMethod 提供原子化接口获取 Java 方法信息
 """
 
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
 
 from ..decompiler import DecompiledMethod
 
@@ -65,7 +64,7 @@ def get_method_info(filepath: str, method_signature: str, client) -> Optional[Di
             "call_count": len(calls),
         }
     
-    except Exception as e:
+    except Exception:
         return None
 
 

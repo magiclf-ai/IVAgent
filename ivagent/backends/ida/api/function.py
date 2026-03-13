@@ -8,8 +8,8 @@
 import idaapi
 import ida_hexrays
 import idc
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
 
 from ..decompiler import DecompiledFunction
 

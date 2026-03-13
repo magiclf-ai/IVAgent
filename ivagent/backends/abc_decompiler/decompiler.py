@@ -8,7 +8,7 @@ Provides access to decompiled Java methods, including:
 - Function call collection
 """
 
-from typing import Set, Dict, List, Tuple, Optional
+from typing import List
 from dataclasses import dataclass, field
 import re
 

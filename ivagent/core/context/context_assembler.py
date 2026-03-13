@@ -6,7 +6,7 @@ ContextAssembler - 上下文组装器
 当上下文超过阈值时，触发 LLM 压缩历史消息。
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import json
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage

@@ -2,7 +2,6 @@
 
 import idapro
 import sys
-import json
 import traceback
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path

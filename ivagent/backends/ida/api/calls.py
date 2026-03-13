@@ -7,8 +7,7 @@
 
 import idaapi
 import idc
-import idautils
-from typing import List, Dict, Any, Optional
+from typing import List, Any
 from dataclasses import dataclass
 
 from ivagent.core.cli_logger import CLILogger

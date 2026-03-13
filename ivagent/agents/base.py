@@ -6,13 +6,13 @@ BaseAgent - Agent 基类
 支持高并发分析场景
 """
 
-from typing import Dict, List, Optional, Any, Awaitable, AsyncIterator
+from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
 import json
 import time
 import asyncio
 
-from ivagent import BaseStaticAnalysisEngine
+from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
 from ..core.cli_logger import CLILogger
 
 

@@ -8,7 +8,7 @@
 - 函数调用信息收集
 """
 
-from typing import Set, Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 import re
 
@@ -62,11 +62,6 @@ class DecompiledMethod:
         # 匹配模式: obj.method(arg1, arg2) 或 Class.method(arg1, arg2)
         call_pattern = re.compile(
             r'(\w+)\s*\.\s*(\w+)\s*\(([^)]*)\)'
-        )
-        
-        # 也匹配静态方法调用: ClassName.methodName(...)
-        static_call_pattern = re.compile(
-            r'([A-Z]\w+)\s*\.\s*(\w+)\s*\(([^)]*)\)'
         )
         
         for line_idx, line in enumerate(self._lines):

@@ -10,7 +10,7 @@ Simple JSON-RPC 2.0 Protocol
 
 import json
 
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
 
 from enum import IntEnum

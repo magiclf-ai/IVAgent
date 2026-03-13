@@ -7,7 +7,7 @@ citem 操作模块
 
 import idaapi
 import ida_hexrays
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Optional
 from dataclasses import dataclass
 
 from ..decompiler import DecompiledFunction

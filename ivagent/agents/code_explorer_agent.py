@@ -32,7 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AI
 from .base import BaseAgent
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine, SearchOptions
 from ..core.context import AgentMessage, ContextCompressor, ReadArtifactPruner
-from ..core import SummaryService
+from ..core.summary_service import SummaryService
 
 # 导入 ToolBasedLLMClient
 try:

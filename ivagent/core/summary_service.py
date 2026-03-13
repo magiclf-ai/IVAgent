@@ -7,7 +7,6 @@ SummaryService - 统一摘要生成服务
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
-import json
 
 from langchain_core.messages import HumanMessage
 

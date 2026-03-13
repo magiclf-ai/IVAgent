@@ -8,7 +8,7 @@
 import idaapi
 import idc
 import idautils
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from dataclasses import dataclass
 
 

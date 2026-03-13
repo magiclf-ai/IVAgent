@@ -5,7 +5,7 @@ Abc-Decompiler (Jadx-based) Engine Implementation
 Provides static analysis capabilities using the Abc-Decompiler MCP Server.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 import re
 
 from .base_static_analysis_engine import (
@@ -14,7 +14,6 @@ from .base_static_analysis_engine import (
     CallSite,
     CrossReference,
     VariableConstraint,
-    TargetType,
     SearchOptions,
     SearchResult,
 )
