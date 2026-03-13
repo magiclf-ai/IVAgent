@@ -7,6 +7,7 @@ IVAgent 智能漏洞挖掘系统 - 快速启动器
 
 import sys
 import subprocess
+import importlib.util
 from pathlib import Path
 
 from ivagent.core.cli_logger import CLILogger
@@ -15,9 +16,10 @@ from ivagent.core.cli_logger import CLILogger
 def check_dependencies(logger: CLILogger):
     """检查必要的依赖"""
     try:
-        import fastapi
-        import uvicorn
-        import pydantic
+        required_modules = ("fastapi", "uvicorn", "pydantic")
+        missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+        if missing:
+            raise ImportError(", ".join(missing))
         logger.success("deps.ok", "依赖检查通过")
         return True
     except ImportError as e:

@@ -13,16 +13,17 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.llm_logger import get_log_manager, LLMLogEntry, LogStorageType
-from core.agent_logger import get_agent_log_manager, AgentLogManager
-from core.vuln_storage import get_vulnerability_manager, VulnerabilityManager, VulnerabilitySeverity, VulnerabilityStatus
+from core.llm_logger import get_log_manager, LLMLogEntry
+from core.agent_logger import get_agent_log_manager
+from core.vuln_storage import get_vulnerability_manager
 from core.cli_logger import CLILogger
+from core.db_profiles import get_db_paths
 from api_redis import redis_router
 
 
@@ -97,6 +98,12 @@ app = FastAPI(
 app.include_router(redis_router)
 WEB_DEBUG = os.environ.get("IVAGENT_WEB_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 web_logger = CLILogger(component="web.api", verbose=WEB_DEBUG)
+
+# 根据 profile 初始化数据库单例
+_db_paths = get_db_paths()
+get_log_manager(storage_path=_db_paths.llm_log_db)
+get_agent_log_manager(db_path=_db_paths.agent_log_db)
+get_vulnerability_manager(db_path=_db_paths.vuln_db)
 
 # WebSocket 连接管理器
 class ConnectionManager:
@@ -476,7 +483,6 @@ async def get_tool_calls(
     for e in entries:
         metadata = e.metadata or {}
         response = e.response or {}
-        tool_call_details = response.get("tool_call_details", {})
         
         result.append(ToolCallLogEntry(
             id=e.id,

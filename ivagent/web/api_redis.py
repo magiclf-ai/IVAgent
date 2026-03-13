@@ -20,7 +20,7 @@ from pathlib import Path
 script_dir = Path(__file__).parent.parent.parent  # hexray_scripts 目录
 sys.path.insert(0, str(script_dir))
 
-from ivagent.core.cache import RedisCache, get_cache
+from ivagent.core.cache import RedisCache
 
 # 导入模型类以确保 pickle 能正确反序列化
 try:
@@ -396,9 +396,6 @@ async def get_stats():
     try:
         redis_client = _get_raw_redis()
         
-        # 基础信息
-        info = redis_client.info()
-        
         # 获取所有键
         all_keys = list(redis_client.scan_iter(count=10000))
         total_keys = len(all_keys)
@@ -433,7 +430,7 @@ async def get_stats():
             key_types=key_types,
             namespaces=namespaces
         )
-    except Exception as e:
+    except Exception:
         return RedisStats(
             connected=False,
             total_keys=0,

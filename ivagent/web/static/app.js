@@ -2428,9 +2428,6 @@ function renderAgentType(agentType) {
     const typeMap = {
         'DeepVulnAgent': '<span class="agent-type-tag vuln">漏洞挖掘</span>',
         'FunctionSummaryAgent': '<span class="agent-type-tag summary">摘要分析</span>',
-        'DecisionAgent': '<span class="agent-type-tag decision">决策分析</span>',
-        'SubFunctionAgent': '<span class="agent-type-tag subfunc">子函数分析</span>',
-        'ProgramAnalyzer': '<span class="agent-type-tag program">程序分析</span>',
     };
     
     return typeMap[agentType] || `<span class="agent-type-tag">${agentType}</span>`;

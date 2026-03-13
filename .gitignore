@@ -21,3 +21,5 @@ ENV/
 .vscode/
 *.swp
 *.swo
+plans/
+output/

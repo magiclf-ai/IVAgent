@@ -4,6 +4,8 @@ import sys
 import argparse
 from pathlib import Path
 
+IDAPRO_RUNTIME = idapro
+
 # 添加 hexray_scripts 到路径
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -35,7 +37,7 @@ def main():
     logger.info("startup.cwd", "工作目录", cwd=Path.cwd())
     
     # 启动服务器
-    server = start_server(
+    start_server(
         idb_path=args.idb,
         host=args.host,
         port=args.port,
