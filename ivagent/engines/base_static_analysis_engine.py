@@ -6,13 +6,15 @@ BaseEngine - 异步分析引擎抽象基类
 支持高并发分析场景
 """
 
+import asyncio
+import os
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
-import asyncio
+from pathlib import Path
+from typing import Dict, List, Optional, Any
 
-from ..models.callsite import CallsiteInfo, ResolvedCallsite
+from ..models.callsite import CallsiteInfo
 from ..core.cli_logger import CLILogger
 
 
@@ -22,6 +24,19 @@ class TargetType(Enum):
     CLASS = "class"
     FIELD = "field"
     VARIABLE = "variable"
+
+
+def make_function_id(file_path: str, func_name: str, start_line: int, source_root: str = "") -> str:
+    """构建标准函数 ID: relative_path::name@line
+
+    仅供 SourceCodeEngine 使用。IDA/JEB/ABC 引擎保持各自的函数 ID 格式不变。
+    """
+    if source_root and os.path.isabs(file_path):
+        try:
+            file_path = str(Path(file_path).relative_to(Path(source_root)))
+        except ValueError:
+            pass
+    return f"{file_path}::{func_name}@{start_line}"
 
 
 @dataclass
@@ -437,7 +452,7 @@ class BaseStaticAnalysisEngine(ABC):
             try:
                 # 延迟导入以避免循环依赖
                 # 注意：这里假设项目结构支持相对导入
-                from ..agents.callsite_agent import CallsiteAgent, ResolvedCallsite
+                from ..agents.callsite_agent import CallsiteAgent
                 
                 agent = CallsiteAgent(
                     llm_client=self._llm_client,

@@ -5,7 +5,7 @@ DeepVulnAgent 提示词管理模块
 集中管理所有 LLM 提示词模板，便于维护和调优。
 """
 
-from typing import Any, List, Dict, TYPE_CHECKING, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import json
 
 # ============================================================================
@@ -32,6 +32,7 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 * 识别源 (Source)：外部输入、未校验参数。
 * 追踪流 (Propagation)：指针赋值、算术运算、内存拷贝。
 * 定位汇 (Sink)：危险函数 (memcpy, strcpy, etc.)、数组索引、指针解引用。
+* **强制递归要求**：如果当前函数本身只是包装函数/分发函数/数据中转节点，或仅将污点参数直接传递给子函数而当前函数内没有最终危险汇点，**不得**直接结束分析，必须继续分析相关 callee。
 
 
 3. **约束求解 (Constraint Solving)**：
@@ -39,13 +40,21 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 * 计算缓冲区大小与拷贝长度的关系。
 
 
-4. **批量工具决策（关键效率步骤）**：
+4. **逻辑完整性检查 (Logic Integrity Check)**：
+* 检查是否存在状态机/权限/认证检查，验证所有到达敏感操作的路径是否都经过该检查。
+* 特别关注 switch-case fallthrough、默认分支、错误处理路径是否绕过了安全检查。
+
+5. **累积效应分析 (Cumulative Effect Analysis)**：
+* 对于循环中的写入/拷贝操作，计算最大累积写入量，与目标缓冲区大小对比。
+* 检查循环边界条件是否充分约束了总写入量。
+
+6. **批量工具决策（关键效率步骤）**：
 * **扫描全函数**：识别所有需要分析的子函数调用点（包括需要获取摘要的和污点流入需要创建子Agent的）。
 * **批量决策**：将独立的工具调用分组，**优先一次性输出所有工具调用**，最大化并行效率。
 * **依赖处理**：如果多个子函数调用存在数据依赖（如A的返回值用于B的参数），先调用A的摘要，等待结果后再处理B。
 
 
-5. **约束准备检查（创建子Agent前必须完成）**：
+7. **约束准备检查（创建子Agent前必须完成）**：
 * 在创建 `create_sub_agent` 前，**必须确保该函数摘要已在 `function_summary_list` 中**。
 * 若摘要不存在，**先调用 `get_function_summary` 获取**，不能立即创建子Agent。
 * 基于摘要信息，正确填充 `argument_constraints` 字段，并按需填充 `global_constraints` 字段。
@@ -54,7 +63,7 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 
 ## 3. 目标漏洞清单 (Vulnerability Taxonomy)
 
-**仅**识别以下 7 类漏洞，标识符严格大小写匹配：
+**仅**识别以下 10 类漏洞，标识符严格大小写匹配：
 
 | 标识符 | 核心判定逻辑 |
 | --- | --- |
@@ -64,7 +73,10 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 | **FORMAT_STRING** | `printf(user_input)` 形式，格式串由攻击者控制。 |
 | **INTEGER_OVERFLOW** | 算术运算导致回绕/溢出，进而导致后续的缓冲区过小或逻辑错误。 |
 | **USE_AFTER_FREE** | 内存被 `free` 后未置 NULL，后续仍被解引用或再次 free。 |
-| **NULL_POINTER** | 指针可能为 NULL (未初始化或通过路径判定)，但在解引用前未做非空检查。 |
+| **NULL_POINTER** | 指针来源于 malloc/calloc 返回值或外部输入解析结果，且存在可达的 NULL 路径，在解引用前未做非空检查。**注意：函数参数缺少 NULL 检查属于防御性编程建议，不作为漏洞报告，除非调用者确实可能传入 NULL。** |
+| **AUTH_BYPASS** | 存在认证/授权/状态检查，但某些代码路径（如 switch-case fallthrough、默认分支）可绕过检查直达敏感操作。 |
+| **CUMULATIVE_OVERFLOW** | 循环/多次调用中每次操作看似安全，但累积写入量超过缓冲区容量（需分析循环边界与缓冲区大小关系）。 |
+| **INCOMPLETE_VALIDATION** | 对输入做了部分校验（如总长度），但遗漏关键维度（如元素计数、嵌套深度、子字段长度）。 |
 
 漏洞判断的条件：
 - **仔细**: 仔细分析代码，基于控制流、数据流挖掘是否存在漏洞，梳理漏洞触发条件
@@ -101,6 +113,7 @@ VULN_AGENT_SYSTEM_PROMPT_IDA = """
 * 然后通过工具调用完成操作，不要输出多余的自然语言。
 * **并行调用优先**：尽可能在一次响应中返回多个工具调用，提升分析效率。
 * 需要结束分析时，请调用 `finalize_analysis_tool`（可与 `report_vulnerability_tool` 同轮提交）。
+* **禁止过早 finalize**：若污点数据仍可沿调用链继续传播，且相关 callee 尚未通过函数摘要或子 Agent 分析覆盖，则**禁止**调用 `finalize_analysis_tool`。
 
 ## 5. 工具调用定义 (Tool Definitions)
 你拥有以下 4 个工具。**强烈建议并行调用**（一次输出多个工具调用以提升效率）。
@@ -291,13 +304,21 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 * 检查权限校验 (Permission Checks) 和输入验证。
 
 
-4. **批量工具决策（关键效率步骤）**：
+4. **逻辑完整性检查 (Logic Integrity Check)**：
+* 检查是否存在认证/授权/权限检查，验证所有到达敏感操作的路径是否都经过该检查。
+* 特别关注 switch-case fallthrough、默认分支、异常处理路径是否绕过了安全检查。
+
+5. **累积效应分析 (Cumulative Effect Analysis)**：
+* 对于循环中的写入/拷贝操作，计算最大累积写入量，与目标缓冲区大小对比。
+* 检查循环边界条件是否充分约束了总写入量。
+
+6. **批量工具决策（关键效率步骤）**：
 * **扫描全函数**：识别所有需要分析的子方法调用点（包括需要获取摘要的和污点流入需要创建子Agent的）。
 * **批量决策**：将独立的工具调用分组，**优先一次性输出所有工具调用**，最大化并行效率。
 * **依赖处理**：如果多个子方法调用存在数据依赖，先调用A的摘要，等待结果后再处理B。
 
 
-5. **约束准备检查（创建子Agent前必须完成）**：
+7. **约束准备检查（创建子Agent前必须完成）**：
 * 在创建 `create_sub_agent` 前，**必须确保该方法摘要已在 `function_summary_list` 中**。
 * 若摘要不存在，**先调用 `get_function_summary` 获取**，不能立即创建子Agent。
 * 基于摘要信息，正确填充 `argument_constraints` 字段，并按需填充 `global_constraints` 字段。
@@ -317,7 +338,9 @@ VULN_AGENT_SYSTEM_PROMPT_JEB = """
 | **INTENT_INJECTION** | 隐式 Intent 劫持，或处理嵌套 Intent 时未校验来源/目标。 |
 | **BROKEN_CRYPTO** | 使用弱加密算法 (DES, ECB模式) 或硬编码密钥。 |
 | **SENSITIVE_INFO_LEAK** | Logcat 打印敏感信息，或将敏感信息写入外部存储/SharedPreferences。 |
-| **NULL_POINTER** | 对象可能为 NULL，但在调用方法或访问字段前未做非空检查。 |
+| **NULL_POINTER** | 对象来源于外部输入解析结果或可能返回 null 的方法调用，且存在可达的 null 路径，在调用方法或访问字段前未做非空检查。**注意：方法参数缺少 null 检查属于防御性编程建议，不作为漏洞报告，除非调用者确实可能传入 null。** |
+| **AUTH_BYPASS** | 存在认证/授权/权限检查，但某些代码路径（如 switch-case fallthrough、默认分支、异常处理路径）可绕过检查直达敏感操作。 |
+| **INCOMPLETE_VALIDATION** | 对输入做了部分校验（如总长度），但遗漏关键维度（如元素计数、嵌套深度、子字段长度）。 |
 
 漏洞判断的条件：
 - **仔细**: 仔细分析代码，基于控制流、数据流挖掘是否存在漏洞，梳理漏洞触发条件
@@ -485,7 +508,15 @@ VULN_AGENT_SYSTEM_PROMPT_ABC = """
 * 检查权限校验和输入验证。
 
 
-4. **批量工具决策（关键效率步骤）**：
+4. **逻辑完整性检查 (Logic Integrity Check)**：
+* 检查是否存在认证/授权/权限检查，验证所有到达敏感操作的路径是否都经过该检查。
+* 特别关注 switch-case fallthrough、默认分支、异常处理路径是否绕过了安全检查。
+
+5. **累积效应分析 (Cumulative Effect Analysis)**：
+* 对于循环中的写入/拷贝操作，计算最大累积写入量，与目标缓冲区大小对比。
+* 检查循环边界条件是否充分约束了总写入量。
+
+6. **批量工具决策（关键效率步骤）**：
 * **扫描全函数**：识别所有需要分析的子函数调用点（包括需要获取摘要的和污点流入需要创建子Agent的）。
 * **批量决策**：将独立的工具调用分组，**优先一次性输出所有工具调用**，最大化并行效率。
 * **依赖处理**：如果多个子函数调用存在数据依赖，先调用A的摘要，等待结果后再处理B。
@@ -509,7 +540,9 @@ VULN_AGENT_SYSTEM_PROMPT_ABC = """
 | **ABILITY_HIJACK** | 隐式 Want 启动 Ability 时未指定 bundleName/abilityName，或处理嵌套 Want 时未校验来源。 |
 | **SENSITIVE_INFO_LEAK** | Hilog 打印敏感信息，或将敏感信息明文写入 PersistentStorage/Preferences/RdbStore。 |
 | **INSECURE_DATA_STORAGE** | 关键数据未加密存储，或文件权限设置过宽 (虽 HarmonyOS 默认沙箱，但需注意公共目录操作)。 |
-| **NULL_POINTER** | 对象可能为 undefined/null，但在调用方法或访问属性前未做非空检查 (ArkTS 严格模式下较少，但在类型转换或 any 类型中可能出现)。 |
+| **NULL_POINTER** | 对象来源于外部输入解析结果或可能返回 undefined/null 的方法调用，且存在可达的 null 路径，在调用方法或访问属性前未做非空检查。**注意：函数参数缺少 null 检查属于防御性编程建议，不作为漏洞报告，除非调用者确实可能传入 null/undefined。** |
+| **AUTH_BYPASS** | 存在认证/授权/权限检查，但某些代码路径（如 switch-case fallthrough、默认分支、异常处理路径）可绕过检查直达敏感操作。 |
+| **INCOMPLETE_VALIDATION** | 对输入做了部分校验（如总长度），但遗漏关键维度（如元素计数、嵌套深度、子字段长度）。 |
 
 漏洞判断的条件：
 - **仔细**: 仔细分析代码，基于控制流、数据流挖掘是否存在漏洞，梳理漏洞触发条件
@@ -677,6 +710,9 @@ ITERATION_PROMPT_TEMPLATE = """
 
 ### 当前上下文
 - 调用深度: {depth}/{max_depth}
+- 污点源（必须沿调用链持续跟踪）:
+
+{taint_sources}
 - 父函数传递的参数约束: 
 
 {parent_constraints}
@@ -686,6 +722,7 @@ ITERATION_PROMPT_TEMPLATE = """
 {global_constraints}
 
 **注意**: 调用栈由 Agent 自动维护。当创建子Agent时，只需提供准确的调用点信息（行号、调用代码），Agent 会自动构建完整调用链。
+**强制规则**: 如果当前函数将污点参数直接传给其他函数，或当前函数本身只是薄包装/转发层，在相关 callee 未分析前，不得结束分析。
 
 ### 已创建的子 Agent ({created_subagent_count}个)
 {created_subagents}
@@ -804,7 +841,13 @@ def build_iteration_prompt(
 """
 
     # 格式化上下文约束信息
-    context_constraints = _format_context_constraints(context.precondition)
+    context_constraints = _format_context_constraints(context.skill)
+
+    taint_sources = getattr(context, "taint_sources", None) or []
+    if taint_sources:
+        taint_sources_str = "\n".join(f"- {item}" for item in taint_sources)
+    else:
+        taint_sources_str = "(无明确污点源)"
 
     # 格式化父函数传递的参数约束 - 优先使用调用栈详细信息
     if hasattr(context, 'call_stack_detailed') and context.call_stack_detailed:
@@ -881,7 +924,7 @@ def build_iteration_prompt(
         func_code=func_def.code,
         depth=context.depth,
         max_depth=context.max_depth,
-        taint_sources=context.taint_sources,
+        taint_sources=taint_sources_str,
         parent_constraints=parent_constraints_str,
         global_constraints=global_constraints_str,
         created_subagent_count=len(created_subagents),
@@ -978,25 +1021,26 @@ def build_incremental_prompt(
     return "\n".join(lines)
 
 
-def _format_context_constraints(precondition) -> str:
+def _format_context_constraints(skill) -> str:
     """
     格式化上下文约束信息
 
     Args:
-        precondition: Precondition 对象或 None（历史字段名，承载上下文约束文本）
+        skill: SkillContext 对象或 None（承载上下文约束文本）
 
     Returns:
         格式化后的上下文约束描述字符串
 
     Note:
-        如果 precondition.text_content 存在，则优先使用文本内容。
+        如果 skill.get_precondition_text() 存在，则优先使用文本内容。
     """
-    if precondition is None:
+    if skill is None:
         return "无额外上下文约束，按常规漏洞分析流程进行。"
 
-    # 优先使用文本化上下文约束
-    if precondition.text_content:
-        return precondition.text_content.strip()
+    if hasattr(skill, "get_precondition_text"):
+        text = skill.get_precondition_text()
+        if text:
+            return text.strip()
 
     return "无额外上下文约束。"
 

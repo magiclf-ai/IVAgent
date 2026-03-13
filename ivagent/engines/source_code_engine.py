@@ -4,10 +4,9 @@ SourceCodeEngine - 基于 LLM Agent + Tool Call 的源码分析引擎
 """
 
 import os
-import json
 import subprocess
 import uuid
-from typing import List, Optional, Any, Union
+from typing import List, Optional, Any
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage
@@ -20,6 +19,8 @@ from .base_static_analysis_engine import (
     VariableConstraint,
     BaseStaticAnalysisEngine,
     SearchResult,
+    SymbolType,
+    make_function_id,
 )
 from ..models.callsite import CallsiteInfo
 from ..core.cli_logger import CLILogger
@@ -578,6 +579,19 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
     # BaseStaticAnalysisEngine 接口实现
     # ==========================================================================
 
+    @staticmethod
+    def _extract_function_name(identifier: str) -> str:
+        """从标准函数 ID 或签名中提取函数名。"""
+        if not identifier:
+            return ""
+        if "::" in identifier and "@" in identifier:
+            tail = identifier.rsplit("::", 1)[-1]
+            return tail.split("@", 1)[0].strip()
+        if "(" in identifier:
+            prefix = identifier.split("(", 1)[0].strip()
+            return prefix.split()[-1].strip() if prefix else ""
+        return identifier.strip()
+
     async def _do_initialize(self):
         """异步初始化引擎"""
         if not self.source_root.exists():
@@ -606,7 +620,6 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
 
         def finish_analysis(
                 found: bool,
-                function_identifier: str = "",
                 name: str = "",
                 signature: str = "",
                 file_path: str = "",
@@ -622,7 +635,6 @@ class SourceCodeEngine(BaseStaticAnalysisEngine):
             
             Args:
                 found: Whether the function definition was found.
-                function_identifier: Unique function identifier for downstream tools.
                 name: Function name.
                 signature: Full function signature (return type, name, parameters).
                 file_path: Relative path to the file containing the function.
@@ -646,9 +658,10 @@ Your workflow:
 Guidelines:
 - Read enough context to identify the complete function (from definition to closing brace)
 - Extract accurate line numbers
+- file_path must be relative to the source root
 - Include complete function code with original line numbers
 - Parse parameters with their types
-- Return both function_identifier (stable identifier) and signature (readable declaration)"""
+"""
 
         user_prompt = f"Find the complete function definition for: {query}\n\nSource root: {self.source_root}"
 
@@ -657,15 +670,15 @@ Guidelines:
         if result.get("success") and result.get("result"):
             data = result["result"]
             if data.get("found"):
-                resolved_identifier = (
-                    data.get("function_identifier")
-                    or data.get("identifier")
-                    or data.get("signature")
-                    or query
+                canonical_id = make_function_id(
+                    data.get("file_path", ""),
+                    data.get("name", query),
+                    data.get("start_line", 0),
+                    str(self.source_root),
                 )
                 return FunctionDef(
-                    function_identifier=resolved_identifier,
-                    signature=data.get("signature", resolved_identifier),
+                    function_identifier=canonical_id,
+                    signature=data.get("signature", canonical_id),
                     name=data.get("name", query),
                     code=data.get("code", ""),
                     file_path=data.get("file_path", ""),
@@ -691,6 +704,8 @@ Guidelines:
             Args:
                 calls: List of call dicts, each containing:
                     - callee_name: Name of the called function
+                    - file_path: Relative path to the callee definition file (optional)
+                    - start_line: Start line of the callee definition (optional)
                     - line_number: Line number where the call occurs
                     - context: The actual code line containing the call
                     - arguments: List of argument strings (optional)
@@ -708,7 +723,8 @@ Your workflow:
 Guidelines:
 - Include the line number for each call
 - Include the actual code line as context
-- List the arguments if they can be determined"""
+- List the arguments if they can be determined
+- If you can locate the callee definition, include file_path relative to source root and start_line"""
 
         user_prompt = f"Find all function calls within: {function_identifier}\n\nSource root: {self.source_root}"
 
@@ -716,7 +732,7 @@ Guidelines:
 
         if result.get("success") and result.get("result"):
             calls = result["result"].get("calls", [])
-            caller_name = function_identifier.split('(')[0].split()[-1].strip()
+            caller_name = self._extract_function_name(function_identifier)
 
             return [
                 CallSite(
@@ -724,13 +740,17 @@ Guidelines:
                     caller_identifier=function_identifier,
                     callee_name=c.get("callee_name", ""),
                     callee_identifier=(
-                        c.get("function_identifier")
-                        or c.get("identifier")
-                        or c.get("signature")
-                        or c.get("callee_name", "")
+                        make_function_id(
+                            c.get("file_path", ""),
+                            c.get("callee_name", ""),
+                            c.get("start_line", 0),
+                            str(self.source_root),
+                        )
+                        if c.get("file_path") and c.get("start_line")
+                        else c.get("callee_name", "")
                     ),
                     line_number=c.get("line_number", 0),
-                    file_path="",
+                    file_path=c.get("file_path", ""),
                     call_context=c.get("context", ""),
                     arguments=c.get("arguments", []),
                 )
@@ -744,7 +764,7 @@ Guidelines:
             function_identifier: str,
     ) -> List[CallSite]:
         """通过 LLM Agent 获取调用该函数的父函数"""
-        func_name = function_identifier.split('(')[0].split()[-1].strip()
+        func_name = self._extract_function_name(function_identifier)
 
         def finish_analysis(callers: list = None):
             """
@@ -755,6 +775,7 @@ Guidelines:
                     - caller_name: Name of the calling function
                     - caller_identifier: Full identifier of caller (optional)
                     - file_path: Path to the file
+                    - start_line: Start line of caller definition (optional)
                     - line_number: Line number of the call
                     - context: The actual code line containing the call
             """
@@ -772,7 +793,9 @@ Your workflow:
 Exclude:
 - The function's own definition
 - Comments mentioning the function
-- String literals containing the function name"""
+- String literals containing the function name
+
+If you can identify the caller definition, include its file_path relative to source root and start_line."""
 
         user_prompt = f"Find all functions that call: {func_name}\n\nSource root: {self.source_root}"
 
@@ -784,7 +807,16 @@ Exclude:
             return [
                 CallSite(
                     caller_name=c.get("caller_name", ""),
-                    caller_identifier=c.get("caller_identifier", c.get("caller_name", "")),
+                    caller_identifier=(
+                        make_function_id(
+                            c.get("file_path", ""),
+                            c.get("caller_name", ""),
+                            c.get("start_line", 0),
+                            str(self.source_root),
+                        )
+                        if c.get("file_path") and c.get("start_line")
+                        else c.get("caller_identifier", c.get("caller_name", ""))
+                    ),
                     callee_name=func_name,
                     callee_identifier=function_identifier,
                     line_number=c.get("line_number", 0),
@@ -920,28 +952,39 @@ Constraint types:
         if not callsite.function_identifier:
             return None
 
-        func_name = callsite.function_identifier.split('(')[0].strip()
+        func_name = self._extract_function_name(callsite.function_identifier)
 
-        def finish_analysis(resolved: bool, function_identifier: str = "", reason: str = ""):
+        def finish_analysis(
+                resolved: bool,
+                file_path: str = "",
+                name: str = "",
+                start_line: int = 0,
+                reason: str = "",
+        ):
             """
-            Report the resolved function identifier.
+            Report the resolved function definition location.
             
             Args:
-                resolved: Whether the identifier was successfully resolved.
-                function_identifier: The resolved unique function identifier.
+                resolved: Whether the function definition was found.
+                file_path: Relative path to the file containing the function (relative to source root).
+                name: Function name.
+                start_line: Start line number of the function definition (1-based).
                 reason: Explanation if not resolved.
             """
             pass
 
-        system_prompt = """You are an expert code analyst. Resolve a function call to its unique function identifier.
+        system_prompt = """You are an expert code analyst. Resolve a function call to its definition location.
 
 Your workflow:
-1. If caller is provided, examine the call context
-2. Otherwise, search for the function definition
-3. Call finish_analysis with the resolved function_identifier
+1. Search for the function definition using search_code
+2. Use read_file to confirm the definition location
+3. Call finish_analysis with file_path (relative to source root), name, and start_line
 
-Rule:
-- Do not return C/C++ declaration text like 'foo(int x)'; return a stable identifier."""
+Rules:
+- file_path must be relative to the source root, not absolute
+- start_line is the line number where the function definition begins (1-based)
+- If the function cannot be found, set resolved=false and explain in reason
+"""
 
         user_prompt = f"Resolve function call: {callsite.function_identifier}\nLocation: {callsite.file_path}:{callsite.line_number}"
         if caller_identifier:
@@ -952,11 +995,12 @@ Rule:
 
         if result.get("success") and result.get("result"):
             data = result["result"]
-            if data.get("resolved"):
-                return (
-                    data.get("function_identifier")
-                    or data.get("identifier")
-                    or data.get("signature")
+            if data.get("resolved") and data.get("name"):
+                return make_function_id(
+                    data.get("file_path", ""),
+                    data["name"],
+                    data.get("start_line", 0),
+                    str(self.source_root),
                 )
 
         return None
@@ -975,8 +1019,6 @@ Rule:
         Returns:
             SearchResult 列表，包含符号类型信息
         """
-        from .base_static_analysis_engine import SymbolType
-
         # 从 options 中提取参数
         limit = 10
         offset = 0
@@ -991,8 +1033,6 @@ Rule:
             Args:
                 symbols: List of symbol dicts, each containing:
                     - name: Symbol name
-                    - function_identifier: Stable function identifier
-                    - signature: Full signature (optional readable form)
                     - symbol_type: Type of symbol (function, class, global_var, etc.)
                     - file_path: Path to file
                     - line: Line number
@@ -1004,7 +1044,7 @@ Rule:
 Your workflow:
 1. Use search_code to find potential matches
 2. Examine each match to confirm it's a symbol definition (function, class, global variable)
-3. Call finish_analysis with all matching symbols, including function_identifier and types"""
+3. Call finish_analysis with all matching symbols and types"""
 
         # 请求更多结果以支持 offset
         fetch_limit = limit + offset
@@ -1030,13 +1070,23 @@ Your workflow:
                 else:
                     symbol_type = SymbolType.FUNCTION
 
+                identifier = (
+                    make_function_id(
+                        s.get("file_path", ""),
+                        s.get("name", ""),
+                        s.get("line", 0),
+                        str(self.source_root),
+                    )
+                    if s.get("file_path") and s.get("line")
+                    else s.get("function_identifier")
+                    or s.get("identifier")
+                    or s.get("signature")
+                    or s.get("name", "")
+                )
+
                 results.append(SearchResult(
                     name=s.get("name", ""),
-                    identifier=(
-                        s.get("function_identifier")
-                        or s.get("identifier")
-                        or s.get("signature", "")
-                    ),
+                    identifier=identifier,
                     symbol_type=symbol_type,
                     file_path=s.get("file_path"),
                     line=s.get("line", 0),
