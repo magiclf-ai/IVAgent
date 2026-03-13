@@ -15,7 +15,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass, asdict
-from contextlib import contextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -230,7 +229,7 @@ class SQLiteLogStorage(BaseLogStorage):
             if col_name not in existing_columns:
                 try:
                     conn.execute(f"ALTER TABLE llm_logs ADD COLUMN {col_name} {col_type}")
-                except sqlite3.OperationalError as e:
+                except sqlite3.OperationalError:
                     # 列可能已存在或表结构问题，忽略错误
                     pass
     
@@ -728,7 +727,6 @@ class MemoryLogStorage(BaseLogStorage):
         limit: int = 100,
         offset: int = 0
     ) -> List[LLMLogEntry]:
-        import json
         
         entries = list(self._entries.values())
         
@@ -854,14 +852,10 @@ class LLMLogManager:
             return
         
         try:
-            # 默认路径
+            # 默认路径：根据环境变量或 production profile
             if storage_path is None:
-                base_dir = Path.home() / ".ivagent" / "llm_logs"
-                base_dir.mkdir(parents=True, exist_ok=True)
-                if storage_type == LogStorageType.SQLITE:
-                    storage_path = base_dir / "logs.db"
-                elif storage_type == LogStorageType.JSON:
-                    storage_path = base_dir / "json_logs"
+                from .db_profiles import get_db_paths
+                storage_path = get_db_paths().llm_log_db
             
             if storage_type == LogStorageType.SQLITE:
                 self.storage = SQLiteLogStorage(storage_path)

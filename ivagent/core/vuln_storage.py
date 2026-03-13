@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass
 
 
 class VulnerabilitySeverity(str, Enum):
@@ -606,8 +606,8 @@ class VulnerabilityManager:
         self._initialized = True
         
         if db_path is None:
-            base_dir = Path.home() / ".ivagent" / "logs"
-            db_path = base_dir / "vulnerabilities.db"
+            from .db_profiles import get_db_paths
+            db_path = get_db_paths().vuln_db
         
         self.storage = VulnerabilityStorage(db_path)
     

@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 
 class AgentStatus(str, Enum):
@@ -399,8 +399,8 @@ class AgentLogManager:
         self._initialized = True
         
         if db_path is None:
-            base_dir = Path.home() / ".ivagent" / "logs"
-            db_path = base_dir / "agent_logs.db"
+            from .db_profiles import get_db_paths
+            db_path = get_db_paths().agent_log_db
         
         self.storage = AgentLogStorage(db_path)
     
