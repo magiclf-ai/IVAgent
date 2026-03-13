@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
-from ..models.constraints import FunctionContext, Precondition
+from ..models.constraints import FunctionContext
+from ..models.skill import SkillContext
 from ..core.context import ArtifactStore
 
 class AgentType(str, Enum):
@@ -513,20 +514,20 @@ class AgentDelegate:
             )
             
             # 执行分析（目标函数标识符显式传入）
-            precondition_text = (analysis_context or "").strip()
-            if not precondition_text:
-                precondition_text = (task_description or "").strip()
-            precondition = None
-            if precondition_text:
-                precondition = Precondition.from_text(
+            skill_text = (analysis_context or "").strip()
+            if not skill_text:
+                skill_text = (task_description or "").strip()
+            skill = None
+            if skill_text:
+                skill = SkillContext(
                     name="analysis_context",
-                    text_content=precondition_text,
                     description="analysis context",
-                    target="vuln_analysis",
+                    target_type="vuln_analysis",
+                    raw_markdown=skill_text,
                 )
             function_context = FunctionContext(
                 function_identifier=function_identifier,
-                precondition=precondition,
+                skill=skill,
             )
             result = await agent.run(function_identifier=function_identifier, context=function_context)
             

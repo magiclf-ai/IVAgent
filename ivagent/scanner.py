@@ -1,9 +1,7 @@
 import asyncio
-import argparse
-import os
 import time
-from typing import Optional, List, Dict, Any, Union
-from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
 
 from langchain_openai import ChatOpenAI
 
@@ -11,14 +9,14 @@ from ivagent.core.cli_logger import CLILogger, format_duration
 from ivagent.engines.base_static_analysis_engine import BaseStaticAnalysisEngine
 from ivagent.engines.factory import create_engine
 from ivagent.agents.deep_vuln_agent import DeepVulnAgent
-from ivagent.models.constraints import Precondition
+from ivagent.models.skill import SkillContext
 
 
 @dataclass
 class ScanConfig:
     """Configuration for IVAgent Scanner"""
     engine_type: str
-    target_path: str
+    target_path: Optional[str]
     llm_api_key: str
     llm_base_url: str
     llm_model: str
@@ -84,14 +82,15 @@ class IVAgentScanner:
     async def scan_function(
             self,
             function_identifier: str,
-            precondition: Optional[Precondition] = None
+            skill: Optional[SkillContext] = None,
+            deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Scan a single function for vulnerabilities.
         
         Args:
             function_identifier: Function address (IDA) or identifier (JEB/ABC)
-            precondition: Optional analysis constraints/preconditions
+            skill: Optional skill context and analysis constraints
             
         Returns:
             Scan result dictionary containing vulnerabilities
@@ -124,9 +123,10 @@ class IVAgentScanner:
             agent = DeepVulnAgent(
                 engine=self.engine,
                 llm_client=self.llm,
-                precondition=precondition,
+                skill=skill,
                 verbose=self.config.verbose,
                 progress_logger=self._build_progress_logger(function_identifier),
+                deadline=deadline,
             )
 
             result = await agent.run(function_identifier)
@@ -155,14 +155,15 @@ class IVAgentScanner:
     async def scan_functions(
             self,
             function_identifiers: List[str],
-            precondition: Optional[Precondition] = None
+            skill: Optional[SkillContext] = None,
+            deadline: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Scan multiple functions concurrently.
         
         Args:
             function_identifiers: List of function addresses/identifiers
-            precondition: Optional analysis constraints/preconditions
+            skill: Optional skill context and analysis constraints
             
         Returns:
             List of scan results
@@ -189,6 +190,10 @@ class IVAgentScanner:
             async def _scan_single(idx, sig):
                 async with semaphore:
                     single_t0 = time.perf_counter()
+                    # Compute per-function deadline from batch deadline
+                    func_deadline = deadline
+                    if func_deadline is None and deadline is not None:
+                        func_deadline = deadline
                     try:
                         self.logger.info(
                             "scan_batch.item_start",
@@ -199,9 +204,10 @@ class IVAgentScanner:
                         agent = DeepVulnAgent(
                             engine=self.engine,
                             llm_client=self.llm,
-                            precondition=precondition,
+                            skill=skill,
                             verbose=self.config.verbose,
                             progress_logger=self._build_progress_logger(sig),
+                            deadline=func_deadline,
                         )
                         result = await agent.run(sig)
                         vuln_count = len(result.get("vulnerabilities", []))
@@ -234,77 +240,3 @@ class IVAgentScanner:
                 duration=format_duration(time.perf_counter() - batch_t0),
             )
             return results
-
-
-def main():
-    """命令行入口"""
-    cli_logger = CLILogger(component="ivagent.scanner.cli")
-    parser = argparse.ArgumentParser(description='IVAgent Scanner - 漏洞扫描工具')
-    parser.add_argument('target', help='目标文件路径 (IDB/APK/ABC)')
-    parser.add_argument('functions', nargs='+', help='要扫描的函数签名/地址')
-    parser.add_argument('--engine', default='ida', choices=['ida', 'jeb', 'abc'],
-                        help='分析引擎类型 (默认: ida)')
-    parser.add_argument('--source-root', dest='source_root',
-                        help='源代码根目录 (用于 CallsiteAgent 源码分析)')
-    parser.add_argument('--host', default='127.0.0.1',
-                        help='RPC Server 地址 (默认: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=0,
-                        help='RPC Server 端口 (0=使用引擎默认端口)')
-    parser.add_argument('--llm-api-key', default=os.getenv('LLM_API_KEY', ''),
-                        help='LLM API Key (默认从环境变量 LLM_API_KEY 读取)')
-    parser.add_argument('--llm-base-url', default=os.getenv('LLM_BASE_URL', 'http://localhost:8000/v1'),
-                        help='LLM Base URL (默认从环境变量 LLM_BASE_URL 读取)')
-    parser.add_argument('--llm-model', default=os.getenv('LLM_MODEL', 'gpt-4'),
-                        help='LLM 模型名称 (默认从环境变量 LLM_MODEL 读取)')
-    parser.add_argument('--max-concurrency', type=int, default=10,
-                        help='最大并发数 (默认: 10)')
-    parser.add_argument('--temperature', type=float, default=0.1,
-                        help='LLM 温度参数 (默认: 0.1)')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='显示详细日志')
-
-    args = parser.parse_args()
-
-    # 验证必要参数
-    if not args.llm_api_key:
-        parser.error('缺少 LLM API Key，请通过 --llm-api-key 提供或设置 LLM_API_KEY 环境变量')
-
-    # 创建配置
-    config = ScanConfig(
-        engine_type=args.engine,
-        target_path=args.target,
-        llm_api_key=args.llm_api_key,
-        llm_base_url=args.llm_base_url,
-        llm_model=args.llm_model,
-        engine_host=args.host,
-        engine_port=args.port,
-        max_concurrency=args.max_concurrency,
-        temperature=args.temperature,
-        verbose=args.verbose,
-        source_root=args.source_root
-    )
-
-    # 运行扫描
-    scanner = IVAgentScanner(config, logger=CLILogger(component="ivagent.scanner", verbose=args.verbose))
-
-    async def run_scan():
-        if len(args.functions) == 1:
-            # 单个函数扫描
-            result = await scanner.scan_function(args.functions[0])
-            import json
-            cli_logger.info("scan.result", "单函数扫描结果", function=args.functions[0])
-            cli_logger.info("scan.result.payload", json.dumps(result, indent=2, ensure_ascii=False))
-        else:
-            # 多个函数扫描
-            results = await scanner.scan_functions(args.functions)
-            cli_logger.success("scan.batch", "批量扫描完成", total=len(results))
-            for i, (sig, result) in enumerate(zip(args.functions, results)):
-                import json
-                cli_logger.info("scan.batch.item", "扫描结果", index=i + 1, function=sig)
-                cli_logger.info("scan.batch.item.payload", json.dumps(result, indent=2, ensure_ascii=False))
-
-    asyncio.run(run_scan())
-
-
-if __name__ == '__main__':
-    main()

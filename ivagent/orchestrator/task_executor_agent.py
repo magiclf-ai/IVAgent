@@ -12,8 +12,9 @@ import json
 import time
 
 from langchain_openai import ChatOpenAI
-from ..engines import BaseStaticAnalysisEngine
-from ..core import ToolBasedLLMClient, SummaryService
+from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
+from ..core.summary_service import SummaryService
+from ..core.tool_llm_client import ToolBasedLLMClient
 from ..core.cli_logger import CLILogger
 from ..core.context import MessageManager, ContextAssembler, ContextCompressor, ArtifactStore, ReadArtifactPruner
 from ..core.agent_logger import get_agent_log_manager, AgentStatus
@@ -193,7 +194,7 @@ class TaskExecutorAgent:
         # 8. 工具管理器
         self.tools_manager = OrchestratorTools(
             llm_client=self.llm_client,
-            workflow_context=None,
+            skill_context=None,
             engine_type=None,
             target_path=None,
             source_root=self.source_root,

@@ -12,14 +12,14 @@ import json
 import asyncio
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 
 
-from ..models.workflow import WorkflowContext
-from ..core import ToolBasedLLMClient, SummaryService
+from ..models.skill import SkillContext
+from ..core.summary_service import SummaryService
+from ..core.tool_llm_client import ToolBasedLLMClient
 from ..core.cli_logger import CLILogger
 from ..core.context import ArtifactStore, MessageManager, ContextAssembler, ContextCompressor, ReadArtifactPruner
-from .workflow_parser import WorkflowParser
 from .tools import OrchestratorTools
 from .planning_prompts import (
     build_execution_system_prompt,
@@ -64,7 +64,7 @@ class TaskOrchestratorAgent:
         engine_type: Optional[str] = None,
         target_path: Optional[str] = None,
         source_root: Optional[str] = None,
-        workflow_context: Optional[WorkflowContext] = None,
+        skill_context: Optional[SkillContext] = None,
         verbose: bool = True,
         enable_logging: bool = True,
         session_id: Optional[str] = None,
@@ -74,7 +74,7 @@ class TaskOrchestratorAgent:
     ):
 
         self.llm = llm_client
-        self.workflow_context = workflow_context
+        self.skill_context = skill_context
         self.verbose = verbose
         self.enable_logging = enable_logging
         self.session_id = session_id or f"session_{id(self)}"
@@ -88,7 +88,7 @@ class TaskOrchestratorAgent:
         # 初始化 Tools（如果提供了 engine_type 和 target_path 则立即初始化 engine）
         self.tools_manager = OrchestratorTools(
             llm_client=llm_client,
-            workflow_context=workflow_context,
+            skill_context=skill_context,
             engine_type=engine_type,
             target_path=target_path,
             source_root=source_root,
@@ -101,10 +101,8 @@ class TaskOrchestratorAgent:
         # 确定目标函数显示内容
         if target_path:
             target_function = target_path
-        elif workflow_context and workflow_context.target and workflow_context.target.path:
-            target_function = workflow_context.target.path
-        elif workflow_context and workflow_context.name:
-            target_function = f"workflow: {workflow_context.name}"
+        elif skill_context and skill_context.name:
+            target_function = f"skill: {skill_context.name}"
         else:
             target_function = "orchestrator"
 
@@ -216,48 +214,31 @@ class TaskOrchestratorAgent:
         """确定统一 Artifact 落盘目录（session 级）。"""
         return self._resolve_session_dir() / "artifacts"
 
-    async def execute_workflow(self, workflow_path: str = None, target_path: str = None) -> OrchestratorResult:
+    async def execute_skill(self, skill: Optional[SkillContext] = None, target_path: str = None) -> OrchestratorResult:
         """
-        执行 Workflow 文档（简化版）
+        执行 Skill（简化版）
 
         新的执行流程：
-        1. 解析 Workflow 文档（如果提供了 workflow_path）
-        2. 引导 LLM 调用 plan_tasks() 规划任务（如果提供了 workflow_path）
+        1. 使用 SkillContext（如果提供了 skill）
+        2. 引导 LLM 调用 plan_tasks() 规划任务（如果提供了 skill）
         3. 循环引导 LLM 调用 execute_task()/execute_tasks() 执行任务
         4. 检测所有任务完成后结束
 
         Args:
-            workflow_path: Workflow 文件路径（可选，如果为 None 则跳过解析和规划）
-            target_path: 目标程序路径（可选，如果 workflow 中未指定）
+            skill: Skill 上下文（可选，如果为 None 则跳过规划）
+            target_path: 目标程序路径（可选）
 
         Returns:
             OrchestratorResult 执行结果
         """
-        # 如果提供了 workflow_path，则解析 Workflow
-        if workflow_path:
-            self._log(f"读取 Workflow 文档: {workflow_path}")
-
-            try:
-                parser = WorkflowParser()
-                self.workflow_context = parser.parse_and_validate(workflow_path)
-            except Exception as e:
-                return OrchestratorResult(
-                    success=False,
-                    vulnerabilities_found=0,
-                    report="",
-                    summary=f"Failed to parse workflow: {e}",
-                    errors=[str(e)],
-                )
+        if skill:
+            self.skill_context = skill
 
             # 异步初始化引擎（如果有待处理的引擎配置）
             if not self.tools_manager._initialized:
                 self._log("正在初始化分析引擎...")
                 try:
-                    # 从 workflow 或参数获取目标路径
-                    workflow_target = None
-                    if self.workflow_context and self.workflow_context.target:
-                        workflow_target = self.workflow_context.target.path
-                    final_target = target_path or workflow_target
+                    final_target = target_path
 
                     initialized = await self.tools_manager.initialize(target_path=final_target)
                     if not initialized:
@@ -282,14 +263,13 @@ class TaskOrchestratorAgent:
                         errors=[str(e)],
                     )
 
-            # 更新 Tools 的 Workflow 上下文
-            self.tools_manager.workflow_context = self.workflow_context
+            # 更新 Tools 的 Skill 上下文
+            self.tools_manager.skill_context = self.skill_context
 
-            self._log("Workflow 解析成功")
-            self._log(f"名称: {self.workflow_context.name}")
+            self._log("Skill 加载成功")
+            self._log(f"名称: {self.skill_context.name}")
 
-            # 使用运行时传入的 target_path 或 workflow 中的 target
-            final_target = target_path or (self.workflow_context.target.path if self.workflow_context.target else None)
+            final_target = target_path
             if final_target:
                 self._log(f"目标: {final_target}")
 
@@ -299,8 +279,7 @@ class TaskOrchestratorAgent:
             # 让 LLM 自主规划并执行
             await self.message_manager.add_user_message(planning_prompt)
         else:
-            # workflow_path=None: 跳过解析和规划，直接进入任务执行循环
-            self._log("跳过 Workflow 解析，直接进入任务执行循环")
+            self._log("跳过 Skill 规划，直接进入任务执行循环")
 
         max_iterations = 20
         iteration = 0
@@ -480,47 +459,9 @@ class TaskOrchestratorAgent:
 
     def _build_simplified_planning_prompt(self, target_path: str = None) -> str:
         """构建简化版的规划 Prompt"""
-        if not self.workflow_context:
-            return "No workflow context available."
+        if not self.skill_context:
+            return "No skill context available."
         return build_planning_user_prompt(
-            workflow_context=self.workflow_context,
+            skill_context=self.skill_context,
             target_path=target_path,
         )
-
-# 便捷函数
-async def run_workflow(
-    workflow_path: str,
-    llm_client: ChatOpenAI,
-    engine_type: str,
-    target_path: str,
-    source_root: Optional[str] = None,
-    verbose: bool = True,
-    enable_logging: bool = True,
-    session_id: Optional[str] = None,
-) -> OrchestratorResult:
-    """
-    便捷函数：执行 Workflow
-    
-    Args:
-        workflow_path: Workflow 文件路径
-        llm_client: LLM 客户端
-        engine_type: 引擎类型 (ida, jeb, abc, source)
-        target_path: 目标程序路径
-        source_root: 源代码根目录（可选）
-        verbose: 是否打印详细日志
-        enable_logging: 是否启用 LLM 交互日志记录
-        session_id: 会话 ID（用于日志追踪）
-        
-    Returns:
-        执行结果
-    """
-    orchestrator = TaskOrchestratorAgent(
-        llm_client=llm_client,
-        engine_type=engine_type,
-        target_path=target_path,
-        source_root=source_root,
-        verbose=verbose,
-        enable_logging=enable_logging,
-        session_id=session_id,
-    )
-    return await orchestrator.execute_workflow(workflow_path, target_path=target_path)

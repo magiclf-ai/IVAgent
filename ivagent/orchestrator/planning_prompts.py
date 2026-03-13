@@ -7,7 +7,7 @@
 
 from typing import Optional
 
-from ..models.workflow import WorkflowContext
+from ..models.skill import SkillContext
 
 
 def build_planning_system_prompt() -> str:
@@ -413,64 +413,74 @@ def build_execution_system_prompt() -> str:
 
 
 def build_planning_user_prompt(
-    workflow_context: WorkflowContext,
+    skill_context: SkillContext,
     target_path: Optional[str] = None,
 ) -> str:
-    """基于 WorkflowContext 构建规划用户提示词"""
-    if not workflow_context:
-        return "No workflow context available."
+    """基于 SkillContext 构建规划用户提示词"""
+    if not skill_context:
+        return "No skill context available."
 
     lines = [
-        "# Workflow 信息",
+        "# Skill 信息",
         "",
         "## 名称",
-        f"{workflow_context.name}",
+        f"{skill_context.name}",
         "",
         "## 描述",
-        f"{workflow_context.description or '无'}",
+        f"{skill_context.description or '无'}",
         "",
         "## 规划要求",
         "任务规划必须完备且无遗漏；覆盖目标攻击面、关键函数路径与必要验证闭环。",
         "",
     ]
 
-    final_target = target_path
-    if not final_target and workflow_context.target and workflow_context.target.path:
-        final_target = workflow_context.target.path
-
-    if final_target:
+    if target_path:
         lines.extend([
             "## 目标",
-            f"{final_target}",
+            f"{target_path}",
             "",
         ])
 
-    if workflow_context.scope:
+    if skill_context.scope:
         lines.extend([
             "## 分析范围",
-            f"{workflow_context.scope.description}",
+            f"{skill_context.scope.description}",
             "",
         ])
 
-    if workflow_context.vulnerability_focus:
+    if skill_context.taint_sources:
+        lines.extend([
+            "## 污点源",
+            *[f"- {source}" for source in skill_context.taint_sources],
+            "",
+        ])
+
+    if skill_context.dangerous_apis:
+        lines.extend([
+            "## 危险 API",
+            *[f"- {api}" for api in skill_context.dangerous_apis],
+            "",
+        ])
+
+    if skill_context.vulnerability_focus:
         lines.extend([
             "## 漏洞关注点",
-            f"{workflow_context.vulnerability_focus}",
+            f"{skill_context.vulnerability_focus}",
             "",
         ])
 
-    if workflow_context.background_knowledge:
+    if skill_context.background_knowledge:
         lines.extend([
             "## 背景知识",
-            f"{workflow_context.background_knowledge}",
+            f"{skill_context.background_knowledge}",
             "",
         ])
 
-    if workflow_context.raw_markdown:
+    if skill_context.raw_markdown:
         lines.extend([
-            "## 完整 Workflow 文档",
+            "## 完整 Skill 文档",
             "```markdown",
-            f"{workflow_context.raw_markdown}",
+            f"{skill_context.raw_markdown}",
             "```",
             "",
         ])

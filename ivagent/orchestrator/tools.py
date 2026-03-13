@@ -4,7 +4,7 @@ Orchestrator Tools - 简化的 Tool 管理
 
 所有 Tools 整合到一个类中，通过类变量共享状态：
 - engine: 当前分析引擎
-- workflow_context: Workflow 上下文
+- skill_context: Skill 上下文
 - llm_client: LLM 客户端
 - agents: 创建的 Agent 缓存
 - vulnerabilities: 发现的漏洞列表
@@ -15,19 +15,19 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from pathlib import Path
 import uuid
-import json
 import asyncio
 import re
 
 from .agent_delegate import AgentDelegate
-from ..models.workflow import WorkflowContext
+from ..models.skill import SkillContext
 
-from ..engines import create_engine, BaseStaticAnalysisEngine
 from ..engines.base_static_analysis_engine import SearchOptions
+from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
+from ..engines.factory import create_engine
 from ..agents.deep_vuln_agent import DeepVulnAgent
 from ..agents.prompts import get_vuln_agent_system_prompt
 from ..core.context import ArtifactStore
-from ..core import SummaryService
+from ..core.summary_service import SummaryService
 from ..core.tool_llm_client import ToolBasedLLMClient
 from ..core.cli_logger import CLILogger
 from langchain_core.messages import HumanMessage
@@ -67,7 +67,7 @@ class OrchestratorTools:
     def __init__(
             self,
             llm_client: Any = None,
-            workflow_context: Optional[WorkflowContext] = None,
+            skill_context: Optional[SkillContext] = None,
             engine_type: Optional[str] = None,
             target_path: Optional[str] = None,
             source_root: Optional[str] = None,
@@ -81,7 +81,7 @@ class OrchestratorTools:
     ):
 
         self.llm_client = llm_client
-        self.workflow_context = workflow_context
+        self.skill_context = skill_context
 
         # 共享状态
         self.engine: Optional[BaseStaticAnalysisEngine] = None
@@ -979,7 +979,8 @@ class OrchestratorTools:
                 # 创建 DeepVulnAgent
                 from ..agents.deep_vuln_agent import DeepVulnAgent
                 from ..agents.prompts import get_vuln_agent_system_prompt
-                from ..models.constraints import FunctionContext, Precondition
+                from ..models.constraints import FunctionContext
+                from ..models.skill import SkillContext
 
                 base_prompt = get_vuln_agent_system_prompt(self.engine_name or "ida")
 
@@ -1004,23 +1005,23 @@ class OrchestratorTools:
                 self._last_agent_id = agent_id
 
                 # 执行分析
-                precondition_text = (analysis_context or "").strip()
-                if self.workflow_context and self.workflow_context.background_knowledge:
-                    if precondition_text:
-                        precondition_text = f"{precondition_text}\n\n### 背景知识\n{self.workflow_context.background_knowledge}"
+                skill_text = (analysis_context or "").strip()
+                if self.skill_context and self.skill_context.background_knowledge:
+                    if skill_text:
+                        skill_text = f"{skill_text}\n\n### 背景知识\n{self.skill_context.background_knowledge}"
                     else:
-                        precondition_text = f"### 背景知识\n{self.workflow_context.background_knowledge}"
-                precondition = None
-                if precondition_text:
-                    precondition = Precondition.from_text(
+                        skill_text = f"### 背景知识\n{self.skill_context.background_knowledge}"
+                skill = None
+                if skill_text:
+                    skill = SkillContext(
                         name="analysis_context",
-                        text_content=precondition_text,
                         description="analysis context",
-                        target="vuln_analysis",
+                        target_type="vuln_analysis",
+                        raw_markdown=skill_text,
                     )
                 function_context = FunctionContext(
                     function_identifier=target_function_id,
-                    precondition=precondition,
+                    skill=skill,
                 )
 
                 result = await agent.run(function_identifier=target_function_id, context=function_context)
@@ -1198,24 +1199,25 @@ class OrchestratorTools:
             self._last_agent_id = agent_id
 
             # 执行分析
-            from ..models.constraints import FunctionContext, Precondition
-            precondition_text = (analysis_context or "").strip()
-            if self.workflow_context and self.workflow_context.background_knowledge:
-                if precondition_text:
-                    precondition_text = f"{precondition_text}\n\n### 背景知识\n{self.workflow_context.background_knowledge}"
+            from ..models.constraints import FunctionContext
+            from ..models.skill import SkillContext
+            skill_text = (analysis_context or "").strip()
+            if self.skill_context and self.skill_context.background_knowledge:
+                if skill_text:
+                    skill_text = f"{skill_text}\n\n### 背景知识\n{self.skill_context.background_knowledge}"
                 else:
-                    precondition_text = f"### 背景知识\n{self.workflow_context.background_knowledge}"
-            precondition = None
-            if precondition_text:
-                precondition = Precondition.from_text(
+                    skill_text = f"### 背景知识\n{self.skill_context.background_knowledge}"
+            skill = None
+            if skill_text:
+                skill = SkillContext(
                     name="analysis_context",
-                    text_content=precondition_text,
                     description="analysis context",
-                    target="vuln_analysis",
+                    target_type="vuln_analysis",
+                    raw_markdown=skill_text,
                 )
             function_context = FunctionContext(
                 function_identifier=function_identifier,
-                precondition=precondition,
+                skill=skill,
             )
             result = await agent.run(function_identifier=function_identifier, context=function_context)
             vulns = result.get("vulnerabilities", [])
@@ -2767,9 +2769,9 @@ class OrchestratorTools:
         if context:
             lines.append(f"\n上下文: {context}")
 
-        if self.workflow_context:
+        if self.skill_context:
             lines.append(
-                f"\n分析目标: {self.workflow_context.target.path if self.workflow_context.target else 'Unknown'}")
+                f"\n分析目标: {self.skill_context.name or 'Unknown'}")
 
         if self.engine:
             lines.append(f"引擎类型: {self.engine.__class__.__name__}")

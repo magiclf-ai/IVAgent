@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-MasterOrchestrator - 多 Workflow 协调器
+MasterOrchestrator - Skill 驱动协调器
 
-负责将复杂的漏洞挖掘 workflow 拆分为多个独立的子 workflow，
+负责将复杂的漏洞挖掘 skill 拆分为多个独立的任务组，
 并协调多个 TaskExecutorAgent 的执行（串行/并行）。
 """
 
@@ -15,12 +15,12 @@ import time
 
 from langchain_openai import ChatOpenAI
 
-from ..models.workflow import WorkflowContext
-from ..engines import create_engine, BaseStaticAnalysisEngine
-from ..core import ToolBasedLLMClient
+from ..models.skill import SkillContext
+from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
+from ..engines.factory import create_engine
+from ..core.tool_llm_client import ToolBasedLLMClient
 from ..core.cli_logger import CLILogger
 from ..core.context import ArtifactStore
-from .workflow_parser import WorkflowParser
 from .planning_prompts import (
     build_planning_user_prompt,
     build_master_planning_system_prompt,
@@ -42,7 +42,7 @@ class MasterOrchestratorResult:
 
 
 class MasterOrchestrator:
-    """Master Orchestrator - 多 Workflow 协调器"""
+    """Master Orchestrator - 多 Skill 任务组协调器"""
     
     def __init__(
         self,
@@ -66,7 +66,7 @@ class MasterOrchestrator:
         self._logger = CLILogger(component="MasterOrchestrator", verbose=verbose)
         
         self.engine: Optional[BaseStaticAnalysisEngine] = None
-        self.workflow_context: Optional[WorkflowContext] = None
+        self.skill_context: Optional[SkillContext] = None
         self.session_dir = self._resolve_session_dir()
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_store = ArtifactStore(self.session_dir / "artifacts")
@@ -117,16 +117,16 @@ class MasterOrchestrator:
     async def _guide_planning(
         self,
         orchestrator: Any,
-        workflow_context: WorkflowContext
+        skill_context: SkillContext
     ) -> None:
         """引导 LLM 调用 plan_tasks（允许多轮以先获取 function_identifier）
 
         Args:
             orchestrator: TaskOrchestratorAgent 实例
-            workflow_context: Workflow 上下文
+            skill_context: Skill 上下文
         """
         # 1. 构建规划 prompt
-        planning_prompt = self._build_planning_prompt(workflow_context)
+        planning_prompt = self._build_planning_prompt(skill_context)
 
         # 2. 添加用户消息
         await orchestrator.message_manager.add_user_message(planning_prompt)
@@ -701,7 +701,7 @@ class MasterOrchestrator:
     async def _run_agentic_cycle(
         self,
         orchestrator: Any,
-        workflow_context: WorkflowContext,
+        skill_context: SkillContext,
     ) -> MasterOrchestratorResult:
         """
         统一 Agentic 控制环：Plan -> Act -> Review -> (Append/Stop)
@@ -714,7 +714,7 @@ class MasterOrchestrator:
         max_final_followup_rounds = 2
         cycle_converged = False
 
-        await self._guide_planning(orchestrator, workflow_context)
+        await self._guide_planning(orchestrator, skill_context)
 
         workflows = orchestrator.tools_manager.get_planned_workflows()
         if not workflows:
@@ -727,7 +727,7 @@ class MasterOrchestrator:
         base_result = await self._execute_multi_workflows(
             workflows,
             self.engine,
-            workflow_context,
+            skill_context,
             execution_phase="base",
         )
         aggregate_execution_time += base_result.execution_time
@@ -782,7 +782,7 @@ class MasterOrchestrator:
             followup_result = await self._execute_multi_workflows(
                 pending_workflows,
                 self.engine,
-                workflow_context,
+                skill_context,
                 execution_phase="post_review_append",
             )
             aggregate_execution_time += followup_result.execution_time
@@ -855,7 +855,7 @@ class MasterOrchestrator:
                 followup_result = await self._execute_multi_workflows(
                     pending_workflows,
                     self.engine,
-                    workflow_context,
+                    skill_context,
                     execution_phase="post_review_append",
                 )
                 aggregate_execution_time += followup_result.execution_time
@@ -977,7 +977,7 @@ class MasterOrchestrator:
         self,
         workflows: List[Dict[str, Any]],
         engine: BaseStaticAnalysisEngine,
-        workflow_context: WorkflowContext,
+        skill_context: SkillContext,
         execution_phase: str = "base",
     ) -> MasterOrchestratorResult:
         """执行多个独立的 workflow
@@ -985,7 +985,7 @@ class MasterOrchestrator:
         Args:
             workflows: 规划的 workflow 列表
             engine: 已初始化的引擎实例
-            workflow_context: 原始 workflow 上下文
+            skill_context: 原始 skill 上下文
 
         Returns:
             MasterOrchestratorResult: 汇总的执行结果
@@ -1201,7 +1201,7 @@ class MasterOrchestrator:
             str: Markdown 格式的摘要
         """
         lines = [
-            f"# 多 Workflow 执行摘要",
+            f"# 多 Skill 任务组执行摘要",
             "",
             f"**Session ID**: {self.session_id}",
             f"**总执行时间**: {execution_time:.2f}s",
@@ -1267,16 +1267,16 @@ class MasterOrchestrator:
         
         return "\n".join(lines)
     
-    def _build_planning_prompt(self, workflow_context: WorkflowContext) -> str:
+    def _build_planning_prompt(self, skill_context: SkillContext) -> str:
         """构建规划 prompt
 
         Args:
-            workflow_context: Workflow 上下文
+            skill_context: Skill 上下文
 
         Returns:
             规划 prompt 字符串
         """
-        return build_planning_user_prompt(workflow_context)
+        return build_planning_user_prompt(skill_context)
     
     def _get_planning_system_prompt(self) -> str:
         """获取规划阶段的 system prompt
@@ -1287,11 +1287,11 @@ class MasterOrchestrator:
         return build_master_planning_system_prompt()
 
     
-    async def execute_workflow(self, workflow_path: str, target_path: str = None) -> MasterOrchestratorResult:
-        """执行 Workflow 文档
+    async def execute_skill(self, skill: SkillContext, target_path: str = None) -> MasterOrchestratorResult:
+        """执行 Skill 文档
         
         流程：
-        1. 解析 workflow 文档
+        1. 使用 SkillContext
         2. 初始化引擎
         3. 创建 TaskOrchestratorAgent
         4. 执行 Agentic 控制环（Plan -> Act -> Review -> Append/Stop）
@@ -1301,32 +1301,25 @@ class MasterOrchestrator:
         errors = []
         
         try:
-            # 1. 解析 workflow 文档
-            self._log(f"读取 Workflow 文档: {workflow_path}")
-            parser = WorkflowParser()
-            self.workflow_context = parser.parse_and_validate(workflow_path)
-            
-            self._log(f"Workflow 名称: {self.workflow_context.name}")
-            
-            # 保存原始 workflow 文档
+            # 1. 使用传入 skill
+            self.skill_context = skill
+            self._log(f"加载 Skill: {self.skill_context.name}")
+
+            # 保存原始 skill 文档
             self.artifact_store.put_text(
-                content=self.workflow_context.raw_markdown,
-                kind="master_workflow_source",
-                summary=self.workflow_context.name or "workflow",
+                content=self.skill_context.raw_markdown,
+                kind="master_skill_source",
+                summary=self.skill_context.name or "skill",
                 workflow_id="master",
                 producer="master_orchestrator",
                 metadata={
-                    "kind": "master_workflow_source",
-                    "workflow_name": self.workflow_context.name,
+                    "kind": "master_skill_source",
+                    "skill_name": self.skill_context.name,
                 },
             )
             
             # 2. 初始化引擎
-            final_target = target_path or self.target_path or (
-                self.workflow_context.target.path 
-                if self.workflow_context.target and self.workflow_context.target.path 
-                else None
-            )
+            final_target = target_path or self.target_path
             
             if not final_target:
                 raise ValueError("目标路径未指定")
@@ -1360,7 +1353,7 @@ class MasterOrchestrator:
                 engine_type=self.engine_type,
                 target_path=final_target,
                 source_root=self.source_root,
-                workflow_context=self.workflow_context,
+                skill_context=self.skill_context,
                 session_id=self.session_id,
                 verbose=self.verbose,
                 enable_logging=self.enable_logging,
@@ -1373,7 +1366,7 @@ class MasterOrchestrator:
             orchestrator._init_orchestrator_components(emit_log=False)
 
             self._log("启动 Agentic 控制环...")
-            result = await self._run_agentic_cycle(orchestrator, self.workflow_context)
+            result = await self._run_agentic_cycle(orchestrator, self.skill_context)
             if result.execution_time <= 0:
                 result.execution_time = time.time() - start_time
             return result
@@ -1396,35 +1389,7 @@ class MasterOrchestrator:
                 workflow_results=[],
                 errors=errors,
             )
-
-
-async def run_master_workflow(
-    workflow_path: str,
-    llm_client: ChatOpenAI,
-    engine_type: str,
-    target_path: str,
-    source_root: Optional[str] = None,
-    session_id: Optional[str] = None,
-    execution_mode: str = "sequential",
-    verbose: bool = True,
-    enable_logging: bool = True,
-) -> MasterOrchestratorResult:
-    """便捷函数：执行多 Workflow 模式"""
-    master = MasterOrchestrator(
-        llm_client=llm_client,
-        engine_type=engine_type,
-        target_path=target_path,
-        source_root=source_root,
-        session_id=session_id,
-        execution_mode=execution_mode,
-        verbose=verbose,
-        enable_logging=enable_logging,
-    )
-    return await master.execute_workflow(workflow_path, target_path=target_path)
-
-
 __all__ = [
     "MasterOrchestrator",
     "MasterOrchestratorResult",
-    "run_master_workflow",
 ]

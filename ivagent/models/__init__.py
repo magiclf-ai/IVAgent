@@ -5,11 +5,7 @@
 核心数据结构定义
 """
 
-from .constraints import (
-    FunctionContext,
-    Precondition,
-    CallStackFrame,
-)
+from .constraints import FunctionContext, CallStackFrame
 
 from .function import SimpleFunctionSummary
 
@@ -25,14 +21,8 @@ from .callsite import (
     ResolvedCallsite,
 )
 
-from .workflow import (
-    WorkflowContext,
-    TargetInfo,
-    ScopeInfo,
-    StrategyHints,
-    VulnerabilityFocus,
-    WorkflowParser,
-)
+from .skill import ScopeInfo, SkillContext, StrategyHints
+from .skill_parser import SkillParser
 
 from .semantic_analysis import (
     CodeFinding,
@@ -47,7 +37,6 @@ from .task import (
 __all__ = [
     # 约束模型（纯文本格式）
     "FunctionContext",
-    "Precondition",
     "CallStackFrame",
     # 函数模型（精简纯文本格式）
     "SimpleFunctionSummary",
@@ -59,13 +48,11 @@ __all__ = [
     # 调用点模型
     "CallsiteInfo",
     "ResolvedCallsite",
-    # Workflow 模型
-    "WorkflowContext",
-    "TargetInfo",
+    # Skill 模型
+    "SkillContext",
     "ScopeInfo",
     "StrategyHints",
-    "VulnerabilityFocus",
-    "WorkflowParser",
+    "SkillParser",
     # 语义分析模型
     "CodeFinding",
     # 任务管理模型
