@@ -2,14 +2,15 @@
 """
 缓存模块
 
-提供 Redis 缓存实现和分布式锁，支持函数摘要缓存避免冗余计算
+提供 Redis 缓存实现和函数摘要缓存，支持在 Redis 不可用时自动降级到进程内缓存。
 """
 
-from typing import Any, Optional, Union
+from typing import Any, Optional, Dict, Tuple
 from enum import Enum
 import asyncio
 import pickle
 import hashlib
+import time
 
 from .cli_logger import CLILogger
 
@@ -454,6 +455,123 @@ class FunctionSummaryCache:
         # 超时，最后尝试直接计算
         self.log(f"Wait timeout, computing directly: {function_identifier}", "WARNING")
         return await asyncio.wait_for(compute_func(), timeout=compute_timeout)
+
+
+class LocalFunctionSummaryCache:
+    """
+    进程内函数摘要缓存。
+
+    Redis 不可用时作为直接降级路径，避免摘要分析被基础设施问题中断。
+    """
+
+    def __init__(
+        self,
+        namespace: str = "func_summary_local",
+        default_ttl: int = 3600,
+        verbose: bool = False,
+    ):
+        self.namespace = namespace
+        self.default_ttl = default_ttl
+        self.verbose = verbose
+        self._logger = CLILogger(component="LocalSummaryCache", verbose=verbose)
+        self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    def log(self, message: str, level: str = "INFO"):
+        """打印日志（统一日志格式）"""
+        if not self.verbose:
+            return
+        self._logger.log(level=level, event="cache.summary.local", message=message)
+
+    def _generate_cache_key(self, function_identifier: str, context_hash: Optional[str] = None) -> str:
+        """生成缓存键，保持与 Redis 缓存同一规则。"""
+        import re
+
+        clean_sig = re.sub(r'\s+', '_', function_identifier.strip())
+        max_len = 200
+        if len(clean_sig) > max_len:
+            short_hash = hashlib.md5(clean_sig.encode()).hexdigest()[:16]
+            clean_sig = clean_sig[:max_len] + f"_{short_hash}"
+
+        if context_hash:
+            return f"{clean_sig}:{context_hash}"
+        return clean_sig
+
+    def _get_cached(self, cache_key: str) -> Optional[Any]:
+        item = self._cache.get(cache_key)
+        if item is None:
+            return None
+
+        expires_at, value = item
+        if expires_at and expires_at < time.monotonic():
+            self._cache.pop(cache_key, None)
+            return None
+        return value
+
+    def get(self, function_identifier: str, context_hash: Optional[str] = None) -> Optional[Any]:
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
+        return self._get_cached(cache_key)
+
+    def set(
+        self,
+        function_identifier: str,
+        value: Any,
+        context_hash: Optional[str] = None,
+        ttl: Optional[int] = None,
+    ) -> bool:
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
+        expire_seconds = ttl if ttl is not None else self.default_ttl
+        expires_at = time.monotonic() + max(float(expire_seconds), 0.0) if expire_seconds else 0.0
+        self._cache[cache_key] = (expires_at, value)
+        return True
+
+    def refresh_ttl(
+        self,
+        function_identifier: str,
+        context_hash: Optional[str] = None,
+        ttl: Optional[int] = None,
+    ) -> bool:
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
+        value = self._get_cached(cache_key)
+        if value is None:
+            return False
+        return self.set(function_identifier, value, context_hash, ttl)
+
+    async def _get_lock(self, cache_key: str) -> asyncio.Lock:
+        async with self._locks_guard:
+            lock = self._locks.get(cache_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[cache_key] = lock
+            return lock
+
+    async def get_or_compute(
+        self,
+        function_identifier: str,
+        compute_func,
+        context_hash: Optional[str] = None,
+        ttl: Optional[int] = None,
+        compute_timeout: float = 1200.0,
+    ) -> Any:
+        cache_key = self._generate_cache_key(function_identifier, context_hash)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            self.log(f"Local cache hit for {function_identifier}", "DEBUG")
+            self.refresh_ttl(function_identifier, context_hash, ttl)
+            return cached
+
+        lock = await self._get_lock(cache_key)
+        async with lock:
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                self.log(f"Local cache hit after wait for {function_identifier}", "DEBUG")
+                self.refresh_ttl(function_identifier, context_hash, ttl)
+                return cached
+
+            result = await asyncio.wait_for(compute_func(), timeout=compute_timeout)
+            self.set(function_identifier, result, context_hash, ttl)
+            return result
 
 
 def get_cache(

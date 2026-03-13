@@ -15,24 +15,24 @@ FunctionSummaryAgent - 函数摘要提取 Agent（单 Tool Call Loop）
 - 支持降级到纯 JSON 模式
 """
 
-from typing import Dict, List, Optional, Any, Set, Callable
+from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass, field
 import json
 import asyncio
+import time
 import uuid
 
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 
-from .base import BaseAgent
 from . import prompts
 from ..engines.base_static_analysis_engine import BaseStaticAnalysisEngine
 from ..core.tool_llm_client import ToolBasedLLMClient, SimpleJSONLLMClient
-from ..core.cache import get_cache, FunctionSummaryCache
+from ..core.cache import get_cache, FunctionSummaryCache, LocalFunctionSummaryCache
 from ..core.agent_logger import get_agent_log_manager, AgentStatus
 from ..core.cli_logger import CLILogger
 from ..models.function import SimpleFunctionSummary
-from ..models.callsite import CallsiteInfo, ResolvedCallsite
+from ..models.callsite import CallsiteInfo
 
 
 # ============================================================================
@@ -171,7 +171,7 @@ class FunctionSummaryAgent:
     """
 
     # 类级别的共享缓存，所有 Agent 实例共享
-    _shared_cache: Optional[FunctionSummaryCache] = None
+    _shared_cache: Optional[object] = None
     _cache_initialized = False
 
     def __init__(
@@ -188,6 +188,7 @@ class FunctionSummaryAgent:
             parent_id: Optional[str] = None,
             call_stack: Optional[List[str]] = None,
             source_root: Optional[str] = None,
+            deadline: Optional[float] = None,
     ):
         self.engine = engine
         self.llm_client = llm_client
@@ -230,6 +231,9 @@ class FunctionSummaryAgent:
 
         # 初始化共享缓存
         self._init_shared_cache()
+
+        # 时间预算：deadline 为 time.monotonic() 绝对时间戳
+        self.deadline: Optional[float] = deadline
 
     def _get_tool_llm(self) -> ToolBasedLLMClient:
         """获取 Tool Call LLM 客户端（懒加载）"""
@@ -279,19 +283,29 @@ class FunctionSummaryAgent:
             if self.cache_config.get("password"):
                 cache_kwargs["password"] = self.cache_config["password"]
 
-            cache = get_cache(cache_type, namespace=namespace, ttl=ttl, **cache_kwargs)
-            cache.ensure_available()
-
-            FunctionSummaryAgent._shared_cache = FunctionSummaryCache(
-                cache=cache,
-                namespace=namespace,
-                default_ttl=ttl,
-                verbose=self.verbose,
-            )
+            try:
+                cache = get_cache(cache_type, namespace=namespace, ttl=ttl, **cache_kwargs)
+                cache.ensure_available()
+                FunctionSummaryAgent._shared_cache = FunctionSummaryCache(
+                    cache=cache,
+                    namespace=namespace,
+                    default_ttl=ttl,
+                    verbose=self.verbose,
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "summary_agent.cache.fallback_local",
+                    f"Redis 摘要缓存不可用，回退到进程内缓存: {exc}",
+                )
+                FunctionSummaryAgent._shared_cache = LocalFunctionSummaryCache(
+                    namespace=namespace,
+                    default_ttl=ttl,
+                    verbose=self.verbose,
+                )
             FunctionSummaryAgent._cache_initialized = True
      
     @property
-    def cache(self) -> FunctionSummaryCache:
+    def cache(self) -> object:
         """获取共享缓存实例"""
         return FunctionSummaryAgent._shared_cache
 
@@ -300,6 +314,12 @@ class FunctionSummaryAgent:
         if not self.verbose:
             return
         self._logger.log(level=level, event="summary_agent.event", message=message)
+
+    def _remaining_seconds(self) -> float:
+        """返回距离 deadline 的剩余秒数。无 deadline 时返回 inf。"""
+        if self.deadline is None:
+            return float('inf')
+        return max(0.0, self.deadline - time.monotonic())
 
     async def analyze(
             self,
@@ -410,11 +430,27 @@ class FunctionSummaryAgent:
             )
 
             # 单 Tool Call Loop：交互直到 LLM 提交最终结果
-            return await self._tool_call_loop(
-                user_prompt=user_prompt,
-                func_def=func_def,
-                current_depth=current_depth,
-            )
+            # 带超时保护：超时回退到浅层分析
+            remaining = self._remaining_seconds()
+            if remaining != float('inf') and remaining > 0:
+                try:
+                    return await asyncio.wait_for(
+                        self._tool_call_loop(
+                            user_prompt=user_prompt,
+                            func_def=func_def,
+                            current_depth=current_depth,
+                        ),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    self.log(f"Tool call loop timed out for {function_identifier}, falling back to shallow analysis", "WARNING")
+                    return await self._shallow_analysis(function_identifier)
+            else:
+                return await self._tool_call_loop(
+                    user_prompt=user_prompt,
+                    func_def=func_def,
+                    current_depth=current_depth,
+                )
 
         except Exception as e:
             self.log(f"Analysis failed for {function_identifier}: {str(e)}", "ERROR")
@@ -439,6 +475,20 @@ class FunctionSummaryAgent:
 
         for round_num in range(max_rounds):
             self.log(f"Tool Call Loop - Round {round_num + 1}")
+
+            # 时间预算检查：剩余时间不足时提前返回部分摘要
+            remaining = self._remaining_seconds()
+            if remaining < 10:
+                self.log(f"Time budget exhausted ({remaining:.1f}s left), returning partial summary", "WARNING")
+                # 尝试从已有消息中解析部分结果
+                if messages:
+                    for msg in reversed(messages):
+                        if isinstance(msg, AIMessage) and msg.content:
+                            parsed = self._parse_text_summary(msg.content, self._get_function_identifier(func_def))
+                            if parsed.behavior_summary:
+                                return parsed
+                            break
+                return self._create_empty_summary(self._get_function_identifier(func_def))
 
             result = await tool_llm.atool_call(
                 messages=messages,
@@ -522,7 +572,7 @@ class FunctionSummaryAgent:
 
                     # 第二步：获取解析成功的函数摘要
                     fetch_tasks = []
-                    identifier_map: Dict[str, CallsiteInfo] = {}  # function_identifier -> callsite
+                    identifier_map: Dict[str, List[CallsiteInfo]] = {}  # function_identifier -> callsites
 
                     for callsite, resolved in zip(callsites_to_fetch, resolved_identifiers):
                         if isinstance(resolved, Exception):
@@ -536,8 +586,7 @@ class FunctionSummaryAgent:
                                 behavior_summary=f"解析调用点失败: {str(resolved)}",
                             )
                         elif resolved:
-                            identifier_map[resolved] = callsite
-                            fetch_tasks.append(self._get_sub_function_summary(resolved, current_depth))
+                            identifier_map.setdefault(resolved, []).append(callsite)
                         else:
                             # 解析失败，使用函数标识符作为回退
                             temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
@@ -547,22 +596,27 @@ class FunctionSummaryAgent:
                                 behavior_summary=f"无法解析调用点，请检查函数标识符 '{callsite.function_identifier}' 和行号 {callsite.line_number}",
                             )
 
+                    for resolved in identifier_map:
+                        fetch_tasks.append(self._get_sub_function_summary(resolved, current_depth))
+
                     # 并发获取摘要
                     if fetch_tasks:
                         summary_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
                         for (identifier, result) in zip(identifier_map.keys(), summary_results):
-                            callsite = identifier_map[identifier]
-                            temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
-
+                            callsites = identifier_map[identifier]
                             if isinstance(result, Exception):
                                 self.log(f"Failed to get summary for {identifier}: {result}", "WARNING")
-                                sub_summaries[temp_key] = SubFunctionSummary(
-                                    function_identifier=identifier,
-                                    function_name=callsite.function_identifier,
-                                    behavior_summary=f"获取摘要失败: {str(result)}",
-                                )
+                                for callsite in callsites:
+                                    temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
+                                    sub_summaries[temp_key] = SubFunctionSummary(
+                                        function_identifier=identifier,
+                                        function_name=callsite.function_identifier,
+                                        behavior_summary=f"获取摘要失败: {str(result)}",
+                                    )
                             else:
-                                sub_summaries[temp_key] = result
+                                for callsite in callsites:
+                                    temp_key = f"{callsite.function_identifier}:{callsite.line_number}"
+                                    sub_summaries[temp_key] = result
 
                 # 构建 ToolMessage 响应
                 ai_tool_calls = []
@@ -698,6 +752,7 @@ class FunctionSummaryAgent:
                 context_text=self.context_text,
                 parent_id=self.agent_id,
                 call_stack=new_call_stack,
+                deadline=self.deadline,
             )
 
             summary = await sub_agent.analyze(function_identifier=function_identifier)
@@ -730,7 +785,6 @@ class FunctionSummaryAgent:
         尝试多种格式解析，返回函数标识符列表。
         """
         selected = []
-        content_lower = content.lower()
 
         # 尝试提取 ```json 块
         if "```json" in content:

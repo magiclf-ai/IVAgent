@@ -6,19 +6,16 @@ Tool Call 模式 LLM 客户端
 兼容支持 Tool Call 但不支持结构化输出的模型。
 """
 
-from typing import TypeVar, Type, Optional, Any, List, Dict, Callable, Union
+from typing import TypeVar, Optional, Any, List, Dict, Callable
 from pydantic import BaseModel
 import asyncio
 import json
 import time
-from datetime import datetime
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
-from langchain_core.tools import tool, BaseTool
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 
-from .llm_logger import get_log_manager, LLMLogManager, LogStorageType
+from .llm_logger import get_log_manager
 from .cli_logger import CLILogger
 
 T = TypeVar("T", bound=BaseModel)
@@ -107,7 +104,11 @@ class ToolBasedLLMClient:
         """将消息列表转换为字典列表"""
         result = []
         for msg in messages:
-            msg_dict = {"type": type(msg).__name__}
+            role = getattr(msg, "type", None) or type(msg).__name__
+            msg_dict = {
+                "type": type(msg).__name__,
+                "role": role,
+            }
             if hasattr(msg, "content"):
                 msg_dict["content"] = msg.content
             if hasattr(msg, "name") and msg.name:
@@ -175,6 +176,7 @@ class ToolBasedLLMClient:
         tools: List[Callable],
         system_prompt: Optional[str] = None,
         allow_text_response: bool = True,
+        tool_choice: Optional[dict | str | bool] = None,
     ) -> ToolCallResult:
         """
         异步 Tool Call 调用
@@ -232,7 +234,10 @@ class ToolBasedLLMClient:
         for attempt in range(self.max_retries):
             try:
                 # 绑定工具函数
-                llm_with_tools = self.llm.bind_tools(tools)
+                bind_kwargs: Dict[str, Any] = {}
+                if tool_choice is not None:
+                    bind_kwargs["tool_choice"] = tool_choice
+                llm_with_tools = self.llm.bind_tools(tools, **bind_kwargs)
                 
                 # 调用 LLM
                 response = await llm_with_tools.ainvoke(messages)

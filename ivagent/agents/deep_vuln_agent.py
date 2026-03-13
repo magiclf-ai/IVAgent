@@ -21,28 +21,24 @@ DeepVulnAgent - 深度漏洞挖掘 Agent（Tool Call 模式）
 """
 
 from typing import Dict, List, Optional, Any, Set, Tuple
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 import asyncio
 import uuid
-import time
 import json
+import time
 from datetime import datetime
 
 from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
 
 from .base import BaseAgent
-from .program_analyzer import ProgramAnalyzer
 from .function_summary_agent import FunctionSummaryAgent
 from .prompts import (
     get_vuln_agent_system_prompt,
     build_iteration_prompt,
 )
 from ..core.tool_llm_client import ToolBasedLLMClient, SimpleJSONLLMClient
-from ..core.llm_logger import get_log_manager
 from ..core.agent_logger import get_agent_log_manager, AgentStatus
 from ..core.vuln_storage import get_vulnerability_manager
 from ..models import (
@@ -51,10 +47,10 @@ from ..models import (
     DataFlowPath,
     SimpleFunctionSummary,
     FunctionContext,
-    Precondition,
     CallStackFrame,
 )
-from ..models.callsite import CallsiteInfo, ResolvedCallsite
+from ..models.callsite import CallsiteInfo
+from ..models.skill import SkillContext
 
 
 # ============================================================================
@@ -304,18 +300,6 @@ class VulnerabilityResult(BaseModel):
     constraints_satisfied: bool = Field(default=False)
 
 
-class FinalAnalysisOutput(BaseModel):
-    """最终分析输出（简化结构）"""
-    vulnerabilities: List[VulnerabilityResult] = Field(default_factory=list)
-    constraints_extracted: List[str] = Field(default_factory=list, description="纯文本约束列表")
-    taint_sources_identified: List[str] = Field(default_factory=list)
-    summary: str = Field(default="", description="分析总结")
-
-
-# ============================================================================
-# Agent 执行状态
-# ============================================================================
-
 @dataclass
 class AgentExecutionState:
     """Agent 执行状态"""
@@ -392,10 +376,11 @@ class DeepVulnAgent(BaseAgent):
             parent_id: Optional[str] = None,
             call_stack: Optional[List[str]] = None,
             call_stack_detailed: Optional[List[CallStackFrame]] = None,
-            precondition: Optional[Precondition] = None,
+            skill: Optional[SkillContext] = None,
             progress_logger: Optional[Any] = None,
             source_root: Optional[str] = None,
             system_prompt: Optional[str] = None,
+            deadline: Optional[float] = None,
     ):
         """
         初始化 DeepVulnAgent
@@ -410,7 +395,7 @@ class DeepVulnAgent(BaseAgent):
             parent_id: 父 Agent ID
             call_stack: 当前调用栈（简单版本，函数签名列表）
             call_stack_detailed: 详细调用栈，包含调用点信息
-            precondition: 前置条件定义
+            skill: Skill 上下文
             progress_logger: 进度日志回调函数，接收 (message, level) 参数
             source_root: 源码根目录（用于 CallsiteAgent）
             system_prompt: 自定义系统提示词（用于 Orchestrator 动态注入）
@@ -471,17 +456,8 @@ class DeepVulnAgent(BaseAgent):
         # 确保两种调用栈格式同步
         self._sync_call_stack_formats()
 
-        # 前置条件
-        self.precondition = precondition
-
-        # 程序分析器
-        self.program_analyzer = ProgramAnalyzer(
-            engine=engine,
-            llm_client=llm_client,
-            max_iterations=5,
-            verbose=verbose,
-            max_concurrency=max_concurrency,
-        )
+        # Skill 上下文
+        self.skill = skill
 
         # 函数摘要 Agent
         self.summary_agent = FunctionSummaryAgent(
@@ -490,6 +466,7 @@ class DeepVulnAgent(BaseAgent):
             max_depth=2,
             verbose=verbose,
             source_root=self.source_root,
+            deadline=deadline,
         )
 
         # 执行状态
@@ -502,6 +479,7 @@ class DeepVulnAgent(BaseAgent):
 
         # 子 Agent 任务列表（用于等待所有子任务完成）
         self._sub_agent_tasks: List[asyncio.Task] = []
+        self._sub_agent_semaphore = asyncio.Semaphore(max(1, self.max_concurrency))
 
         # 追踪重复请求的函数（用于多轮对话反馈）
         self._duplicate_requests: List[Dict[str, Any]] = []
@@ -511,6 +489,9 @@ class DeepVulnAgent(BaseAgent):
 
         # Agent 日志管理器
         self._agent_logger = get_agent_log_manager()
+
+        # 时间预算：deadline 为 time.monotonic() 绝对时间戳
+        self.deadline: Optional[float] = deadline
 
     def _sync_call_stack_formats(self):
         """同步两种调用栈格式"""
@@ -525,6 +506,44 @@ class DeepVulnAgent(BaseAgent):
             self.call_stack = [
                 frame.function_identifier for frame in self.call_stack_detailed
             ]
+
+    def _remaining_seconds(self) -> float:
+        """返回距离 deadline 的剩余秒数。无 deadline 时返回 inf。"""
+        if self.deadline is None:
+            return float('inf')
+        return max(0.0, self.deadline - time.monotonic())
+
+    async def _wait_for_sub_agents(self) -> None:
+        """等待所有后台子 Agent 完成，并清空任务列表。"""
+        if not self._sub_agent_tasks:
+            return
+        self._log_progress(f"等待 {len(self._sub_agent_tasks)} 个子 Agent 完成...", kind="subagent")
+        tasks = self._sub_agent_tasks
+        self._sub_agent_tasks = []
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._log_progress("所有子 Agent 已完成", kind="subagent")
+
+    def _merge_result_vulnerabilities(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """将后台子 Agent 累积的漏洞合并到当前返回结果。"""
+        merged: List[Vulnerability] = []
+        seen: Set[Tuple[str, str, str, str]] = set()
+
+        for vuln in list(result.get("vulnerabilities", []) or []) + list(self.vulnerabilities):
+            if not vuln:
+                continue
+            key = (
+                str(getattr(getattr(vuln, "type", None), "value", getattr(vuln, "type", ""))),
+                str(getattr(vuln, "name", "")),
+                str(getattr(vuln, "location", "")),
+                str(getattr(vuln, "description", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(vuln)
+
+        result["vulnerabilities"] = merged
+        return result
 
     def _log_progress(self, message: str, level: str = "info", kind: str = "trace", **extra_fields: Any):
         """
@@ -633,8 +652,8 @@ class DeepVulnAgent(BaseAgent):
         self._log_progress(f"开始分析函数: {function_identifier}", kind="lifecycle")
         self._log_progress(f"调用深度: {len(self.call_stack)}/{self.max_depth}", kind="lifecycle")
 
-        if self.precondition:
-            self._log_progress(f"前置条件: {self.precondition.name}", "info", kind="lifecycle")
+        if self.skill:
+            self._log_progress(f"Skill: {self.skill.name}", "info", kind="lifecycle")
 
         analysis_key = self._build_analysis_task_key(function_identifier)
         mode = "fresh"
@@ -680,6 +699,8 @@ class DeepVulnAgent(BaseAgent):
                         shared_future.set_result(result)
                     DeepVulnAgent._inflight_analysis_tasks.pop(analysis_key, None)
 
+            await self._wait_for_sub_agents()
+            result = self._merge_result_vulnerabilities(result)
             await self._update_execution_state(status="completed")
             vuln_count = len(result.get("vulnerabilities", []))
             summary_suffix = (
@@ -715,11 +736,7 @@ class DeepVulnAgent(BaseAgent):
             result = {"vulnerabilities": [], "constraints": [], "error": error_msg}
 
         finally:
-            # 等待所有子 Agent 任务完成
-            if self._sub_agent_tasks:
-                self._log_progress(f"等待 {len(self._sub_agent_tasks)} 个子 Agent 完成...", kind="subagent")
-                await asyncio.gather(*self._sub_agent_tasks, return_exceptions=True)
-                self._log_progress("所有子 Agent 已完成", kind="subagent")
+            await self._wait_for_sub_agents()
 
         return result
 
@@ -758,17 +775,17 @@ class DeepVulnAgent(BaseAgent):
                 call_stack_detailed=self.call_stack_detailed,
                 depth=len(self.call_stack),
                 max_depth=self.max_depth,
-                precondition=self.precondition,
+                skill=self.skill,
             )
-        elif self.precondition and context.precondition is None:
-            context.precondition = self.precondition
+        elif self.skill and context.skill is None:
+            context.skill = self.skill
 
-        # 如果前置条件定义了污点源，添加到上下文
-        if self.precondition and self.precondition.taint_sources:
-            for taint in self.precondition.taint_sources:
+        # 如果 skill 定义了污点源，添加到上下文
+        if self.skill and self.skill.taint_sources:
+            for taint in self.skill.taint_sources:
                 if taint not in context.taint_sources:
                     context.taint_sources.append(taint)
-            self._log_progress(f"从前置条件添加污点源: {context.taint_sources}", kind="summary")
+            self._log_progress(f"从 Skill 添加污点源: {context.taint_sources}", kind="summary")
 
         # 多轮对话状态
         all_vulnerabilities: List[VulnerabilityResult] = []
@@ -802,6 +819,16 @@ class DeepVulnAgent(BaseAgent):
         messages: List[BaseMessage] = [HumanMessage(content=initial_prompt)]
 
         for iteration in range(self.max_iterations):
+
+            # 时间预算检查：剩余时间不足时强制 finalize
+            remaining = self._remaining_seconds()
+            min_remaining_budget = 10 if context.depth >= context.max_depth else 30
+            if remaining < min_remaining_budget:
+                self._log_progress(
+                    f"[时间预算] 剩余 {remaining:.1f}s < {min_remaining_budget}s，强制结束分析，返回已收集的 {len(all_vulnerabilities)} 个漏洞",
+                    "warning", kind="lifecycle",
+                )
+                break
 
             # LLM 分析迭代（多轮对话模式）
             tool_calls_result = await self._llm_analyze_with_messages(
@@ -965,8 +992,13 @@ class DeepVulnAgent(BaseAgent):
 
                     if func_name in requested_summaries:
                         self._log_progress(f"[去重跳过] 函数 {func_name} 的摘要已在之前轮次请求过", kind="trace")
-                        # 记录空结果用于 ToolMessage
-                        summary_results_map[func_name] = (func_name, None)
+                        existing = sub_summaries.get(func_name)
+                        if existing is None:
+                            for key, (rid, s) in summary_results_map.items():
+                                if s and (key == func_name or rid == func_name):
+                                    existing = s
+                                    break
+                        summary_results_map[func_name] = (func_name, existing)
                         continue
 
                     requested_summaries.add(func_name)
@@ -981,9 +1013,13 @@ class DeepVulnAgent(BaseAgent):
                     )
 
                     # 合并到子函数摘要，并构建结果映射
-                    for func_sig, summary in summary_results:
-                        sub_summaries[func_sig] = summary
-                        summary_results_map[func_sig] = (func_sig, summary)
+                    for original_name, resolved_id, summary in summary_results:
+                        if resolved_id:
+                            sub_summaries[resolved_id] = summary
+                            summary_results_map[resolved_id] = (resolved_id, summary)
+                        if original_name:
+                            lookup_id = resolved_id or original_name
+                            summary_results_map[original_name] = (lookup_id, summary)
 
             # 为每个 tool_call 添加 ToolMessage
             for idx, tc in enumerate(ai_tool_calls):
@@ -1228,7 +1264,7 @@ class DeepVulnAgent(BaseAgent):
             calls: List[Dict[str, Any]],
             caller_identifier: Optional[str] = None,
             caller_code: Optional[str] = None,
-    ) -> List[Tuple[str, Optional[SimpleFunctionSummary]]]:
+    ) -> List[Tuple[str, str, Optional[SimpleFunctionSummary]]]:
         """
         并发执行摘要任务并等待结果
         
@@ -1238,22 +1274,66 @@ class DeepVulnAgent(BaseAgent):
             caller_code: 调用者源代码（用于 CallsiteAgent）
             
         Returns:
-            [(函数标识符, 摘要), ...] 的列表
+            [(原始函数名, 解析后的函数标识符, 摘要), ...] 的列表
         """
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
+        # 计算每个摘要的超时时间
+        remaining = self._remaining_seconds()
+        num_calls = max(len(calls), 1)
+        per_summary_timeout = min(remaining * 0.4 / num_calls, 90) if remaining != float('inf') else None
+
         async def _execute_with_semaphore(call_args: Dict[str, Any]):
             async with semaphore:
+                original_name = call_args.get("function_identifier", "unknown")
+                task_log = self._agent_logger.log_task_start(
+                    agent_id=self.agent_id,
+                    task_type="function_summary",
+                    target=original_name,
+                    metadata={
+                        "line_number": call_args.get("line_number"),
+                        "caller_identifier": caller_identifier,
+                    },
+                )
                 # 解析 callsite
                 callsite = CallsiteInfo.from_dict(call_args)
+                original_name = callsite.function_identifier
 
-                # 解析 callsite 为函数标识符
-                callee_identifier = await self._resolve_callsite(callsite, caller_identifier, caller_code)
-                if not callee_identifier:
-                    callee_identifier = callsite.function_identifier
+                try:
+                    # 解析 callsite 为函数标识符
+                    callee_identifier = await self._resolve_callsite(callsite, caller_identifier, caller_code)
+                    if not callee_identifier:
+                        callee_identifier = original_name
 
-                result = await self._get_sub_function_summary(callee_identifier)
-                return callee_identifier, result
+                    # 带超时保护的摘要获取
+                    if per_summary_timeout is not None and per_summary_timeout > 0:
+                        try:
+                            result = await asyncio.wait_for(
+                                self._get_sub_function_summary(callee_identifier),
+                                timeout=per_summary_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            self._log_progress(
+                                f"[摘要超时] {callee_identifier} 超过 {per_summary_timeout:.1f}s，跳过",
+                                "warning", kind="summary",
+                            )
+                            result = None
+                    else:
+                        result = await self._get_sub_function_summary(callee_identifier)
+
+                    self._agent_logger.log_task_end(
+                        task_id=task_log.task_id,
+                        status=AgentStatus.COMPLETED,
+                        result_summary=f"resolved={callee_identifier}, summary={'hit' if result else 'miss'}",
+                    )
+                    return original_name, callee_identifier, result
+                except Exception as exc:
+                    self._agent_logger.log_task_end(
+                        task_id=task_log.task_id,
+                        status=AgentStatus.FAILED,
+                        error_message=str(exc),
+                    )
+                    raise
 
         results = await asyncio.gather(
             *[_execute_with_semaphore(c) for c in calls],
@@ -1265,9 +1345,9 @@ class DeepVulnAgent(BaseAgent):
         for item in results:
             if isinstance(item, Exception):
                 self._log_progress(f"[摘要任务] 执行失败: {item}", "warning", kind="error")
-                processed_results.append(("", None))
+                processed_results.append(("", "", None))
             else:
-                callee_identifier, summary = item
+                original_name, callee_identifier, summary = item
                 if summary:
                     self._log_progress(f"[摘要任务] 获取 {callee_identifier} 成功", kind="trace")
                 else:
@@ -1330,16 +1410,35 @@ class DeepVulnAgent(BaseAgent):
         func_name = callsite_data.get('function_identifier', 'unknown') if callsite_data else 'unknown'
 
         async def _run_sub_agent():
+            task_log = self._agent_logger.log_task_start(
+                agent_id=self.agent_id,
+                task_type="sub_agent",
+                target=func_name,
+                metadata={
+                    "line_number": call_args.get("line_number"),
+                    "caller_function": call_args.get("caller_function"),
+                },
+            )
             try:
+                async with self._sub_agent_semaphore:
+                    result = await self._create_sub_agent(call_args, parent_context, caller_code)
+                    sub_vulns = result.get("vulnerabilities", [])
 
-                result = await self._create_sub_agent(call_args, parent_context, caller_code)
-                sub_vulns = result.get("vulnerabilities", [])
+                    if sub_vulns:
+                        async with self._vuln_lock:
+                            self.vulnerabilities.extend(sub_vulns)
 
-                if sub_vulns:
-                    async with self._vuln_lock:
-                        self.vulnerabilities.extend(sub_vulns)
-
+                    self._agent_logger.log_task_end(
+                        task_id=task_log.task_id,
+                        status=AgentStatus.COMPLETED,
+                        result_summary=f"vulnerabilities={len(sub_vulns)}",
+                    )
             except Exception as e:
+                self._agent_logger.log_task_end(
+                    task_id=task_log.task_id,
+                    status=AgentStatus.FAILED,
+                    error_message=str(e),
+                )
                 self._log_progress(f"[子Agent失败] {func_name} | 错误: {e}", "warning", kind="error")
 
         # 创建后台任务
@@ -1425,8 +1524,8 @@ class DeepVulnAgent(BaseAgent):
         # 构建子函数上下文 - 使用纯文本约束（不再解析约束内容）
         sub_taint_sources = list(parent_context.taint_sources) if parent_context else []
 
-        # 基于调用上下文生成 precondition
-        sub_precondition = self._build_call_context_precondition(
+        # 基于调用上下文生成子 skill
+        sub_skill = self._build_call_context_skill(
             callee_identifier,
             call_args,
             argument_constraints,
@@ -1450,7 +1549,7 @@ class DeepVulnAgent(BaseAgent):
                 parent_context.global_constraints,
                 global_constraints
             ),
-            precondition=sub_precondition,
+            skill=sub_skill,
         )
 
         # 创建子 Agent
@@ -1464,8 +1563,9 @@ class DeepVulnAgent(BaseAgent):
             parent_id=self.agent_id,
             call_stack=sub_context.call_stack,
             call_stack_detailed=current_call_stack_detailed,
-            precondition=sub_precondition,
+            skill=sub_skill,
             progress_logger=self._progress_logger,
+            deadline=self.deadline,
         )
 
         await self._update_execution_state(sub_agents_created=self.execution_state.sub_agents_created + 1)
@@ -1555,25 +1655,46 @@ class DeepVulnAgent(BaseAgent):
             return parent_text
         return f"{parent_text}\n{current_text}"
 
-    def _build_call_context_precondition(
+    def _build_call_context_skill(
             self,
             function_identifier: str,
             call_args: Dict[str, Any],
             argument_constraints: str,
             call_path_str: str,
-    ) -> Optional[Any]:
+    ) -> Optional[SkillContext]:
         """
-        基于调用上下文构建子函数的 precondition 文本（纯文本格式）
+        基于调用上下文构建子函数 Skill 文本。
         """
         if not argument_constraints and not call_args.get('call_code'):
             return None
 
-        return Precondition(
-            name=f"CallContext_{function_identifier}",
-            description=f"基于调用点生成的上下文 - {call_path_str}",
-            target=function_identifier,
-            text_content="",
+        constraint_lines = [
+            "## 调用路径",
+            call_path_str,
+            "",
+        ]
+        call_code = str(call_args.get("call_code") or "").strip()
+        if call_code:
+            constraint_lines.extend([
+                "## 调用语句",
+                f"```c",
+                call_code,
+                "```",
+                "",
+            ])
+        if argument_constraints:
+            constraint_lines.extend([
+                "## 入参约束",
+                argument_constraints.strip(),
+                "",
+            ])
+
+        return SkillContext(
+            name=f"sub_analysis_{function_identifier}",
+            description=f"Sub-analysis context for {function_identifier}",
+            target_type="generic",
             taint_sources=[],
+            raw_markdown="\n".join(constraint_lines).strip(),
         )
 
     def _filter_duplicate_function_summary_calls(
@@ -1611,9 +1732,6 @@ class DeepVulnAgent(BaseAgent):
                 # 尝试解析函数标识符
                 func_identifier = callsite_data.get('function_identifier', '')
                 line_number = callsite_data.get('line_number', 0)
-
-                # 构建去重键
-                dedup_key = f"{func_identifier}:{line_number}"
 
                 # 检查是否已经存在该函数的摘要
                 if func_identifier in sub_summaries:
@@ -1656,9 +1774,12 @@ class DeepVulnAgent(BaseAgent):
             # 映射漏洞类型
             vuln_type = VulnerabilityType.UNKNOWN
             try:
-                vuln_type = VulnerabilityType(result.type)
-            except ValueError:
-                pass
+                vuln_type = VulnerabilityType[result.type]
+            except (KeyError, ValueError):
+                try:
+                    vuln_type = VulnerabilityType(result.type)
+                except ValueError:
+                    pass
 
             # 映射危害等级到 severity
             severity_map = {"LOW": 0.3, "MEDIUM": 0.6, "HIGH": 0.9}
@@ -1897,9 +2018,12 @@ class DeepVulnAgent(BaseAgent):
             # 映射漏洞类型
             vuln_type = VulnerabilityType.UNKNOWN
             try:
-                vuln_type = VulnerabilityType(result.type)
-            except ValueError:
-                pass
+                vuln_type = VulnerabilityType[result.type]
+            except (KeyError, ValueError):
+                try:
+                    vuln_type = VulnerabilityType(result.type)
+                except ValueError:
+                    pass
 
             # 映射危害等级到 severity
             severity_map = {"LOW": 0.3, "MEDIUM": 0.6, "HIGH": 0.9}
