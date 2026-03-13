@@ -21,5 +21,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
-plans/
+# Local planning docs
+/plans/
+/plans/**
 output/
