@@ -16,15 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from core.llm_logger import get_log_manager, LLMLogEntry
-from core.agent_logger import get_agent_log_manager
-from core.vuln_storage import get_vulnerability_manager
-from core.cli_logger import CLILogger
-from core.db_profiles import get_db_paths
-from api_redis import redis_router
+from ivagent.core.agent_logger import AgentLogManager, get_agent_log_manager
+from ivagent.core.cli_logger import CLILogger
+from ivagent.core.db_profiles import DBPaths, ENV_KEY, get_db_paths
+from ivagent.core.llm_logger import LLMLogManager, LLMLogEntry, get_log_manager
+from ivagent.core.vuln_storage import VulnerabilityManager, get_vulnerability_manager
+from ivagent.web.api_redis import redis_router
 
 
 # API 模型
@@ -98,12 +95,29 @@ app = FastAPI(
 app.include_router(redis_router)
 WEB_DEBUG = os.environ.get("IVAGENT_WEB_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 web_logger = CLILogger(component="web.api", verbose=WEB_DEBUG)
+_runtime_profile: Optional[str] = None
+_db_paths: Optional[DBPaths] = None
 
-# 根据 profile 初始化数据库单例
-_db_paths = get_db_paths()
-get_log_manager(storage_path=_db_paths.llm_log_db)
-get_agent_log_manager(db_path=_db_paths.agent_log_db)
-get_vulnerability_manager(db_path=_db_paths.vuln_db)
+
+def initialize_runtime(profile: Optional[str] = None, *, force: bool = False) -> DBPaths:
+    """按 profile 绑定 Web 进程使用的数据库。"""
+
+    global _runtime_profile, _db_paths
+
+    selected_profile = (profile or os.environ.get(ENV_KEY) or "").strip().lower() or None
+    if not force and _db_paths is not None and _runtime_profile == selected_profile:
+        return _db_paths
+
+    db_paths = get_db_paths(selected_profile)
+    LLMLogManager._instance = None
+    AgentLogManager._instance = None
+    VulnerabilityManager._instance = None
+    get_log_manager(storage_path=db_paths.llm_log_db)
+    get_agent_log_manager(db_path=db_paths.agent_log_db)
+    get_vulnerability_manager(db_path=db_paths.vuln_db)
+    _runtime_profile = selected_profile
+    _db_paths = db_paths
+    return db_paths
 
 # WebSocket 连接管理器
 class ConnectionManager:
@@ -133,10 +147,12 @@ manager = ConnectionManager()
 
 # 获取日志管理器
 def get_logger():
+    initialize_runtime()
     return get_log_manager()
 
 # 获取 Agent 日志管理器
 def get_agent_logger():
+    initialize_runtime()
     return get_agent_log_manager()
 
 
@@ -144,15 +160,19 @@ def get_agent_logger():
 @app.on_event("startup")
 async def startup_event():
     """应用启动时打印数据库路径信息"""
+    db_paths = initialize_runtime(force=True)
     logger = get_logger()
     agent_logger = get_agent_logger()
     llm_db = getattr(logger.storage, 'db_path', 'N/A (Memory Storage)')
     agent_db = getattr(agent_logger.storage, 'db_path', 'N/A (Memory Storage)')
+    vuln_db = db_paths.vuln_db if db_paths else "N/A"
     web_logger.info("startup.llm_db", "LLM 日志数据库路径", db_path=llm_db)
     web_logger.info("startup.agent_db", "Agent 日志数据库路径", db_path=agent_db)
+    web_logger.info("startup.vuln_db", "漏洞数据库路径", db_path=vuln_db)
 
 # 获取漏洞管理器
 def get_vuln_manager():
+    initialize_runtime()
     return get_vulnerability_manager()
 
 
@@ -161,7 +181,17 @@ def get_vuln_manager():
 @app.get("/api/health")
 async def health_check():
     """健康检查"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "service": "ivagent_web",
+        "profile": (_runtime_profile or os.environ.get(ENV_KEY) or "").strip().lower(),
+        "db_paths": {
+            "llm": str(_db_paths.llm_log_db) if _db_paths else "",
+            "agent": str(_db_paths.agent_log_db) if _db_paths else "",
+            "vuln": str(_db_paths.vuln_db) if _db_paths else "",
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
 
 
 @app.get("/api/logs", response_model=List[LogEntryResponse])
@@ -1248,10 +1278,19 @@ async def get_redis_page():
 
 
 # 启动函数
-def start_server(host: str = "0.0.0.0", port: int = 8080, reload: bool = False):
-    """启动 API 服务器"""
+def start_server(
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    reload: bool = False,
+    profile: Optional[str] = None,
+):
+    """启动 API 服务器。"""
     import uvicorn
-    uvicorn.run("api:app", host=host, port=port, reload=reload)
+
+    if profile:
+        os.environ[ENV_KEY] = profile
+    initialize_runtime(profile, force=True)
+    uvicorn.run("ivagent.web.api:app", host=host, port=port, reload=reload)
 
 
 if __name__ == "__main__":

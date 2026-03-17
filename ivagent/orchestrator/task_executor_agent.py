@@ -18,6 +18,7 @@ from ..core.tool_llm_client import ToolBasedLLMClient
 from ..core.cli_logger import CLILogger
 from ..core.context import MessageManager, ContextAssembler, ContextCompressor, ArtifactStore, ReadArtifactPruner
 from ..core.agent_logger import get_agent_log_manager, AgentStatus
+from ..models.skill import SkillContext
 from .tools import OrchestratorTools
 from .task_list_manager import TaskListManager
 from .agent_delegate import AgentDelegate
@@ -56,6 +57,7 @@ class TaskExecutorAgent:
         llm_client: ChatOpenAI,
         engine: BaseStaticAnalysisEngine,
         session_dir: Path,
+        skill_context: Optional[SkillContext] = None,
         source_root: Optional[str] = None,
         verbose: bool = True,
         enable_logging: bool = True,
@@ -82,6 +84,7 @@ class TaskExecutorAgent:
         self.llm_client = llm_client
         self.engine = engine
         self.session_dir = session_dir
+        self.skill_context = skill_context
         self.source_root = source_root
         self.verbose = verbose
         self.enable_logging = enable_logging
@@ -188,13 +191,14 @@ class TaskExecutorAgent:
             engine=self.engine,
             llm_client=self.llm_client,
             artifact_store=self.artifact_store,
+            skill_context=self.skill_context,
             verbose=self.verbose,
         )
 
         # 8. 工具管理器
         self.tools_manager = OrchestratorTools(
             llm_client=self.llm_client,
-            skill_context=None,
+            skill_context=self.skill_context,
             engine_type=None,
             target_path=None,
             source_root=self.source_root,

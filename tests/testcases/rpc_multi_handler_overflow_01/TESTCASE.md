@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: rpc_dispatch
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: heap_overflow, rpc, nested_tlv, multi_handler, partial_validation, cross_function
 
 ## Description
@@ -17,10 +17,6 @@ Key complexity:
 - `parse_tlv` provides correct buffer-boundary validation, creating false confidence
 - Two independent bugs in `parse_nested_config`: array overflow (count) and buffer overflow (value length)
 - The QUERY handler correctly checks `length >= MAX_NAME_LEN`, but the CONFIG handler doesn't replicate this pattern
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

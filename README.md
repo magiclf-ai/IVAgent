@@ -22,7 +22,7 @@ IVAgent/
 ├── tests/eval/               # 测评框架
 ├── tests/testcases/          # 测试用例
 ├── ivagent_cli.py            # 主 CLI
-├── launch_web.py             # Web UI 启动入口
+├── ivagent/web/              # 内建 Web 监控与可视化
 └── plans/                    # 方案文档
 ```
 
@@ -145,16 +145,12 @@ ABC 示例：
 
 ## Web 使用方式
 
-启动 Web：
+`ivagent_cli.py` 和 `tests/eval` 在进入编排执行前会自动确保 Web 服务已启动。
 
-```bash
-.venv/bin/python launch_web.py
-```
-
-默认访问：
+默认访问地址：
 
 ```text
-http://localhost:8080
+http://127.0.0.1:8080
 ```
 
 Web 界面可用于查看：
@@ -163,6 +159,12 @@ Web 界面可用于查看：
 - Agent 执行树
 - 漏洞列表
 - 运行状态
+
+如需单独调试 Web 服务，可直接运行内部入口：
+
+```bash
+.venv/bin/python -m ivagent.web.server --profile production
+```
 
 ## 测试与评估
 

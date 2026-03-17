@@ -32,6 +32,11 @@ tags: [test, eval, regression, validation]
 
 CLI 入口：`tests/eval/cli.py`
 
+说明：
+- `run` / `run-one` 在进入编排执行前会自动确保 Web 监控页已启动
+- `tests/eval` 会为每个 testcase run 创建独立的 sqlite 数据库文件，保存在对应输出目录
+- 实际漏洞挖掘统一通过 `ivagent_cli.py` 执行；testcase 自带 `SKILL.md` 作为系统测试 workflow
+
 支持的子命令：
 - `list` - 列出所有测试用例
 - `run` - 运行测试用例

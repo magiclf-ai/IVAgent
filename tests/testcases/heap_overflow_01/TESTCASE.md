@@ -2,18 +2,14 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: parse_packet
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: buffer_overflow, memcpy, simple, heap
 
 ## Description
 
 This testcase demonstrates a classic heap buffer overflow caused by an unchecked `memcpy`. The vulnerability is simple and should be directly detectable from the entry function.
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

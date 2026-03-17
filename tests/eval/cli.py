@@ -24,6 +24,19 @@ def _emit_json_error(msg: str) -> None:
     _emit_json({"error": msg})
 
 
+async def _ensure_runtime_web_server(*, announce: bool) -> None:
+    """确保共享运行态数据库对应的 Web 监控页面可用。"""
+
+    from ivagent.core.db_profiles import PROFILE_PRODUCTION, activate_db_profile
+    from ivagent.web.runtime import ensure_web_server
+
+    activate_db_profile(PROFILE_PRODUCTION, clear_path_overrides=True)
+    handle = await ensure_web_server(profile=PROFILE_PRODUCTION)
+    if announce:
+        status = "复用" if handle.reused else "启动"
+        print(f"[runtime-web] {status}: {handle.url}", file=sys.stderr)
+
+
 def create_llm() -> object:
     """Create the LLM client used by evaluator/analyzer."""
 
@@ -52,7 +65,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     testcases = discover_testcases(Path(args.testcases_dir))
 
     if args.engine:
-        testcases = [tc for tc in testcases if tc.engine == args.engine]
+        testcases = [tc for tc in testcases if tc.analysis_engine == args.engine]
     if args.tags:
         required = {t.strip() for t in args.tags.split(",")}
         testcases = [tc for tc in testcases if required & set(tc.tags)]
@@ -63,8 +76,9 @@ def cmd_list(args: argparse.Namespace) -> int:
             "testcases": [
                 {
                     "name": tc.name,
-                    "engine": tc.engine,
-                    "skill": tc.skill,
+                    "engine": tc.analysis_engine,
+                    "input_engine": tc.input_engine,
+                    "task_path": str(tc.task_path),
                     "entry_functions": tc.entry_functions,
                     "tags": tc.tags,
                     "timeout": tc.timeout,
@@ -80,8 +94,10 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     print(f"Found {len(testcases)} test cases:\n")
     for testcase in testcases:
-        print(f"  {testcase.name} ({testcase.engine})")
-        print(f"    Entry functions: {', '.join(testcase.entry_functions)}")
+        print(f"  {testcase.name} ({testcase.analysis_engine})")
+        print(f"    Input Engine: {testcase.input_engine}")
+        print(f"    Entry Functions: {', '.join(testcase.entry_functions) or '(none)'}")
+        print(f"    Task: {testcase.task_path}")
         print(f"    Tags: {', '.join(testcase.tags)}")
         print()
     return 0
@@ -97,10 +113,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
         ) from exc
 
     testcases_dir = Path(args.testcases_dir)
+    await _ensure_runtime_web_server(announce=True)
     if args.all:
         testcases = discover_testcases(testcases_dir)
         if args.engine:
-            testcases = [item for item in testcases if item.engine == args.engine]
+            testcases = [item for item in testcases if item.analysis_engine == args.engine]
         if not testcases:
             print("No matching test cases found.")
             return 1
@@ -110,12 +127,13 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             output_base_dir=args.output_dir,
             engine_filter=args.engine,
             parallelism=args.parallel,
+            timeout_override=args.timeout_seconds,
             testcases_dir=testcases_dir,
         )
         output_dir = args.output_dir or (results[0].output_dir and str(Path(results[0].output_dir).parent))
         if output_dir:
             write_run_index(results, output_dir)
-        return 0
+        return 1 if any(not item.success for item in results) else 0
 
     if args.testcase:
         testcase_dir = testcases_dir / args.testcase
@@ -124,7 +142,11 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             return 1
 
         testcase = load_testcase(testcase_dir)
-        result = await run_testcase(testcase, output_base_dir=args.output_dir)
+        result = await run_testcase(
+            testcase,
+            output_base_dir=args.output_dir,
+            timeout_override=args.timeout_seconds,
+        )
         if result.success:
             print(
                 f"success: {len(result.vulnerabilities)} vulnerabilities "
@@ -132,7 +154,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             )
         else:
             print(f"failed: {result.error}")
-        return 0
+        return 0 if result.success else 1
 
     print("Must specify --all or --testcase")
     return 1
@@ -262,6 +284,8 @@ async def cmd_run_one_async(args: argparse.Namespace) -> int:
         _emit_json_error(f"Missing runtime dependencies: {exc}")
         return 1
 
+    await _ensure_runtime_web_server(announce=False)
+
     testcases_dir = Path(args.testcases_dir)
     testcase_dir = testcases_dir / args.testcase
     if not testcase_dir.exists():
@@ -274,7 +298,11 @@ async def cmd_run_one_async(args: argparse.Namespace) -> int:
         _emit_json_error(f"Failed to load testcase: {exc}")
         return 1
 
-    result = await run_testcase(testcase, output_base_dir=args.output_dir)
+    result = await run_testcase(
+        testcase,
+        output_base_dir=args.output_dir,
+        timeout_override=args.timeout_seconds,
+    )
 
     output = {
         "testcase_name": result.testcase_name,
@@ -287,6 +315,7 @@ async def cmd_run_one_async(args: argparse.Namespace) -> int:
         "llm_log_db": result.llm_log_db,
         "agent_log_db": result.agent_log_db,
         "vuln_db": result.vuln_db,
+        "fatal_llm_errors": result.fatal_llm_errors,
         "artifacts": {},
     }
     out_path = Path(result.output_dir)
@@ -310,13 +339,13 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Query eval DB statistics and emit JSON."""
-    from ivagent.core.db_profiles import get_db_paths, PROFILE_EVAL
+    """Query shared runtime DB statistics and emit JSON."""
+    from ivagent.core.db_profiles import PROFILE_PRODUCTION, activate_db_profile
     from ivagent.core.llm_logger import SQLiteLogStorage
     from ivagent.core.agent_logger import AgentLogStorage
     from ivagent.core.vuln_storage import VulnerabilityStorage
 
-    eval_paths = get_db_paths(PROFILE_EVAL)
+    eval_paths = activate_db_profile(PROFILE_PRODUCTION, clear_path_overrides=True)
 
     llm_stats = {"total_calls": 0, "success_calls": 0, "failed_calls": 0}
     if eval_paths.llm_log_db.exists():
@@ -357,7 +386,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             pass
 
     _emit_json({
-        "profile": "eval",
+        "profile": "production",
         "llm_logs": llm_stats,
         "agents": agent_stats,
         "vulnerabilities": vuln_stats,
@@ -366,11 +395,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    """Delete eval DB files and reset singletons."""
-    from ivagent.core.db_profiles import get_db_paths, PROFILE_EVAL
+    """Delete shared runtime DB files and reset singletons."""
+    from ivagent.core.db_profiles import PROFILE_PRODUCTION, activate_db_profile
     from tests.eval.test_runner import reset_singletons
 
-    eval_paths = get_db_paths(PROFILE_EVAL)
+    eval_paths = activate_db_profile(PROFILE_PRODUCTION, clear_path_overrides=True)
     deleted = []
     for db_path in (eval_paths.llm_log_db, eval_paths.agent_log_db, eval_paths.vuln_db):
         if db_path.exists():
@@ -410,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--engine", choices=["source", "ida", "jeb", "abc"])
     run_parser.add_argument("--output-dir", help="Directory to store outputs")
     run_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        help="Override testcase timeout in seconds",
+    )
+    run_parser.add_argument(
         "--parallel",
         type=int,
         default=1,
@@ -439,11 +473,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_one_parser = subparsers.add_parser("run-one", help="Run a single testcase (JSON output)")
     run_one_parser.add_argument("testcase", help="Testcase name")
     run_one_parser.add_argument("--output-dir", help="Output directory")
+    run_one_parser.add_argument("--timeout-seconds", type=int, help="Override testcase timeout in seconds")
     run_one_parser.add_argument("--json-output", help="Optional JSON file path for machine-readable result output")
 
-    subparsers.add_parser("status", help="Query eval DB statistics (JSON output)")
+    subparsers.add_parser("status", help="Query shared runtime DB statistics (JSON output)")
 
-    subparsers.add_parser("reset", help="Clear eval DB and reset state (JSON output)")
+    subparsers.add_parser("reset", help="Clear shared runtime DB and reset state (JSON output)")
 
     return parser
 

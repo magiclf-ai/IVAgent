@@ -17,14 +17,14 @@ def _response_to_text(response: object) -> str:
     return str(content)
 
 
-def llm_evaluate_testcase(testcase_md: str, results_md: str, llm: object) -> str:
+def llm_evaluate_testcase(ground_truth_md: str, results_md: str, llm: object) -> str:
     """Ask the LLM to evaluate one testcase."""
 
     prompt = f"""You are evaluating an automated vulnerability detection system.
 
-# Test Case
+# Ground Truth
 
-{testcase_md}
+{ground_truth_md}
 
 # Detection Results
 
@@ -32,7 +32,7 @@ def llm_evaluate_testcase(testcase_md: str, results_md: str, llm: object) -> str
 
 # Task
 
-Compare the detection results against the expected vulnerabilities in the testcase.
+Compare the detection results against the expected vulnerabilities in the ground truth.
 Use semantic matching, not exact string matching.
 You MUST write the entire report in Simplified Chinese.
 Return a Chinese markdown report only.
@@ -111,7 +111,7 @@ def llm_evaluate_all(
             results_md = result.results_markdown or format_detection_results_as_markdown(
                 {"vulnerabilities": result.vulnerabilities}
             )
-            report = llm_evaluate_testcase(testcase.content, results_md, llm)
+            report = llm_evaluate_testcase(testcase.ground_truth_markdown, results_md, llm)
 
         individual_reports.append({"testcase_name": testcase.name, "report": report})
 

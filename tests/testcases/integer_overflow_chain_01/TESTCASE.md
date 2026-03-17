@@ -2,18 +2,14 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: allocate_and_copy
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: integer_overflow, buffer_overflow, chain, complex
 
 ## Description
 
 This testcase models a vulnerability chain. An integer overflow in size calculation causes a later heap buffer overflow during `memcpy`.
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

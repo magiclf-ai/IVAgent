@@ -74,6 +74,7 @@ class SkillContext:
 
     taint_sources: List[str] = field(default_factory=list)
     dangerous_apis: List[str] = field(default_factory=list)
+    background_knowledge_files: List[str] = field(default_factory=list)
 
     raw_markdown: str = ""
     vulnerability_focus: str = ""
@@ -93,6 +94,7 @@ class SkillContext:
             "strategy_hints": self.strategy_hints.to_dict(),
             "vulnerability_focus": self.vulnerability_focus,
             "background_knowledge": self.background_knowledge,
+            "background_knowledge_files": self.background_knowledge_files,
             "taint_sources": self.taint_sources,
             "dangerous_apis": self.dangerous_apis,
             "tags": self.tags,
@@ -101,27 +103,10 @@ class SkillContext:
             result["scope"] = self.scope.to_dict()
         return result
 
-    def get_full_context_text(self, target_path: Optional[str] = None) -> str:
-        """
-        获取完整上下文文本，用于注入 LLM Prompt。
-        """
+    def _build_guidance_sections(self) -> List[str]:
+        """构建供 LLM 消费的分析指导文本片段。"""
 
-        lines = [
-            f"## Skill: {self.name}",
-            "",
-            "### 描述",
-            f"{self.description}",
-            "",
-        ]
-
-        if target_path:
-            lines.extend(
-                [
-                    "### 目标程序",
-                    f"- 路径: {target_path}",
-                    "",
-                ]
-            )
+        lines: List[str] = []
 
         if self.scope:
             lines.extend(
@@ -166,11 +151,63 @@ class SkillContext:
         if self.raw_markdown:
             lines.append(self.raw_markdown)
 
-        return "\n".join(lines)
+        return lines
+
+    def get_full_context_text(self, target_path: Optional[str] = None) -> str:
+        """
+        获取完整上下文文本，用于注入 LLM Prompt。
+        """
+
+        lines = [
+            f"## Skill: {self.name}",
+            "",
+            "### 描述",
+            f"{self.description}",
+            "",
+        ]
+
+        if target_path:
+            lines.extend(
+                [
+                    "### 目标程序",
+                    f"- 路径: {target_path}",
+                    "",
+                ]
+            )
+
+        lines.extend(self._build_guidance_sections())
+
+        return "\n".join(lines).strip()
 
     def get_precondition_text(self) -> Optional[str]:
         """
         获取供 DeepVulnAgent 使用的文本化约束内容。
         """
 
-        return self.raw_markdown if self.raw_markdown else None
+        text = "\n".join(self._build_guidance_sections()).strip()
+        return text or None
+
+    def build_runtime_skill(self, analysis_context: Optional[str] = None) -> Optional["SkillContext"]:
+        """
+        构建运行时漏洞分析 Skill，将 analysis_context 与 Skill 前置知识统一合并。
+        """
+
+        merged_blocks: List[str] = []
+        context_text = (analysis_context or "").strip()
+        precondition_text = (self.get_precondition_text() or "").strip()
+
+        if context_text:
+            merged_blocks.append(context_text)
+        if precondition_text and precondition_text != context_text:
+            merged_blocks.append(precondition_text)
+
+        merged_text = "\n\n".join(block for block in merged_blocks if block).strip()
+        if not merged_text:
+            return None
+
+        return SkillContext(
+            name="analysis_context",
+            description="analysis context",
+            target_type="vuln_analysis",
+            raw_markdown=merged_text,
+        )

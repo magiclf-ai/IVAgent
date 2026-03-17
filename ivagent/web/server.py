@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
-"""
-LLM 日志可视化服务器启动脚本
-
-Usage:
-    python server.py                        # 默认 production profile
-    python server.py --profile eval         # 查看测试/评估日志
-    python server.py --port 8080            # 指定端口
-    python server.py --host 0.0.0.0         # 指定主机
-    python server.py --reload               # 开发模式（自动重载）
-"""
+"""LLM 日志可视化服务器内部入口。"""
 
 import argparse
 import os
-import sys
-from pathlib import Path
+from typing import Sequence
 
-# 添加父目录到路径
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from core.cli_logger import CLILogger
-from core.db_profiles import get_db_paths, ENV_KEY, PROFILE_PRODUCTION
+from ivagent.core.cli_logger import CLILogger
+from ivagent.core.db_profiles import ENV_KEY, PROFILE_PRODUCTION, activate_db_profile
 
 
-def main():
-    logger = CLILogger(component="web.server", verbose=True)
+def build_parser() -> argparse.ArgumentParser:
+    """构建 Web 服务器命令行参数。"""
+
     parser = argparse.ArgumentParser(description='LLM 交互日志可视化服务器')
     parser.add_argument('--host', default='0.0.0.0', help='服务器主机地址 (默认: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8080, help='服务器端口 (默认: 8080)')
@@ -33,12 +21,18 @@ def main():
         choices=['production', 'eval'],
         help='数据库 profile (默认: production)',
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """启动 Web 服务。"""
+
+    logger = CLILogger(component="web.server", verbose=True)
+    args = build_parser().parse_args(argv)
 
     # 通过环境变量传递给 uvicorn worker 进程
     os.environ[ENV_KEY] = args.profile
-    db_paths = get_db_paths(args.profile)
+    db_paths = activate_db_profile(args.profile, clear_path_overrides=True)
 
     logger.info("startup.banner", "LLM 交互日志可视化系统")
     logger.info("startup.profile", "数据库 profile", profile=args.profile)
@@ -47,9 +41,11 @@ def main():
     logger.info("startup.vuln_db", "漏洞库", db_path=db_paths.vuln_db)
     logger.info("startup.addr", "服务地址", url=f"http://{args.host}:{args.port}")
 
-    from web.api import start_server
-    start_server(host=args.host, port=args.port, reload=args.reload)
+    from ivagent.web.api import start_server
+
+    start_server(host=args.host, port=args.port, reload=args.reload, profile=args.profile)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

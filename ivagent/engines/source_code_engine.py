@@ -702,13 +702,9 @@ Guidelines:
             Report all function calls found within the target function.
             
             Args:
-                calls: List of call dicts, each containing:
-                    - callee_name: Name of the called function
-                    - file_path: Relative path to the callee definition file (optional)
-                    - start_line: Start line of the callee definition (optional)
-                    - line_number: Line number where the call occurs
-                    - context: The actual code line containing the call
-                    - arguments: List of argument strings (optional)
+                calls: List of call dictionaries. Each item may include
+                    callee_name, file_path, start_line, line_number,
+                    context, and arguments.
             """
             pass
 
@@ -771,13 +767,9 @@ Guidelines:
             Report all functions that call the target function.
             
             Args:
-                callers: List of caller dicts, each containing:
-                    - caller_name: Name of the calling function
-                    - caller_identifier: Full identifier of caller (optional)
-                    - file_path: Path to the file
-                    - start_line: Start line of caller definition (optional)
-                    - line_number: Line number of the call
-                    - context: The actual code line containing the call
+                callers: List of caller dictionaries. Each item may include
+                    caller_name, caller_identifier, file_path, start_line,
+                    line_number, and context.
             """
             pass
 
@@ -841,11 +833,8 @@ If you can identify the caller definition, include its file_path relative to sou
             Report all references to the target symbol.
             
             Args:
-                references: List of reference dicts, each containing:
-                    - file_path: Path to the file
-                    - line: Line number
-                    - content: The line content
-                    - type: Type of reference (definition|call|reference|comment)
+                references: List of reference dictionaries. Each item may
+                    include file_path, line, content, and type.
             """
             pass
 
@@ -898,10 +887,8 @@ Reference types:
             Report all constraints for the target variable.
             
             Args:
-                constraints: List of constraint dicts, each containing:
-                    - line_number: Line where constraint appears
-                    - constraint: Description of the constraint
-                    - type: Type of constraint (null_check|range_check|type_check|other)
+                constraints: List of constraint dictionaries. Each item may
+                    include line_number, constraint, and type.
             """
             pass
 
@@ -1030,12 +1017,9 @@ Rules:
             """
             Report matching symbols.
 
-            Args:
-                symbols: List of symbol dicts, each containing:
-                    - name: Symbol name
-                    - symbol_type: Type of symbol (function, class, global_var, etc.)
-                    - file_path: Path to file
-                    - line: Line number
+            Parameters:
+                symbols: List of symbol dictionaries. Each item should contain
+                    the keys `name`, `symbol_type`, `file_path`, and `line`.
             """
             pass
 

@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: parse_tft_ie
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: heap_overflow, multi_level_parsing, tlv, baseband, partial_validation, cross_function
 
 ## Description
@@ -16,10 +16,6 @@ Key complexity:
 - Two-pass parsing in `parse_packet_filter`: first pass validates byte budget, second pass stores pointers
 - The byte-budget validation in pass 1 succeeds, masking the array overflow in pass 2
 - Attacker controls component count indirectly through packet filter length field
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

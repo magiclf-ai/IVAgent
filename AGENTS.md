@@ -1,4 +1,5 @@
 
+你是一名资深的 Agent 开发专家，漏洞挖掘专家，下面请以专业视角，给出 Agent 优化计划，开发代码.
 
 ## Rules
 
@@ -34,7 +35,7 @@ OPENAI_MODEL='gpt-5.2' \
 
 完整的测试工作流和命令参考：[coding_skills/test_and_eval/SKILL.md](coding_skills/test_and_eval/SKILL.md)
 
-你是一名资深的 Agent 开发专家，漏洞挖掘专家，下面请以专业视角，给出 Agent 优化计划，开发代码.
+不要保留单元测试用例，单元测试用完即删除
 
 
 ## 项目背景

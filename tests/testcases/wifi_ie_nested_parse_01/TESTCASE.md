@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: process_mgmt_frame
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: heap_overflow, nested_parsing, wifi, partial_validation, cross_function, array_overflow
 
 ## Description
@@ -16,10 +16,6 @@ Key complexity:
 - Partial validation: PMKID path is fully validated (count <= MAX_PMKIDS), cipher path is not
 - Outer IE length check passes, sub-element byte budget check passes, only array bounds check is missing
 - The vulnerability requires understanding that `parse_pmkid_list` is safe but `parse_cipher_suites` is not
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

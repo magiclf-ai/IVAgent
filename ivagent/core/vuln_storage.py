@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass
 
+from .run_context import merge_run_metadata
+
 
 class VulnerabilitySeverity(str, Enum):
     """漏洞危害等级"""
@@ -176,9 +178,20 @@ class VulnerabilityStorage:
     def _get_conn(self) -> sqlite3.Connection:
         """获取线程本地连接"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._local.conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=30.0,
+            )
             self._local.conn.row_factory = sqlite3.Row
+            self._configure_conn(self._local.conn)
         return self._local.conn
+
+    def _configure_conn(self, conn: sqlite3.Connection) -> None:
+        """统一配置 sqlite 并发参数。"""
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
     
     def _init_db(self):
         """初始化数据库表"""
@@ -650,6 +663,7 @@ class VulnerabilityManager:
             function_identifier=function_identifier,
             location=location,
             agent_id=agent_id,
+            metadata=json.dumps(merge_run_metadata(kwargs.pop("metadata", None)), ensure_ascii=False),
             **kwargs
         )
         self.storage.save_vulnerability(vuln)
@@ -708,6 +722,7 @@ class VulnerabilityManager:
                 data_flow_intermediate = "[]"
                 data_flow_path = None
             
+            merged_metadata = merge_run_metadata(vuln_dict.get('metadata', {}))
             record = VulnerabilityRecord(
                 vuln_id=str(uuid.uuid4()),
                 name=vuln_dict.get('name', 'Unknown'),
@@ -728,9 +743,9 @@ class VulnerabilityManager:
                 code_snippet=vuln_dict.get('code_snippet'),
                 agent_id=agent_id,
                 parent_agent_id=parent_agent_id,
-                call_stack=json.dumps(vuln_dict.get('metadata', {}).get('call_stack', [])),
+                call_stack=json.dumps(merged_metadata.get('call_stack', [])),
                 tags=json.dumps(vuln_dict.get('tags', [])),
-                metadata=json.dumps(vuln_dict.get('metadata', {})),
+                metadata=json.dumps(merged_metadata, ensure_ascii=False),
             )
             
             self.storage.save_vulnerability(record)

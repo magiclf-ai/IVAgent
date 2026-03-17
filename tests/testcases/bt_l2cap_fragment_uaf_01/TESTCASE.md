@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: l2cap_recv_fragment
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: use_after_free, bluetooth, l2cap, fragment_reassembly, cross_function, error_handling
 
 ## Description
@@ -17,10 +17,6 @@ Key complexity:
 - `append_fragment` correctly validates fragment size and returns error, but the error handler is buggy
 - The freed memory may be reallocated between the free and the subsequent access
 - 5-function interaction: `l2cap_recv_fragment` → `find_or_create_entry` → `append_fragment` → `handle_reassembly_error` → `process_completed_entries`
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

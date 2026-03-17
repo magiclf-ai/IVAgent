@@ -2,18 +2,14 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: process_data
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: uaf, use_after_free, cross_function, memory_safety
 
 ## Description
 
 This testcase demonstrates a cross-function use-after-free. Memory is released in one helper and then dereferenced from another helper through a dangling global pointer.
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

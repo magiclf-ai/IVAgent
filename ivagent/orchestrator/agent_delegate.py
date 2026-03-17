@@ -63,6 +63,7 @@ class AgentDelegate:
         engine: BaseStaticAnalysisEngine,
         llm_client: Any,
         artifact_store: Optional[ArtifactStore] = None,
+        skill_context: Optional[SkillContext] = None,
         verbose: bool = True,
     ):
         """
@@ -76,7 +77,31 @@ class AgentDelegate:
         self.engine = engine
         self.llm_client = llm_client
         self.artifact_store = artifact_store
+        self.skill_context = skill_context
         self.verbose = verbose
+
+    def _build_runtime_skill(
+        self,
+        analysis_context: Optional[str],
+        task_description: str = "",
+    ) -> Optional[SkillContext]:
+        """统一合并任务上下文与顶层 Skill 前置知识。"""
+
+        context_text = (analysis_context or "").strip()
+        if not context_text:
+            context_text = (task_description or "").strip()
+
+        if self.skill_context:
+            return self.skill_context.build_runtime_skill(context_text)
+        if not context_text:
+            return None
+
+        return SkillContext(
+            name="analysis_context",
+            description="analysis context",
+            target_type="vuln_analysis",
+            raw_markdown=context_text,
+        )
     
     async def delegate(
         self,
@@ -514,17 +539,10 @@ class AgentDelegate:
             )
             
             # 执行分析（目标函数标识符显式传入）
-            skill_text = (analysis_context or "").strip()
-            if not skill_text:
-                skill_text = (task_description or "").strip()
-            skill = None
-            if skill_text:
-                skill = SkillContext(
-                    name="analysis_context",
-                    description="analysis context",
-                    target_type="vuln_analysis",
-                    raw_markdown=skill_text,
-                )
+            skill = self._build_runtime_skill(
+                analysis_context=analysis_context,
+                task_description=task_description,
+            )
             function_context = FunctionContext(
                 function_identifier=function_identifier,
                 skill=skill,

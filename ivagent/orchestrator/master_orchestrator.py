@@ -50,6 +50,7 @@ class MasterOrchestrator:
         engine_type: Optional[str] = None,
         target_path: Optional[str] = None,
         source_root: Optional[str] = None,
+        session_root_dir: Optional[str] = None,
         session_id: Optional[str] = None,
         execution_mode: str = "sequential",
         verbose: bool = True,
@@ -59,6 +60,7 @@ class MasterOrchestrator:
         self.engine_type = engine_type
         self.target_path = target_path
         self.source_root = source_root
+        self.session_root_dir = session_root_dir
         self.session_id = session_id or f"master_session_{id(self)}"
         self.execution_mode = execution_mode
         self.verbose = verbose
@@ -87,7 +89,9 @@ class MasterOrchestrator:
     
     def _resolve_session_dir(self) -> Path:
         """确定 session 目录路径"""
-        if self.source_root:
+        if self.session_root_dir:
+            base_dir = Path(self.session_root_dir)
+        elif self.source_root:
             base_dir = Path(self.source_root) / ".ivagent" / "sessions"
         else:
             base_dir = Path.cwd() / ".ivagent" / "sessions"
@@ -117,7 +121,8 @@ class MasterOrchestrator:
     async def _guide_planning(
         self,
         orchestrator: Any,
-        skill_context: SkillContext
+        skill_context: SkillContext,
+        planning_context_text: Optional[str] = None,
     ) -> None:
         """引导 LLM 调用 plan_tasks（允许多轮以先获取 function_identifier）
 
@@ -126,7 +131,10 @@ class MasterOrchestrator:
             skill_context: Skill 上下文
         """
         # 1. 构建规划 prompt
-        planning_prompt = self._build_planning_prompt(skill_context)
+        planning_prompt = self._build_planning_prompt(
+            skill_context,
+            planning_context_text=planning_context_text,
+        )
 
         # 2. 添加用户消息
         await orchestrator.message_manager.add_user_message(planning_prompt)
@@ -702,6 +710,7 @@ class MasterOrchestrator:
         self,
         orchestrator: Any,
         skill_context: SkillContext,
+        planning_context_text: Optional[str] = None,
     ) -> MasterOrchestratorResult:
         """
         统一 Agentic 控制环：Plan -> Act -> Review -> (Append/Stop)
@@ -714,7 +723,11 @@ class MasterOrchestrator:
         max_final_followup_rounds = 2
         cycle_converged = False
 
-        await self._guide_planning(orchestrator, skill_context)
+        await self._guide_planning(
+            orchestrator,
+            skill_context,
+            planning_context_text=planning_context_text,
+        )
 
         workflows = orchestrator.tools_manager.get_planned_workflows()
         if not workflows:
@@ -1010,6 +1023,7 @@ class MasterOrchestrator:
                     llm_client=self.llm_client,
                     engine=engine,
                     session_dir=self.session_dir,
+                    skill_context=self.skill_context,
                     source_root=self.source_root,
                     verbose=self.verbose,
                     enable_logging=self.enable_logging,
@@ -1267,16 +1281,25 @@ class MasterOrchestrator:
         
         return "\n".join(lines)
     
-    def _build_planning_prompt(self, skill_context: SkillContext) -> str:
+    def _build_planning_prompt(
+        self,
+        skill_context: SkillContext,
+        planning_context_text: Optional[str] = None,
+    ) -> str:
         """构建规划 prompt
 
         Args:
             skill_context: Skill 上下文
+            planning_context_text: 额外规划上下文
 
         Returns:
             规划 prompt 字符串
         """
-        return build_planning_user_prompt(skill_context)
+        return build_planning_user_prompt(
+            skill_context,
+            target_path=self.target_path,
+            planning_context_text=planning_context_text,
+        )
     
     def _get_planning_system_prompt(self) -> str:
         """获取规划阶段的 system prompt
@@ -1287,7 +1310,12 @@ class MasterOrchestrator:
         return build_master_planning_system_prompt()
 
     
-    async def execute_skill(self, skill: SkillContext, target_path: str = None) -> MasterOrchestratorResult:
+    async def execute_skill(
+        self,
+        skill: SkillContext,
+        target_path: str = None,
+        planning_context_text: Optional[str] = None,
+    ) -> MasterOrchestratorResult:
         """执行 Skill 文档
         
         流程：
@@ -1353,6 +1381,7 @@ class MasterOrchestrator:
                 engine_type=self.engine_type,
                 target_path=final_target,
                 source_root=self.source_root,
+                artifacts_dir=str(self.session_dir.parent),
                 skill_context=self.skill_context,
                 session_id=self.session_id,
                 verbose=self.verbose,
@@ -1366,7 +1395,11 @@ class MasterOrchestrator:
             orchestrator._init_orchestrator_components(emit_log=False)
 
             self._log("启动 Agentic 控制环...")
-            result = await self._run_agentic_cycle(orchestrator, self.skill_context)
+            result = await self._run_agentic_cycle(
+                orchestrator,
+                self.skill_context,
+                planning_context_text=planning_context_text,
+            )
             if result.execution_time <= 0:
                 result.execution_time = time.time() - start_time
             return result

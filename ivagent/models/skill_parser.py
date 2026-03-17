@@ -36,13 +36,19 @@ class SkillParser:
             skill_dir = path.parent
 
         content = path.read_text(encoding="utf-8")
-        context = self._parse_content(content)
+        context = self._parse_content(content, skill_dir=skill_dir)
         context.skill_dir = skill_dir
         context.supporting_files = self._load_supporting_files(skill_dir, path.name)
         return context
 
-    def _parse_content(self, content: str) -> SkillContext:
+    def _parse_content(self, content: str, skill_dir: Path | None = None) -> SkillContext:
         """解析 SKILL.md 字符串内容。"""
+
+        metadata, markdown_body = self._split_frontmatter(content)
+        return self._build_context(metadata, markdown_body, skill_dir=skill_dir)
+
+    def _split_frontmatter(self, content: str) -> tuple[Dict[str, Any], str]:
+        """拆分 frontmatter 与正文。"""
 
         frontmatter_match = self._frontmatter_pattern.match(content)
         if frontmatter_match:
@@ -52,6 +58,15 @@ class SkillParser:
         else:
             markdown_body = content
             metadata = {}
+        return metadata, markdown_body
+
+    def _build_context(
+        self,
+        metadata: Dict[str, Any],
+        markdown_body: str,
+        skill_dir: Path | None = None,
+    ) -> SkillContext:
+        """基于 frontmatter 与正文构建 SkillContext。"""
 
         scope_data = metadata.get("scope")
         scope = None
@@ -66,7 +81,12 @@ class SkillParser:
 
         taint_sources = self._normalize_string_list(metadata.get("taint_sources", []))
         dangerous_apis = self._normalize_string_list(metadata.get("dangerous_apis", []))
+        background_knowledge_files = self._normalize_string_list(metadata.get("background_knowledge_files", []))
         tags = self._normalize_string_list(metadata.get("tags", []))
+        background_knowledge = self._build_background_knowledge(
+            metadata=metadata,
+            skill_dir=skill_dir,
+        )
 
         return SkillContext(
             name=metadata.get("name", ""),
@@ -77,9 +97,10 @@ class SkillParser:
             strategy_hints=strategy_hints,
             taint_sources=taint_sources,
             dangerous_apis=dangerous_apis,
+            background_knowledge_files=background_knowledge_files,
             raw_markdown=markdown_body.strip(),
             vulnerability_focus=metadata.get("vulnerability_focus", ""),
-            background_knowledge=metadata.get("background_knowledge", ""),
+            background_knowledge=background_knowledge,
             tags=tags,
             metadata={
                 key: value
@@ -96,10 +117,61 @@ class SkillParser:
                     "dangerous_apis",
                     "vulnerability_focus",
                     "background_knowledge",
+                    "background_knowledge_files",
                     "tags",
                 }
             },
         )
+
+    def _build_background_knowledge(
+        self,
+        metadata: Dict[str, Any],
+        skill_dir: Path | None = None,
+    ) -> str:
+        """按 frontmatter 声明顺序拼接背景知识。"""
+
+        if not metadata:
+            return ""
+
+        blocks: List[str] = []
+        for key, value in metadata.items():
+            if key == "background_knowledge":
+                text = self._normalize_text_block(value)
+                if text:
+                    blocks.append(text)
+            elif key == "background_knowledge_files":
+                for relative_path in self._normalize_string_list(value):
+                    text = self._read_background_knowledge_file(
+                        skill_dir=skill_dir,
+                        relative_path=relative_path,
+                    )
+                    if text:
+                        blocks.append(text)
+
+        return "\n\n".join(blocks).strip()
+
+    @staticmethod
+    def _normalize_text_block(value: Any) -> str:
+        if isinstance(value, list):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            return "\n".join(parts).strip()
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @staticmethod
+    def _read_background_knowledge_file(skill_dir: Path | None, relative_path: str) -> str:
+        if not skill_dir:
+            raise ValueError("background_knowledge_files requires a concrete skill directory")
+
+        candidate = Path(relative_path)
+        if not candidate.is_absolute():
+            candidate = (skill_dir / candidate).resolve()
+
+        if not candidate.exists() or not candidate.is_file():
+            raise FileNotFoundError(f"Background knowledge file not found: {relative_path}")
+
+        return candidate.read_text(encoding="utf-8").strip()
 
     def _load_supporting_files(self, skill_dir: Path, main_file: str) -> Dict[str, str]:
         """加载 skill 目录下的其他文本支持文件。"""

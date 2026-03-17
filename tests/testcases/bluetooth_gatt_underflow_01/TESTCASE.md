@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: build_read_multi_rsp
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: integer_underflow, heap_overflow, bluetooth, gatt, partial_validation, cross_function
 
 ## Description
@@ -16,10 +16,6 @@ Key complexity:
 - The overflow only triggers when multiple attributes fill the buffer near the MTU boundary
 - The bug is a subtle off-by-N where N depends on how many attributes have been processed
 - Cross-function taint: handles come from caller, attribute data from database, both flow into the overflow
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

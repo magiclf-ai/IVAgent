@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: ipc_dispatch_message
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: type_confusion, ipc, partial_validation, cross_function, multi_handler, buffer_overflow
 
 ## Description
@@ -17,10 +17,6 @@ Key complexity:
 - TEXT path: `sanitize_text` provides false sense of security (checks terminator, not length)
 - STRUCT path: `field_count` is attacker-controlled, used as loop bound for array access
 - The dispatcher's length validation is correct but insufficient — it doesn't know about inner struct layouts
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

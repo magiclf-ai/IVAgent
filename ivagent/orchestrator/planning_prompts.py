@@ -47,6 +47,11 @@ def build_planning_system_prompt() -> str:
 17. 若压缩摘要中 `### 是否需要继续获取信息` 为“是”，必须先按 `### 最小补充信息集` 追加最小取证任务，禁止直接结束或跳到全量重复探索。
 18. 若压缩摘要中 `### 是否需要继续获取信息` 为“否”，禁止追加与最小补证无关的重复取证任务；应优先进入 `vuln_analysis` 或收敛。
 19. `vuln_analysis` 任务的 `description` 必须使用中性措辞（如“挖掘 <function_identifier> 中的漏洞”）；禁止在任务描述中预设具体漏洞类型。
+20. 若当前已具备标准 `function_identifier`、可直接写入的 `analysis_context`、以及足以定位风险操作的关键调用链，必须优先规划第一次 `vuln_analysis`；禁止把非阻塞补证任务排在其前面。
+21. 新增 `code_explorer` 任务前，必须先判断该缺口是否直接阻塞当前下一步；若只是增强型 caller/xref/平行入口/外围覆盖补证，不得前置为第一次 `vuln_analysis` 的门槛。
+22. 当 `### 是否需要继续获取信息` 为“否”时，caller/xref/平行攻击面扩展等增强性取证只能作为后续补证，不能作为首个顺序任务。
+23. 当用户已经显式给出入口函数或入口函数名时，首次 `delegate_task(agent_type="code_explorer")` 只能做“最小启动取证”：验证入口 `function_identifier`、抽取该入口的参数级约束、列出最关键的 1-2 个下游函数及其角色，并输出“是否需要继续获取信息 / 最小补充信息集”。
+24. 首轮 `code_explorer` query 的目标是尽快支撑 `plan_tasks`，不是一次性完成全量 caller/xref/危险 API 全覆盖；禁止在首轮 query 中要求全量外围补证。
 
 # 必须闭环（漏洞挖掘任务）
 
@@ -63,6 +68,7 @@ def build_planning_system_prompt() -> str:
   - 存在多个独立的分析目标（如多个组件、多个漏洞类型）
   - 各个分析流程可以完全独立执行
   - 可以并行执行以提高效率
+- 优先最小闭环：当现有证据已足以支持第一次 `vuln_analysis` 时，先进入分析闭环，再决定是否追加增强型补证。
 - 若任务之间无依赖，可规划为可并发执行（执行层自动并发）。
 - 任务描述必须具体、可执行、可验证；去除与执行无关的冗余措辞。
 - 避免使用规则、启发式或经验判断进行泛化推断，优先基于上下文与工具输出决策。
@@ -209,6 +215,11 @@ def build_master_planning_system_prompt() -> str:
 17. 若压缩摘要中 `### 是否需要继续获取信息` 为“是”，必须先按 `### 最小补充信息集` 追加最小取证任务，禁止直接结束或跳到全量重复探索。
 18. 若压缩摘要中 `### 是否需要继续获取信息` 为“否”，禁止追加与最小补证无关的重复取证任务；应优先进入 `vuln_analysis` 或收敛。
 19. `vuln_analysis` 任务的 `description` 必须使用中性措辞（如“挖掘 <function_identifier> 中的漏洞”）；禁止在任务描述中预设具体漏洞类型。
+20. 若当前已具备标准 `function_identifier`、可直接写入的 `analysis_context`、以及足以定位风险操作的关键调用链，必须优先规划第一次 `vuln_analysis`；禁止把非阻塞补证任务排在其前面。
+21. 新增 `code_explorer` 任务前，必须先判断该缺口是否直接阻塞当前下一步；若只是增强型 caller/xref/平行入口/外围覆盖补证，不得前置为第一次 `vuln_analysis` 的门槛。
+22. 当 `### 是否需要继续获取信息` 为“否”时，caller/xref/平行攻击面扩展等增强性取证只能作为后续补证，不能作为首个顺序任务。
+23. 当用户已经显式给出入口函数或入口函数名时，首次 `delegate_task(agent_type="code_explorer")` 只能做“最小启动取证”：验证入口 `function_identifier`、抽取该入口的参数级约束、列出最关键的 1-2 个下游函数及其角色，并输出“是否需要继续获取信息 / 最小补充信息集”。
+24. 首轮 `code_explorer` query 的目标是尽快支撑 `plan_tasks`，不是一次性完成全量 caller/xref/危险 API 全覆盖；禁止在首轮 query 中要求全量外围补证。
 
 # 必须闭环（漏洞挖掘任务）
 
@@ -225,6 +236,7 @@ def build_master_planning_system_prompt() -> str:
   - 存在多个独立的分析目标（如多个组件、多个漏洞类型）
   - 各个分析流程可以完全独立执行
   - 可以并行执行以提高效率
+- 优先最小闭环：当现有证据已足以支持第一次 `vuln_analysis` 时，先进入分析闭环，再决定是否追加增强型补证。
 - 若任务之间无依赖，可规划为可并发执行（执行层自动并发）。
 - 任务描述必须具体、可执行、可验证；去除与执行无关的冗余措辞。
 - 避免使用规则、启发式或经验判断进行泛化推断，优先基于上下文与工具输出决策。
@@ -415,6 +427,7 @@ def build_execution_system_prompt() -> str:
 def build_planning_user_prompt(
     skill_context: SkillContext,
     target_path: Optional[str] = None,
+    planning_context_text: Optional[str] = None,
 ) -> str:
     """基于 SkillContext 构建规划用户提示词"""
     if not skill_context:
@@ -482,6 +495,13 @@ def build_planning_user_prompt(
             "```markdown",
             f"{skill_context.raw_markdown}",
             "```",
+            "",
+        ])
+
+    if planning_context_text:
+        lines.extend([
+            "## 额外规划上下文",
+            planning_context_text,
             "",
         ])
 

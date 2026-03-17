@@ -18,6 +18,8 @@ dangerous_apis:
   - "malloc() - 内存分配，注意整数溢出"
   - "free() - 内存释放，注意 UAF 和 Double Free"
   - "realloc() - 内存重分配，注意指针更新"
+background_knowledge_files:
+  - "../_shared/vulnerability_workflow_knowledge.md"
 tags: [eval, source, generic, memory_safety]
 ---
 

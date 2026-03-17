@@ -2,18 +2,14 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: log_message
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: format_string, printf, simple
 
 ## Description
 
 This testcase demonstrates a format string vulnerability where attacker-controlled input is passed directly to `printf` as the format string.
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

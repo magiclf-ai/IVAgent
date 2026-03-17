@@ -2,18 +2,14 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: handle_request
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: buffer_overflow, cross_function, data_flow, strcpy
 
 ## Description
 
 This testcase requires cross-function data-flow analysis. Attacker-controlled input reaches `copy_data`, where an unsafe `strcpy` writes into a fixed-size stack buffer.
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

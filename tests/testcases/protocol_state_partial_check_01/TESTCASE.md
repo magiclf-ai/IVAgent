@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: process_protocol_msg
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: state_machine, auth_bypass, buffer_overflow, partial_validation, cross_function, protocol
 
 ## Description
@@ -18,10 +18,6 @@ Key complexity:
 - `validate_credentials` is correctly implemented but never called on the bypass path
 - The `authenticated` check in DATA state is dead code on the bypass path
 - 3-function chain: `process_protocol_msg` → state dispatch → `parse_data_fields`
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

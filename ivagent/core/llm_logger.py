@@ -19,6 +19,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from .cli_logger import CLILogger
+from .run_context import merge_run_metadata
 
 _internal_logger = CLILogger(component="LLMLogManager")
 
@@ -147,9 +148,20 @@ class SQLiteLogStorage(BaseLogStorage):
     def _get_conn(self) -> sqlite3.Connection:
         """获取线程本地连接"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._local.conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=30.0,
+            )
             self._local.conn.row_factory = sqlite3.Row
+            self._configure_conn(self._local.conn)
         return self._local.conn
+
+    def _configure_conn(self, conn: sqlite3.Connection) -> None:
+        """统一配置 sqlite 并发参数。"""
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
     
     def _init_db(self):
         """初始化数据库表"""
@@ -890,7 +902,7 @@ class LLMLogManager:
             return None
         
         # 合并 metadata，自动添加 Agent 信息
-        merged_metadata = dict(metadata) if metadata else {}
+        merged_metadata = merge_run_metadata(metadata)
         
         # 如果提供了 agent_id 且 metadata 中没有 agent 信息，尝试从 agent_logger 获取
         if agent_id and ('agent_type' not in merged_metadata or 'target_function' not in merged_metadata):

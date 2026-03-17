@@ -4,7 +4,7 @@
 
 两个内置 profile：
 - production（默认）：真实扫描运行使用
-- eval：测试与评估使用
+- eval：测试与评估入口使用，但运行态数据库与 production 共用
 
 通过环境变量 IVAGENT_DB_PROFILE 选择 profile，
 也可以通过精确路径环境变量覆盖单个数据库文件：
@@ -44,9 +44,9 @@ _PROFILES = {
         vuln_db=_IVAGENT_HOME / "production" / "vulnerabilities.db",
     ),
     PROFILE_EVAL: DBPaths(
-        llm_log_db=_IVAGENT_HOME / "eval" / "llm_logs.db",
-        agent_log_db=_IVAGENT_HOME / "eval" / "agent_logs.db",
-        vuln_db=_IVAGENT_HOME / "eval" / "vulnerabilities.db",
+        llm_log_db=_IVAGENT_HOME / "production" / "llm_logs.db",
+        agent_log_db=_IVAGENT_HOME / "production" / "agent_logs.db",
+        vuln_db=_IVAGENT_HOME / "production" / "vulnerabilities.db",
     ),
 }
 
@@ -82,3 +82,13 @@ def get_db_paths(profile: str | None = None) -> DBPaths:
     for p in (resolved.llm_log_db, resolved.agent_log_db, resolved.vuln_db):
         p.parent.mkdir(parents=True, exist_ok=True)
     return resolved
+
+
+def activate_db_profile(profile: str, *, clear_path_overrides: bool = False) -> DBPaths:
+    """激活指定 profile，并按需清除精确数据库路径覆盖。"""
+
+    os.environ[ENV_KEY] = profile
+    if clear_path_overrides:
+        for key in (ENV_LLM_LOG_DB, ENV_AGENT_LOG_DB, ENV_VULN_DB):
+            os.environ.pop(key, None)
+    return get_db_paths(profile)

@@ -2,9 +2,9 @@
 
 ## Metadata
 - **Engine**: source
-- **Skill**: eval_source_scan
+- **Input Engine**: ida
 - **Entry Functions**: rlc_process_data_blocks
-- **Timeout**: 300 seconds
+- **Timeout**: 900 seconds
 - **Tags**: heap_overflow, fragment_reassembly, baseband, struct_corruption, cross_function, multi_stage
 
 ## Description
@@ -17,10 +17,6 @@ Key complexity:
 - `validate_fragments` checks `total_size` against MAX_PDU_SIZE, but the corrupted value passes
 - 4-function call chain: `rlc_process_data_blocks` → `add_fragment` → `validate_fragments` → `concatenate_fragments`
 - The root cause (missing count check) and the exploitable symptom (heap overflow in memcpy) are in different functions
-
-## Source Code
-
-See `source/vuln.c`
 
 ## Expected Vulnerabilities
 

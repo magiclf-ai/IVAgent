@@ -358,6 +358,7 @@ class OrchestratorTools:
         确保 AgentDelegate 可用，失败时返回错误文本。
         """
         if self._agent_delegate:
+            self._agent_delegate.skill_context = self.skill_context
             return None
         if not self.engine:
             return "[错误] 引擎未初始化，无法创建 AgentDelegate。请先初始化引擎并重新初始化 Orchestrator。"
@@ -370,9 +371,25 @@ class OrchestratorTools:
             engine=self.engine,
             llm_client=self.llm_client,
             artifact_store=self.artifact_store,
+            skill_context=self.skill_context,
             verbose=self.verbose,
         )
         return None
+
+    def _build_runtime_analysis_skill(self, analysis_context: str) -> Optional[SkillContext]:
+        """统一组装漏洞分析阶段的运行时 Skill。"""
+
+        context_text = (analysis_context or "").strip()
+        if self.skill_context:
+            return self.skill_context.build_runtime_skill(context_text)
+        if not context_text:
+            return None
+        return SkillContext(
+            name="analysis_context",
+            description="analysis context",
+            target_type="vuln_analysis",
+            raw_markdown=context_text,
+        )
 
     def _format_recoverable_error(
         self,
@@ -789,6 +806,7 @@ class OrchestratorTools:
                 engine=self.engine,
                 llm_client=self.llm_client,
                 artifact_store=self.artifact_store,
+                skill_context=self.skill_context,
                 verbose=self.verbose,
             )
 
@@ -1005,20 +1023,7 @@ class OrchestratorTools:
                 self._last_agent_id = agent_id
 
                 # 执行分析
-                skill_text = (analysis_context or "").strip()
-                if self.skill_context and self.skill_context.background_knowledge:
-                    if skill_text:
-                        skill_text = f"{skill_text}\n\n### 背景知识\n{self.skill_context.background_knowledge}"
-                    else:
-                        skill_text = f"### 背景知识\n{self.skill_context.background_knowledge}"
-                skill = None
-                if skill_text:
-                    skill = SkillContext(
-                        name="analysis_context",
-                        description="analysis context",
-                        target_type="vuln_analysis",
-                        raw_markdown=skill_text,
-                    )
+                skill = self._build_runtime_analysis_skill(analysis_context)
                 function_context = FunctionContext(
                     function_identifier=target_function_id,
                     skill=skill,
@@ -1201,20 +1206,7 @@ class OrchestratorTools:
             # 执行分析
             from ..models.constraints import FunctionContext
             from ..models.skill import SkillContext
-            skill_text = (analysis_context or "").strip()
-            if self.skill_context and self.skill_context.background_knowledge:
-                if skill_text:
-                    skill_text = f"{skill_text}\n\n### 背景知识\n{self.skill_context.background_knowledge}"
-                else:
-                    skill_text = f"### 背景知识\n{self.skill_context.background_knowledge}"
-            skill = None
-            if skill_text:
-                skill = SkillContext(
-                    name="analysis_context",
-                    description="analysis context",
-                    target_type="vuln_analysis",
-                    raw_markdown=skill_text,
-                )
+            skill = self._build_runtime_analysis_skill(analysis_context)
             function_context = FunctionContext(
                 function_identifier=function_identifier,
                 skill=skill,
